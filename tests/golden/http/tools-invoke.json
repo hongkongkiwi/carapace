@@ -1,0 +1,419 @@
+{
+  "$schema": "golden-trace-v1",
+  "description": "HTTP /tools/invoke endpoint - directly invoke agent tools via HTTP",
+  "source_files": [
+    "src/gateway/tools-invoke-http.ts",
+    "src/gateway/http-utils.ts",
+    "src/agents/clawdbot-tools.ts",
+    "src/agents/pi-tools.policy.ts"
+  ],
+  "endpoint": "/tools/invoke",
+  "method": "POST",
+  "authentication": {
+    "required": true,
+    "methods": ["Authorization: Bearer <token>"],
+    "notes": ["Uses gateway authentication (authorizeGatewayConnect)"]
+  },
+  "request_schema": {
+    "type": "object",
+    "required": ["tool"],
+    "properties": {
+      "tool": {
+        "type": "string",
+        "description": "Name of the tool to invoke (must be available after policy filtering)"
+      },
+      "action": {
+        "type": "string",
+        "description": "Optional action parameter. Auto-merged into args if tool schema has 'action' property."
+      },
+      "args": {
+        "type": "object",
+        "description": "Arguments to pass to the tool execute function",
+        "additionalProperties": true
+      },
+      "sessionKey": {
+        "type": "string",
+        "description": "Optional session key. Defaults to main session key.",
+        "default_behavior": "'main' or config-resolved main session key"
+      },
+      "dryRun": {
+        "type": "boolean",
+        "description": "Reserved for future use"
+      }
+    }
+  },
+  "response_schema": {
+    "success": {
+      "status": 200,
+      "body": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean", "const": true },
+          "result": { "description": "Tool execution result (type depends on tool)" }
+        }
+      }
+    },
+    "error_not_found": {
+      "status": 404,
+      "body": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean", "const": false },
+          "error": {
+            "type": "object",
+            "properties": {
+              "type": { "const": "not_found" },
+              "message": { "type": "string", "pattern": "Tool not available" }
+            }
+          }
+        }
+      }
+    },
+    "error_tool_error": {
+      "status": 400,
+      "body": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean", "const": false },
+          "error": {
+            "type": "object",
+            "properties": {
+              "type": { "const": "tool_error" },
+              "message": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "error_validation": {
+      "status": 400,
+      "body": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "object",
+            "properties": {
+              "message": { "type": "string" },
+              "type": { "const": "invalid_request_error" }
+            }
+          }
+        }
+      }
+    },
+    "error_unauthorized": {
+      "status": 401,
+      "body": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "object",
+            "properties": {
+              "message": { "const": "Unauthorized" },
+              "type": { "const": "unauthorized" }
+            }
+          }
+        }
+      }
+    }
+  },
+  "headers": {
+    "X-Clawdbot-Message-Channel": {
+      "description": "Message channel for policy inheritance (e.g., 'telegram', 'slack')"
+    },
+    "X-Clawdbot-Account-Id": {
+      "description": "Account ID for group-based tool policy resolution"
+    }
+  },
+  "tool_policy_resolution": {
+    "description": "Tools are filtered through multiple policy layers",
+    "layers": [
+      "Profile policy (tools.profile)",
+      "Provider profile policy (tools.byProvider.profile)",
+      "Global policy (tools.allow)",
+      "Global provider policy (tools.byProvider.allow)",
+      "Agent policy (agents.<id>.tools.allow)",
+      "Agent provider policy (agents.<id>.tools.byProvider.allow)",
+      "Group policy (groups.<id>.tools.allow)",
+      "Subagent policy (if sessionKey indicates subagent)"
+    ],
+    "notes": [
+      "Plugin tools require explicit allowlist entry or plugin group expansion",
+      "Unknown allowlist entries are logged as warnings"
+    ]
+  },
+  "scenarios": [
+    {
+      "name": "invoke_tool_simple",
+      "description": "Invoke a tool with minimal arguments",
+      "request": {
+        "method": "POST",
+        "path": "/tools/invoke",
+        "headers": { "Authorization": "Bearer {{gateway_token}}" },
+        "body": {
+          "tool": "time",
+          "args": {}
+        }
+      },
+      "response": {
+        "status": 200,
+        "body_schema": {
+          "properties": {
+            "ok": { "const": true },
+            "result": { "type": "object" }
+          }
+        }
+      }
+    },
+    {
+      "name": "invoke_tool_with_args",
+      "description": "Invoke a tool with specific arguments",
+      "request": {
+        "method": "POST",
+        "path": "/tools/invoke",
+        "headers": { "Authorization": "Bearer {{gateway_token}}" },
+        "body": {
+          "tool": "web_search",
+          "args": {
+            "query": "latest news"
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "body_schema": {
+          "properties": { "ok": { "const": true } }
+        }
+      }
+    },
+    {
+      "name": "invoke_tool_with_action",
+      "description": "Invoke a tool with action parameter (auto-merged into args)",
+      "request": {
+        "method": "POST",
+        "path": "/tools/invoke",
+        "headers": { "Authorization": "Bearer {{gateway_token}}" },
+        "body": {
+          "tool": "filesystem",
+          "action": "read",
+          "args": {
+            "path": "/tmp/test.txt"
+          }
+        }
+      },
+      "response": { "status": 200 },
+      "notes": ["action='read' merged into args if tool schema has 'action' property"]
+    },
+    {
+      "name": "invoke_tool_with_session_key",
+      "description": "Invoke tool with specific session context",
+      "request": {
+        "method": "POST",
+        "path": "/tools/invoke",
+        "headers": { "Authorization": "Bearer {{gateway_token}}" },
+        "body": {
+          "tool": "memory",
+          "args": { "action": "list" },
+          "sessionKey": "custom-session"
+        }
+      },
+      "response": { "status": 200 }
+    },
+    {
+      "name": "invoke_tool_main_session",
+      "description": "sessionKey='main' resolves to configured main session",
+      "request": {
+        "method": "POST",
+        "path": "/tools/invoke",
+        "headers": { "Authorization": "Bearer {{gateway_token}}" },
+        "body": {
+          "tool": "time",
+          "sessionKey": "main"
+        }
+      },
+      "response": { "status": 200 }
+    },
+    {
+      "name": "invoke_with_channel_header",
+      "description": "Channel header affects tool policy inheritance",
+      "request": {
+        "method": "POST",
+        "path": "/tools/invoke",
+        "headers": {
+          "Authorization": "Bearer {{gateway_token}}",
+          "X-Clawdbot-Message-Channel": "telegram"
+        },
+        "body": {
+          "tool": "time"
+        }
+      },
+      "response": { "status": 200 },
+      "notes": ["Provider profile policy and group policy use message channel"]
+    },
+    {
+      "name": "error_missing_tool",
+      "description": "Missing tool field in request",
+      "request": {
+        "method": "POST",
+        "path": "/tools/invoke",
+        "headers": { "Authorization": "Bearer {{gateway_token}}" },
+        "body": {}
+      },
+      "response": {
+        "status": 400,
+        "body_schema": {
+          "properties": {
+            "error": {
+              "properties": {
+                "message": { "const": "tools.invoke requires body.tool" }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "error_empty_tool_name",
+      "description": "Empty tool name after trim",
+      "request": {
+        "method": "POST",
+        "path": "/tools/invoke",
+        "headers": { "Authorization": "Bearer {{gateway_token}}" },
+        "body": {
+          "tool": "   "
+        }
+      },
+      "response": {
+        "status": 400,
+        "body_schema": {
+          "properties": {
+            "error": {
+              "properties": {
+                "message": { "const": "tools.invoke requires body.tool" }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "error_tool_not_found",
+      "description": "Tool not available (not in allowed tools after policy)",
+      "request": {
+        "method": "POST",
+        "path": "/tools/invoke",
+        "headers": { "Authorization": "Bearer {{gateway_token}}" },
+        "body": {
+          "tool": "nonexistent_tool"
+        }
+      },
+      "response": {
+        "status": 404,
+        "body_schema": {
+          "properties": {
+            "ok": { "const": false },
+            "error": {
+              "properties": {
+                "type": { "const": "not_found" },
+                "message": { "pattern": "Tool not available: nonexistent_tool" }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "error_tool_execution_failed",
+      "description": "Tool execution throws error",
+      "request": {
+        "method": "POST",
+        "path": "/tools/invoke",
+        "headers": { "Authorization": "Bearer {{gateway_token}}" },
+        "body": {
+          "tool": "filesystem",
+          "args": {
+            "action": "read",
+            "path": "/nonexistent/path/that/should/fail"
+          }
+        }
+      },
+      "response": {
+        "status": 400,
+        "body_schema": {
+          "properties": {
+            "ok": { "const": false },
+            "error": {
+              "properties": {
+                "type": { "const": "tool_error" },
+                "message": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "error_method_not_allowed",
+      "description": "Only POST method is allowed",
+      "request": {
+        "method": "GET",
+        "path": "/tools/invoke"
+      },
+      "response": {
+        "status": 405,
+        "headers": { "Allow": "POST" }
+      }
+    },
+    {
+      "name": "error_unauthorized",
+      "description": "Missing or invalid authentication",
+      "request": {
+        "method": "POST",
+        "path": "/tools/invoke",
+        "body": { "tool": "time" }
+      },
+      "response": {
+        "status": 401,
+        "body_schema": {
+          "properties": {
+            "error": {
+              "properties": {
+                "message": { "const": "Unauthorized" },
+                "type": { "const": "unauthorized" }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "args_not_object_treated_as_empty",
+      "description": "Non-object args value treated as empty object",
+      "request": {
+        "method": "POST",
+        "path": "/tools/invoke",
+        "headers": { "Authorization": "Bearer {{gateway_token}}" },
+        "body": {
+          "tool": "time",
+          "args": "invalid"
+        }
+      },
+      "response": { "status": 200 },
+      "notes": ["Non-object/array args coerced to empty object {}"]
+    },
+    {
+      "name": "args_array_treated_as_empty",
+      "description": "Array args value treated as empty object",
+      "request": {
+        "method": "POST",
+        "path": "/tools/invoke",
+        "headers": { "Authorization": "Bearer {{gateway_token}}" },
+        "body": {
+          "tool": "time",
+          "args": [1, 2, 3]
+        }
+      },
+      "response": { "status": 200 },
+      "notes": ["Array args coerced to empty object {}"]
+    }
+  ]
+}

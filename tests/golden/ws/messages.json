@@ -1,0 +1,416 @@
+{
+  "$schema": "golden-trace-v1",
+  "description": "WebSocket message frame formats and RPC methods - based on clawdbot gateway source code",
+  "source_files": [
+    "src/gateway/protocol/schema/frames.ts",
+    "src/gateway/server-methods-list.ts",
+    "src/gateway/server-methods/*.ts"
+  ],
+  "protocol_version": 3,
+  "frame_types": {
+    "request": {
+      "source": "src/gateway/protocol/schema/frames.ts RequestFrameSchema",
+      "schema": {
+        "type": "object",
+        "required": ["type", "id", "method"],
+        "additionalProperties": false,
+        "properties": {
+          "type": { "const": "req" },
+          "id": { "type": "string", "minLength": 1, "description": "Unique request ID for correlating responses" },
+          "method": { "type": "string", "minLength": 1, "description": "RPC method name" },
+          "params": { "description": "Method-specific parameters (optional)" }
+        }
+      },
+      "examples": [
+        { "type": "req", "id": "h1", "method": "health" },
+        { "type": "req", "id": "h2", "method": "health", "params": { "probe": true } },
+        { "type": "req", "id": "s1", "method": "sessions.list", "params": {} },
+        { "type": "req", "id": "cfg1", "method": "config.get", "params": { "key": "gateway.port" } }
+      ]
+    },
+    "response": {
+      "source": "src/gateway/protocol/schema/frames.ts ResponseFrameSchema",
+      "schema": {
+        "type": "object",
+        "required": ["type", "id", "ok"],
+        "additionalProperties": false,
+        "properties": {
+          "type": { "const": "res" },
+          "id": { "type": "string", "minLength": 1, "description": "Matches request ID" },
+          "ok": { "type": "boolean", "description": "True if request succeeded" },
+          "payload": { "description": "Response data (present when ok=true)" },
+          "error": { "$ref": "#/error_schema", "description": "Error details (present when ok=false)" }
+        }
+      },
+      "examples": [
+        { "type": "res", "id": "h1", "ok": true, "payload": { "ts": 1706000000000, "status": "healthy" } },
+        { "type": "res", "id": "bad", "ok": false, "error": { "code": "INVALID_REQUEST", "message": "missing field" } },
+        { "type": "res", "id": "s1", "ok": true, "payload": { "sessions": [] } }
+      ]
+    },
+    "event": {
+      "source": "src/gateway/protocol/schema/frames.ts EventFrameSchema",
+      "schema": {
+        "type": "object",
+        "required": ["type", "event"],
+        "additionalProperties": false,
+        "properties": {
+          "type": { "const": "event" },
+          "event": { "type": "string", "minLength": 1, "description": "Event name" },
+          "payload": { "description": "Event-specific data" },
+          "seq": { "type": "integer", "minimum": 0, "description": "Monotonically increasing sequence number" },
+          "stateVersion": {
+            "type": "object",
+            "properties": {
+              "presence": { "type": "integer", "minimum": 0 },
+              "health": { "type": "integer", "minimum": 0 }
+            },
+            "description": "Version counters for state reconciliation"
+          }
+        }
+      },
+      "examples": [
+        { "type": "event", "event": "tick", "payload": { "ts": 1706000000000 }, "seq": 42 },
+        { "type": "event", "event": "presence", "payload": { "presence": [] }, "seq": 43, "stateVersion": { "presence": 5, "health": 2 } }
+      ]
+    }
+  },
+  "error_schema": {
+    "source": "src/gateway/protocol/schema/frames.ts ErrorShapeSchema",
+    "type": "object",
+    "required": ["code", "message"],
+    "additionalProperties": false,
+    "properties": {
+      "code": { "type": "string", "minLength": 1, "description": "Error code from ErrorCodes enum" },
+      "message": { "type": "string", "minLength": 1, "description": "Human-readable error description" },
+      "details": { "description": "Additional error context" },
+      "retryable": { "type": "boolean", "description": "Whether client should retry" },
+      "retryAfterMs": { "type": "integer", "minimum": 0, "description": "Suggested retry delay in milliseconds" }
+    }
+  },
+  "methods": {
+    "source": "src/gateway/server-methods-list.ts listGatewayMethods()",
+    "categories": {
+      "health_status": {
+        "methods": ["health", "status"],
+        "description": "Health and status checks"
+      },
+      "config": {
+        "methods": ["config.get", "config.set", "config.apply", "config.patch", "config.schema"],
+        "description": "Configuration management"
+      },
+      "sessions": {
+        "methods": ["sessions.list", "sessions.preview", "sessions.patch", "sessions.reset", "sessions.delete", "sessions.compact"],
+        "description": "Session management"
+      },
+      "chat": {
+        "methods": ["chat.history", "chat.send", "chat.abort"],
+        "description": "WebChat/WebSocket-native chat operations"
+      },
+      "agent": {
+        "methods": ["agent", "agent.identity.get", "agent.wait", "send", "wake"],
+        "description": "Agent invocation and messaging"
+      },
+      "channels": {
+        "methods": ["channels.status", "channels.logout", "talk.mode"],
+        "description": "Messaging channel management"
+      },
+      "models_skills": {
+        "methods": ["models.list", "skills.status", "skills.bins", "skills.install", "skills.update"],
+        "description": "Model and skill management"
+      },
+      "nodes": {
+        "methods": ["node.pair.request", "node.pair.list", "node.pair.approve", "node.pair.reject", "node.pair.verify", "node.rename", "node.list", "node.describe", "node.invoke", "node.invoke.result", "node.event"],
+        "description": "Remote node management and invocation"
+      },
+      "devices": {
+        "methods": ["device.pair.list", "device.pair.approve", "device.pair.reject", "device.token.rotate", "device.token.revoke"],
+        "description": "Device pairing and token management"
+      },
+      "cron": {
+        "methods": ["cron.list", "cron.status", "cron.add", "cron.update", "cron.remove", "cron.run", "cron.runs"],
+        "description": "Scheduled task management"
+      },
+      "exec_approvals": {
+        "methods": ["exec.approvals.get", "exec.approvals.set", "exec.approvals.node.get", "exec.approvals.node.set", "exec.approval.request", "exec.approval.resolve"],
+        "description": "Command execution approval workflow"
+      },
+      "wizard": {
+        "methods": ["wizard.start", "wizard.next", "wizard.cancel", "wizard.status"],
+        "description": "Setup wizard flow"
+      },
+      "logs": {
+        "methods": ["logs.tail"],
+        "description": "Log streaming"
+      },
+      "misc": {
+        "methods": ["last-heartbeat", "set-heartbeats", "system-presence", "system-event", "usage.status", "usage.cost", "tts.status", "tts.providers", "tts.enable", "tts.disable", "tts.convert", "tts.setProvider", "update.run", "voicewake.get", "voicewake.set"],
+        "description": "Miscellaneous operations"
+      }
+    },
+    "full_list": [
+      "health",
+      "logs.tail",
+      "channels.status",
+      "channels.logout",
+      "status",
+      "usage.status",
+      "usage.cost",
+      "tts.status",
+      "tts.providers",
+      "tts.enable",
+      "tts.disable",
+      "tts.convert",
+      "tts.setProvider",
+      "config.get",
+      "config.set",
+      "config.apply",
+      "config.patch",
+      "config.schema",
+      "exec.approvals.get",
+      "exec.approvals.set",
+      "exec.approvals.node.get",
+      "exec.approvals.node.set",
+      "exec.approval.request",
+      "exec.approval.resolve",
+      "wizard.start",
+      "wizard.next",
+      "wizard.cancel",
+      "wizard.status",
+      "talk.mode",
+      "models.list",
+      "agents.list",
+      "skills.status",
+      "skills.bins",
+      "skills.install",
+      "skills.update",
+      "update.run",
+      "voicewake.get",
+      "voicewake.set",
+      "sessions.list",
+      "sessions.preview",
+      "sessions.patch",
+      "sessions.reset",
+      "sessions.delete",
+      "sessions.compact",
+      "last-heartbeat",
+      "set-heartbeats",
+      "wake",
+      "node.pair.request",
+      "node.pair.list",
+      "node.pair.approve",
+      "node.pair.reject",
+      "node.pair.verify",
+      "device.pair.list",
+      "device.pair.approve",
+      "device.pair.reject",
+      "device.token.rotate",
+      "device.token.revoke",
+      "node.rename",
+      "node.list",
+      "node.describe",
+      "node.invoke",
+      "node.invoke.result",
+      "node.event",
+      "cron.list",
+      "cron.status",
+      "cron.add",
+      "cron.update",
+      "cron.remove",
+      "cron.run",
+      "cron.runs",
+      "system-presence",
+      "system-event",
+      "send",
+      "agent",
+      "agent.identity.get",
+      "agent.wait",
+      "chat.history",
+      "chat.abort",
+      "chat.send"
+    ]
+  },
+  "method_examples": {
+    "health": {
+      "source": "src/gateway/server-methods/health.ts",
+      "request": { "type": "req", "id": "h1", "method": "health" },
+      "request_with_probe": { "type": "req", "id": "h2", "method": "health", "params": { "probe": true } },
+      "response": { "type": "res", "id": "h1", "ok": true, "payload": { "ts": 1706000000000, "status": "healthy" } },
+      "notes": [
+        "Without probe=true, may return cached health snapshot",
+        "Cache TTL is HEALTH_REFRESH_INTERVAL_MS = 60000ms"
+      ]
+    },
+    "chat.history": {
+      "source": "src/gateway/server-methods/chat.ts",
+      "params_schema": {
+        "type": "object",
+        "required": ["sessionKey"],
+        "properties": {
+          "sessionKey": { "type": "string", "minLength": 1 },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 200 }
+        }
+      },
+      "request": { "type": "req", "id": "ch1", "method": "chat.history", "params": { "sessionKey": "main" } },
+      "response": {
+        "type": "res",
+        "id": "ch1",
+        "ok": true,
+        "payload": {
+          "sessionKey": "main",
+          "sessionId": "abc123",
+          "messages": [],
+          "thinkingLevel": "off"
+        }
+      }
+    },
+    "chat.send": {
+      "source": "src/gateway/server-methods/chat.ts",
+      "params_schema": {
+        "type": "object",
+        "required": ["sessionKey", "message", "idempotencyKey"],
+        "properties": {
+          "sessionKey": { "type": "string", "minLength": 1 },
+          "message": { "type": "string" },
+          "thinking": { "type": "string", "description": "Thinking level override" },
+          "deliver": { "type": "boolean" },
+          "attachments": { "type": "array" },
+          "timeoutMs": { "type": "integer", "minimum": 0 },
+          "idempotencyKey": { "type": "string", "minLength": 1 }
+        }
+      },
+      "request": {
+        "type": "req",
+        "id": "cs1",
+        "method": "chat.send",
+        "params": {
+          "sessionKey": "main",
+          "message": "Hello!",
+          "idempotencyKey": "msg-123"
+        }
+      },
+      "response_started": {
+        "type": "res",
+        "id": "cs1",
+        "ok": true,
+        "payload": { "runId": "msg-123", "status": "started" }
+      },
+      "response_cached": {
+        "type": "res",
+        "id": "cs1",
+        "ok": true,
+        "payload": { "runId": "msg-123", "status": "in_flight" }
+      },
+      "notes": [
+        "Returns immediately with status=started, actual result comes via chat event",
+        "idempotencyKey is used as runId for deduplication",
+        "Sending 'stop' or '/stop' aborts active runs on the session"
+      ]
+    },
+    "chat.abort": {
+      "source": "src/gateway/server-methods/chat.ts",
+      "params_schema": {
+        "type": "object",
+        "required": ["sessionKey"],
+        "properties": {
+          "sessionKey": { "type": "string", "minLength": 1 },
+          "runId": { "type": "string", "description": "Specific run to abort (optional, aborts all if omitted)" }
+        }
+      },
+      "request": { "type": "req", "id": "ca1", "method": "chat.abort", "params": { "sessionKey": "main" } },
+      "response": { "type": "res", "id": "ca1", "ok": true, "payload": { "ok": true, "aborted": true, "runIds": ["msg-123"] } }
+    },
+    "config.get": {
+      "source": "src/gateway/server-methods/config.ts",
+      "params_schema": {
+        "type": "object",
+        "properties": {
+          "key": { "type": "string", "description": "Dot-separated config path (optional, returns all if omitted)" }
+        }
+      },
+      "request": { "type": "req", "id": "cg1", "method": "config.get", "params": { "key": "gateway.port" } },
+      "response": { "type": "res", "id": "cg1", "ok": true, "payload": { "key": "gateway.port", "value": 8080 } }
+    },
+    "sessions.list": {
+      "source": "src/gateway/server-methods/sessions.ts",
+      "request": { "type": "req", "id": "sl1", "method": "sessions.list", "params": {} },
+      "response": { "type": "res", "id": "sl1", "ok": true, "payload": { "sessions": [] } }
+    },
+    "agent": {
+      "source": "src/gateway/server-methods/agent.ts",
+      "params_schema": {
+        "type": "object",
+        "required": ["message", "idempotencyKey"],
+        "properties": {
+          "message": { "type": "string", "minLength": 1 },
+          "agentId": { "type": "string" },
+          "to": { "type": "string" },
+          "replyTo": { "type": "string" },
+          "sessionId": { "type": "string" },
+          "sessionKey": { "type": "string" },
+          "thinking": { "type": "string" },
+          "deliver": { "type": "boolean" },
+          "attachments": { "type": "array" },
+          "channel": { "type": "string" },
+          "replyChannel": { "type": "string" },
+          "accountId": { "type": "string" },
+          "replyAccountId": { "type": "string" },
+          "threadId": { "type": "string" },
+          "groupId": { "type": "string" },
+          "groupChannel": { "type": "string" },
+          "groupSpace": { "type": "string" },
+          "timeout": { "type": "integer", "minimum": 0 },
+          "lane": { "type": "string" },
+          "extraSystemPrompt": { "type": "string" },
+          "idempotencyKey": { "type": "string", "minLength": 1 },
+          "label": { "type": "string" },
+          "spawnedBy": { "type": "string" }
+        }
+      },
+      "request": {
+        "type": "req",
+        "id": "a1",
+        "method": "agent",
+        "params": {
+          "message": "What is 2+2?",
+          "idempotencyKey": "agent-run-123"
+        }
+      },
+      "response": {
+        "type": "res",
+        "id": "a1",
+        "ok": true,
+        "payload": { "runId": "agent-run-123", "status": "started" }
+      }
+    },
+    "send": {
+      "source": "src/gateway/server-methods/send.ts",
+      "params_schema": {
+        "type": "object",
+        "required": ["to", "message", "idempotencyKey"],
+        "properties": {
+          "to": { "type": "string", "minLength": 1 },
+          "message": { "type": "string", "minLength": 1 },
+          "mediaUrl": { "type": "string" },
+          "mediaUrls": { "type": "array", "items": { "type": "string" } },
+          "gifPlayback": { "type": "boolean" },
+          "channel": { "type": "string" },
+          "accountId": { "type": "string" },
+          "sessionKey": { "type": "string" },
+          "idempotencyKey": { "type": "string", "minLength": 1 }
+        }
+      },
+      "request": {
+        "type": "req",
+        "id": "snd1",
+        "method": "send",
+        "params": {
+          "to": "+15551234567",
+          "message": "Hello from gateway!",
+          "channel": "whatsapp",
+          "idempotencyKey": "send-123"
+        }
+      }
+    }
+  }
+}

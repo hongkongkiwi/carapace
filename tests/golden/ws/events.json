@@ -1,0 +1,440 @@
+{
+  "$schema": "golden-trace-v1",
+  "description": "WebSocket event types and payloads - based on clawdbot gateway source code",
+  "source_files": [
+    "src/gateway/server-methods-list.ts",
+    "src/gateway/server-broadcast.ts",
+    "src/gateway/protocol/schema/frames.ts",
+    "src/gateway/protocol/schema/agent.ts",
+    "src/gateway/protocol/schema/devices.ts",
+    "src/gateway/protocol/schema/logs-chat.ts",
+    "src/gateway/protocol/schema/snapshot.ts"
+  ],
+  "notes": [
+    "Events are broadcast to all connected clients with appropriate scope permissions",
+    "Events include seq (monotonically increasing sequence) and optional stateVersion",
+    "Some events are gated by scope: exec.approval.*, device.pair.*, node.pair.* require specific scopes"
+  ],
+  "event_list": [
+    "connect.challenge",
+    "agent",
+    "chat",
+    "presence",
+    "tick",
+    "talk.mode",
+    "shutdown",
+    "health",
+    "heartbeat",
+    "cron",
+    "node.pair.requested",
+    "node.pair.resolved",
+    "node.invoke.request",
+    "device.pair.requested",
+    "device.pair.resolved",
+    "voicewake.changed",
+    "exec.approval.requested",
+    "exec.approval.resolved"
+  ],
+  "scope_requirements": {
+    "source": "src/gateway/server-broadcast.ts EVENT_SCOPE_GUARDS",
+    "exec.approval.requested": ["operator.approvals"],
+    "exec.approval.resolved": ["operator.approvals"],
+    "device.pair.requested": ["operator.pairing"],
+    "device.pair.resolved": ["operator.pairing"],
+    "node.pair.requested": ["operator.pairing"],
+    "node.pair.resolved": ["operator.pairing"],
+    "notes": ["operator.admin scope grants access to all scoped events"]
+  },
+  "events": {
+    "connect.challenge": {
+      "source": "src/gateway/server/ws-connection.ts lines 120-125",
+      "description": "Sent immediately when WebSocket connection is established, before handshake",
+      "timing": "on_connection",
+      "payload_schema": {
+        "type": "object",
+        "required": ["nonce", "ts"],
+        "properties": {
+          "nonce": { "type": "string", "format": "uuid", "description": "Random challenge nonce for device signature" },
+          "ts": { "type": "integer", "description": "Server timestamp in milliseconds" }
+        }
+      },
+      "example": {
+        "type": "event",
+        "event": "connect.challenge",
+        "payload": {
+          "nonce": "550e8400-e29b-41d4-a716-446655440000",
+          "ts": 1706000000000
+        }
+      }
+    },
+    "tick": {
+      "source": "src/gateway/protocol/schema/frames.ts TickEventSchema",
+      "description": "Periodic heartbeat to keep connection alive and synchronize time",
+      "timing": "every 30 seconds (TICK_INTERVAL_MS)",
+      "payload_schema": {
+        "type": "object",
+        "required": ["ts"],
+        "properties": {
+          "ts": { "type": "integer", "minimum": 0, "description": "Server timestamp in milliseconds" }
+        }
+      },
+      "example": {
+        "type": "event",
+        "event": "tick",
+        "payload": { "ts": 1706000030000 },
+        "seq": 42
+      }
+    },
+    "presence": {
+      "source": "src/gateway/protocol/schema/snapshot.ts PresenceEntrySchema",
+      "description": "Broadcast when connected clients change (connect/disconnect)",
+      "payload_schema": {
+        "type": "object",
+        "required": ["presence"],
+        "properties": {
+          "presence": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["ts"],
+              "properties": {
+                "host": { "type": "string", "description": "Client hostname or display name" },
+                "ip": { "type": "string", "description": "Client IP address (remote only)" },
+                "version": { "type": "string", "description": "Client version" },
+                "platform": { "type": "string", "description": "Client platform (darwin, linux, win32)" },
+                "deviceFamily": { "type": "string", "description": "Device family (MacBookPro, iPhone, etc)" },
+                "modelIdentifier": { "type": "string", "description": "Device model identifier" },
+                "mode": { "type": "string", "description": "Client mode (ui, cli, webchat, etc)" },
+                "lastInputSeconds": { "type": "integer", "minimum": 0 },
+                "reason": { "type": "string", "description": "connect or disconnect" },
+                "tags": { "type": "array", "items": { "type": "string" } },
+                "text": { "type": "string" },
+                "ts": { "type": "integer", "minimum": 0, "description": "Last update timestamp" },
+                "deviceId": { "type": "string", "description": "Device identity ID" },
+                "roles": { "type": "array", "items": { "type": "string" } },
+                "scopes": { "type": "array", "items": { "type": "string" } },
+                "instanceId": { "type": "string" }
+              }
+            }
+          }
+        }
+      },
+      "example": {
+        "type": "event",
+        "event": "presence",
+        "payload": {
+          "presence": [
+            {
+              "host": "My Mac",
+              "version": "2024.1.0",
+              "platform": "darwin",
+              "mode": "ui",
+              "reason": "connect",
+              "ts": 1706000000000,
+              "roles": ["operator"],
+              "scopes": ["operator.admin"]
+            }
+          ]
+        },
+        "seq": 5,
+        "stateVersion": { "presence": 5, "health": 2 }
+      }
+    },
+    "health": {
+      "source": "src/gateway/server-broadcast.ts",
+      "description": "Broadcast when health status changes",
+      "payload_schema": {
+        "type": "object",
+        "description": "Health snapshot (structure varies)"
+      },
+      "example": {
+        "type": "event",
+        "event": "health",
+        "payload": { "ts": 1706000000000, "status": "healthy" },
+        "seq": 10,
+        "stateVersion": { "presence": 5, "health": 3 }
+      }
+    },
+    "shutdown": {
+      "source": "src/gateway/protocol/schema/frames.ts ShutdownEventSchema",
+      "description": "Server is shutting down, client should reconnect",
+      "payload_schema": {
+        "type": "object",
+        "required": ["reason"],
+        "properties": {
+          "reason": { "type": "string", "minLength": 1, "description": "Shutdown reason" },
+          "restartExpectedMs": { "type": "integer", "minimum": 0, "description": "Expected time until server restarts" }
+        }
+      },
+      "example": {
+        "type": "event",
+        "event": "shutdown",
+        "payload": { "reason": "update", "restartExpectedMs": 5000 },
+        "seq": 100
+      }
+    },
+    "agent": {
+      "source": "src/gateway/protocol/schema/agent.ts AgentEventSchema",
+      "description": "Agent execution progress events (streaming output, tool calls, completion)",
+      "payload_schema": {
+        "type": "object",
+        "required": ["runId", "seq", "stream", "ts", "data"],
+        "properties": {
+          "runId": { "type": "string", "minLength": 1, "description": "Agent run identifier (from idempotencyKey)" },
+          "seq": { "type": "integer", "minimum": 0, "description": "Event sequence within this run" },
+          "stream": { "type": "string", "minLength": 1, "description": "Stream type (text, tool_use, final, error, etc)" },
+          "ts": { "type": "integer", "minimum": 0, "description": "Event timestamp" },
+          "data": { "type": "object", "description": "Stream-specific data" }
+        }
+      },
+      "streams": {
+        "text": "Streaming text output",
+        "tool_use": "Tool invocation",
+        "tool_result": "Tool execution result",
+        "final": "Agent run completed",
+        "error": "Agent run failed",
+        "thinking": "Extended thinking output"
+      },
+      "example": {
+        "type": "event",
+        "event": "agent",
+        "payload": {
+          "runId": "agent-run-123",
+          "seq": 1,
+          "stream": "text",
+          "ts": 1706000001000,
+          "data": { "text": "Hello! " }
+        },
+        "seq": 20
+      }
+    },
+    "chat": {
+      "source": "src/gateway/protocol/schema/logs-chat.ts ChatEventSchema",
+      "description": "WebChat message events (for webchat-ui clients)",
+      "payload_schema": {
+        "type": "object",
+        "required": ["runId", "sessionKey", "seq", "state"],
+        "properties": {
+          "runId": { "type": "string", "minLength": 1, "description": "Chat run identifier (from idempotencyKey)" },
+          "sessionKey": { "type": "string", "minLength": 1, "description": "Session key" },
+          "seq": { "type": "integer", "minimum": 0, "description": "Event sequence within this run" },
+          "state": { "type": "string", "enum": ["delta", "final", "aborted", "error"], "description": "Event state" },
+          "message": { "description": "Message content (for final state)" },
+          "errorMessage": { "type": "string", "description": "Error description (for error state)" },
+          "usage": { "description": "Token usage (for final state)" },
+          "stopReason": { "type": "string", "description": "Why generation stopped" }
+        }
+      },
+      "states": {
+        "delta": "Streaming text chunk",
+        "final": "Message complete",
+        "aborted": "Run was aborted",
+        "error": "Run failed with error"
+      },
+      "example_delta": {
+        "type": "event",
+        "event": "chat",
+        "payload": {
+          "runId": "msg-123",
+          "sessionKey": "main",
+          "seq": 1,
+          "state": "delta",
+          "message": { "role": "assistant", "content": [{ "type": "text", "text": "Hello" }] }
+        },
+        "seq": 30
+      },
+      "example_final": {
+        "type": "event",
+        "event": "chat",
+        "payload": {
+          "runId": "msg-123",
+          "sessionKey": "main",
+          "seq": 10,
+          "state": "final",
+          "message": {
+            "role": "assistant",
+            "content": [{ "type": "text", "text": "Hello! How can I help you?" }],
+            "timestamp": 1706000005000,
+            "stopReason": "end_turn",
+            "usage": { "input": 10, "output": 20, "totalTokens": 30 }
+          }
+        },
+        "seq": 39
+      }
+    },
+    "device.pair.requested": {
+      "source": "src/gateway/protocol/schema/devices.ts DevicePairRequestedEventSchema",
+      "description": "A device is requesting pairing approval",
+      "scope_required": ["operator.pairing"],
+      "payload_schema": {
+        "type": "object",
+        "required": ["requestId", "deviceId", "publicKey", "ts"],
+        "properties": {
+          "requestId": { "type": "string", "minLength": 1, "description": "Pairing request ID" },
+          "deviceId": { "type": "string", "minLength": 1, "description": "Device identity ID" },
+          "publicKey": { "type": "string", "minLength": 1, "description": "Device public key" },
+          "displayName": { "type": "string", "description": "Device display name" },
+          "platform": { "type": "string", "description": "Device platform" },
+          "clientId": { "type": "string", "description": "Client ID" },
+          "clientMode": { "type": "string", "description": "Client mode" },
+          "role": { "type": "string", "description": "Requested role" },
+          "roles": { "type": "array", "items": { "type": "string" } },
+          "scopes": { "type": "array", "items": { "type": "string" } },
+          "remoteIp": { "type": "string", "description": "Client IP address" },
+          "silent": { "type": "boolean", "description": "Auto-approved local request" },
+          "isRepair": { "type": "boolean", "description": "Re-pairing existing device" },
+          "ts": { "type": "integer", "minimum": 0, "description": "Request timestamp" }
+        }
+      },
+      "example": {
+        "type": "event",
+        "event": "device.pair.requested",
+        "payload": {
+          "requestId": "req-abc123",
+          "deviceId": "dev-xyz789",
+          "publicKey": "base64url-encoded-public-key",
+          "displayName": "iPhone 15",
+          "platform": "ios",
+          "clientId": "clawdbot-ios",
+          "clientMode": "ui",
+          "role": "operator",
+          "scopes": ["operator.admin"],
+          "ts": 1706000000000
+        },
+        "seq": 50
+      }
+    },
+    "device.pair.resolved": {
+      "source": "src/gateway/protocol/schema/devices.ts DevicePairResolvedEventSchema",
+      "description": "Device pairing request was approved or rejected",
+      "scope_required": ["operator.pairing"],
+      "payload_schema": {
+        "type": "object",
+        "required": ["requestId", "deviceId", "decision", "ts"],
+        "properties": {
+          "requestId": { "type": "string", "minLength": 1, "description": "Pairing request ID" },
+          "deviceId": { "type": "string", "minLength": 1, "description": "Device identity ID" },
+          "decision": { "type": "string", "minLength": 1, "description": "approved or rejected" },
+          "ts": { "type": "integer", "minimum": 0, "description": "Resolution timestamp" }
+        }
+      },
+      "example": {
+        "type": "event",
+        "event": "device.pair.resolved",
+        "payload": {
+          "requestId": "req-abc123",
+          "deviceId": "dev-xyz789",
+          "decision": "approved",
+          "ts": 1706000010000
+        },
+        "seq": 51
+      }
+    },
+    "node.pair.requested": {
+      "source": "src/gateway/server-methods-list.ts",
+      "description": "A remote node is requesting pairing approval",
+      "scope_required": ["operator.pairing"],
+      "payload_schema": {
+        "type": "object",
+        "required": ["requestId", "nodeId"],
+        "properties": {
+          "requestId": { "type": "string" },
+          "nodeId": { "type": "string" }
+        }
+      }
+    },
+    "node.pair.resolved": {
+      "source": "src/gateway/server-methods-list.ts",
+      "description": "Node pairing request was resolved",
+      "scope_required": ["operator.pairing"]
+    },
+    "node.invoke.request": {
+      "source": "src/gateway/protocol/schema/nodes.ts NodeInvokeRequestEventSchema",
+      "description": "Request for a node to invoke a command (sent to specific node)",
+      "payload_schema": {
+        "type": "object",
+        "required": ["invokeId", "command", "args"],
+        "properties": {
+          "invokeId": { "type": "string" },
+          "command": { "type": "string" },
+          "args": { "type": "array", "items": { "type": "string" } },
+          "cwd": { "type": "string" },
+          "env": { "type": "object" },
+          "timeoutMs": { "type": "integer" }
+        }
+      }
+    },
+    "exec.approval.requested": {
+      "source": "src/gateway/server-methods-list.ts",
+      "description": "Command execution requires approval",
+      "scope_required": ["operator.approvals"],
+      "payload_schema": {
+        "type": "object",
+        "required": ["requestId", "command"],
+        "properties": {
+          "requestId": { "type": "string" },
+          "command": { "type": "string" },
+          "args": { "type": "array", "items": { "type": "string" } },
+          "cwd": { "type": "string" },
+          "agentId": { "type": "string" },
+          "sessionKey": { "type": "string" }
+        }
+      }
+    },
+    "exec.approval.resolved": {
+      "source": "src/gateway/server-methods-list.ts",
+      "description": "Execution approval was granted or denied",
+      "scope_required": ["operator.approvals"],
+      "payload_schema": {
+        "type": "object",
+        "required": ["requestId", "decision"],
+        "properties": {
+          "requestId": { "type": "string" },
+          "decision": { "type": "string", "enum": ["approved", "denied"] }
+        }
+      }
+    },
+    "talk.mode": {
+      "source": "src/gateway/server-methods-list.ts",
+      "description": "Talk mode status changed",
+      "payload_schema": {
+        "type": "object",
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "channel": { "type": "string" }
+        }
+      }
+    },
+    "heartbeat": {
+      "source": "src/gateway/server-methods-list.ts",
+      "description": "Heartbeat event",
+      "payload_schema": {
+        "type": "object",
+        "properties": {
+          "ts": { "type": "integer" }
+        }
+      }
+    },
+    "cron": {
+      "source": "src/gateway/server-methods-list.ts",
+      "description": "Cron job execution event",
+      "payload_schema": {
+        "type": "object",
+        "properties": {
+          "jobId": { "type": "string" },
+          "status": { "type": "string" }
+        }
+      }
+    },
+    "voicewake.changed": {
+      "source": "src/gateway/server-methods-list.ts",
+      "description": "Voice wake configuration changed (sent to node clients)",
+      "payload_schema": {
+        "type": "object",
+        "properties": {
+          "triggers": { "type": "array", "description": "Wake word triggers" }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,459 @@
+{
+  "$schema": "golden-trace-v1",
+  "description": "WebSocket connection handshake protocol - based on clawdbot gateway source code",
+  "source_files": [
+    "src/gateway/server/ws-connection.ts",
+    "src/gateway/server/ws-connection/message-handler.ts",
+    "src/gateway/protocol/schema/frames.ts",
+    "src/gateway/protocol/schema/protocol-schemas.ts"
+  ],
+  "protocol_version": 3,
+  "notes": [
+    "Protocol version is defined in src/gateway/protocol/schema/protocol-schemas.ts as PROTOCOL_VERSION = 3",
+    "Handshake timeout is 10 seconds (DEFAULT_HANDSHAKE_TIMEOUT_MS in server-constants.ts)",
+    "Connection flow: open -> receive connect.challenge -> send connect request -> receive hello-ok response"
+  ],
+  "scenarios": [
+    {
+      "name": "connect_challenge_on_open",
+      "description": "Server immediately sends connect.challenge event upon WebSocket connection",
+      "source_reference": "ws-connection.ts lines 120-125",
+      "steps": [
+        { "action": "open_connection" },
+        {
+          "action": "receive",
+          "expected": {
+            "type": "event",
+            "event": "connect.challenge",
+            "payload": {
+              "nonce": "{{uuid}}",
+              "ts": "{{timestamp_ms}}"
+            }
+          },
+          "notes": [
+            "nonce is a random UUID generated via randomUUID()",
+            "ts is Date.now() timestamp in milliseconds",
+            "Client must include nonce in device signature for remote connections"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "connect_success_local_with_token",
+      "description": "Successful local connection with token auth (no device identity required)",
+      "source_reference": "message-handler.ts lines 376-416",
+      "steps": [
+        { "action": "open_connection" },
+        { "action": "receive", "expected_event": "connect.challenge" },
+        {
+          "action": "send",
+          "frame": {
+            "type": "req",
+            "id": "{{request_id}}",
+            "method": "connect",
+            "params": {
+              "minProtocol": 3,
+              "maxProtocol": 3,
+              "client": {
+                "id": "test",
+                "version": "1.0.0",
+                "platform": "test",
+                "mode": "test"
+              },
+              "auth": {
+                "token": "{{gateway_token}}"
+              }
+            }
+          },
+          "notes": [
+            "client.id must be one of: webchat-ui, clawdbot-control-ui, webchat, cli, gateway-client, clawdbot-macos, clawdbot-ios, clawdbot-android, node-host, test, fingerprint, clawdbot-probe",
+            "client.mode must be one of: webchat, cli, ui, backend, node, probe, test",
+            "Token auth allows skipping device identity for local connections"
+          ]
+        },
+        {
+          "action": "receive",
+          "expected": {
+            "type": "res",
+            "id": "{{request_id}}",
+            "ok": true,
+            "payload": {
+              "type": "hello-ok",
+              "protocol": 3,
+              "server": {
+                "version": "{{server_version}}",
+                "commit": "{{optional_git_commit}}",
+                "host": "{{hostname}}",
+                "connId": "{{connection_uuid}}"
+              },
+              "features": {
+                "methods": ["{{method_list}}"],
+                "events": ["{{event_list}}"]
+              },
+              "snapshot": {
+                "presence": [],
+                "health": {},
+                "stateVersion": {
+                  "presence": 0,
+                  "health": 0
+                },
+                "uptimeMs": "{{uptime}}",
+                "configPath": "{{optional}}",
+                "stateDir": "{{optional}}",
+                "sessionDefaults": "{{optional}}"
+              },
+              "canvasHostUrl": "{{optional_canvas_host_url}}",
+              "auth": "{{optional_device_token_info}}",
+              "policy": {
+                "maxPayload": 524288,
+                "maxBufferedBytes": 1572864,
+                "tickIntervalMs": 30000
+              }
+            }
+          },
+          "notes": [
+            "policy.maxPayload is MAX_PAYLOAD_BYTES = 512 * 1024 = 524288",
+            "policy.maxBufferedBytes is MAX_BUFFERED_BYTES = 1.5 * 1024 * 1024 = 1572864",
+            "policy.tickIntervalMs is TICK_INTERVAL_MS = 30000",
+            "auth field only present if device identity was provided and verified"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "connect_success_with_device_identity",
+      "description": "Connection with full device identity and signature verification",
+      "source_reference": "message-handler.ts lines 418-564",
+      "steps": [
+        { "action": "open_connection" },
+        { "action": "receive", "expected_event": "connect.challenge", "capture": { "nonce": "payload.nonce" } },
+        {
+          "action": "send",
+          "frame": {
+            "type": "req",
+            "id": "{{request_id}}",
+            "method": "connect",
+            "params": {
+              "minProtocol": 3,
+              "maxProtocol": 3,
+              "client": {
+                "id": "clawdbot-macos",
+                "displayName": "My Mac",
+                "version": "2024.1.0",
+                "platform": "darwin",
+                "deviceFamily": "MacBookPro",
+                "modelIdentifier": "Mac14,5",
+                "mode": "ui",
+                "instanceId": "{{instance_uuid}}"
+              },
+              "device": {
+                "id": "{{device_id_derived_from_public_key}}",
+                "publicKey": "{{base64url_ed25519_public_key}}",
+                "signature": "{{base64url_ed25519_signature}}",
+                "signedAt": "{{timestamp_ms}}",
+                "nonce": "{{captured_nonce}}"
+              },
+              "auth": {
+                "token": "{{device_token_or_gateway_token}}"
+              },
+              "role": "operator",
+              "scopes": ["operator.admin"]
+            }
+          },
+          "notes": [
+            "device.id must be derived from publicKey using deriveDeviceIdFromPublicKey()",
+            "device.signedAt must be within 10 minutes of server time (DEVICE_SIGNATURE_SKEW_MS)",
+            "device.nonce is required for remote connections, optional for local",
+            "signature covers: deviceId, clientId, clientMode, role, scopes, signedAtMs, token, nonce",
+            "role can be 'operator' or 'node'",
+            "scopes: operator.admin, operator.approvals, operator.pairing"
+          ]
+        },
+        {
+          "action": "receive",
+          "expected": {
+            "type": "res",
+            "id": "{{request_id}}",
+            "ok": true,
+            "payload": {
+              "type": "hello-ok",
+              "auth": {
+                "deviceToken": "{{issued_device_token}}",
+                "role": "operator",
+                "scopes": ["operator.admin"],
+                "issuedAtMs": "{{timestamp}}"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "connect_node_role",
+      "description": "Node client connection (remote command execution node)",
+      "source_reference": "message-handler.ts lines 729-740",
+      "steps": [
+        { "action": "open_connection" },
+        { "action": "receive", "expected_event": "connect.challenge" },
+        {
+          "action": "send",
+          "frame": {
+            "type": "req",
+            "id": "{{request_id}}",
+            "method": "connect",
+            "params": {
+              "minProtocol": 3,
+              "maxProtocol": 3,
+              "client": {
+                "id": "node-host",
+                "displayName": "Remote Node",
+                "version": "1.0.0",
+                "platform": "darwin",
+                "deviceFamily": "MacBookPro",
+                "mode": "node",
+                "instanceId": "{{instance_uuid}}"
+              },
+              "role": "node",
+              "commands": ["bash", "node", "python"],
+              "device": "{{device_identity}}"
+            }
+          },
+          "notes": [
+            "role='node' for remote execution nodes",
+            "commands array lists available executables on the node",
+            "Server filters commands against allowlist in config"
+          ]
+        },
+        {
+          "action": "receive",
+          "expected_response": {
+            "type": "res",
+            "id": "{{request_id}}",
+            "ok": true,
+            "payload": {
+              "type": "hello-ok",
+              "protocol": 3,
+              "features": {
+                "methods": "{{full_gateway_methods}}",
+                "events": "{{full_gateway_events}}"
+              },
+              "auth": {
+                "deviceToken": "{{issued_device_token}}",
+                "role": "node",
+                "scopes": ["node.exec"],
+                "issuedAtMs": "{{timestamp}}"
+              }
+            }
+          },
+          "notes": [
+            "Node role receives full method/event lists (same as operator)",
+            "Role-based access control happens at method invocation time, not connection time",
+            "Device token issued with node-specific scopes",
+            "Commands array is validated and filtered by server against allowlist"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "handshake_timeout",
+      "description": "Server closes connection if handshake not completed within timeout",
+      "source_reference": "ws-connection.ts lines 214-224",
+      "steps": [
+        { "action": "open_connection" },
+        { "action": "receive", "expected_event": "connect.challenge" },
+        { "action": "wait", "duration_ms": 10100 },
+        { "action": "expect_close", "code": 1000, "reason": "" }
+      ],
+      "notes": ["Default handshake timeout is 10 seconds (DEFAULT_HANDSHAKE_TIMEOUT_MS)"]
+    },
+    {
+      "name": "protocol_mismatch",
+      "description": "Server rejects connection with incompatible protocol version",
+      "source_reference": "message-handler.ts lines 307-333",
+      "steps": [
+        { "action": "open_connection" },
+        { "action": "receive", "expected_event": "connect.challenge" },
+        {
+          "action": "send",
+          "frame": {
+            "type": "req",
+            "id": "c1",
+            "method": "connect",
+            "params": {
+              "minProtocol": 99,
+              "maxProtocol": 99,
+              "client": { "id": "test", "version": "1.0.0", "platform": "test", "mode": "test" }
+            }
+          }
+        },
+        {
+          "action": "receive",
+          "expected": {
+            "type": "res",
+            "id": "c1",
+            "ok": false,
+            "error": {
+              "code": "INVALID_REQUEST",
+              "message": "protocol mismatch",
+              "details": { "expectedProtocol": 3 }
+            }
+          }
+        },
+        { "action": "expect_close", "code": 1002, "reason": "protocol mismatch" }
+      ]
+    },
+    {
+      "name": "invalid_first_request",
+      "description": "Server rejects non-connect request as first message",
+      "source_reference": "message-handler.ts lines 263-301",
+      "steps": [
+        { "action": "open_connection" },
+        { "action": "receive", "expected_event": "connect.challenge" },
+        {
+          "action": "send",
+          "frame": {
+            "type": "req",
+            "id": "h1",
+            "method": "health"
+          }
+        },
+        {
+          "action": "receive",
+          "expected": {
+            "type": "res",
+            "id": "h1",
+            "ok": false,
+            "error": {
+              "code": "INVALID_REQUEST",
+              "message": "invalid handshake: first request must be connect"
+            }
+          }
+        },
+        { "action": "expect_close", "code": 1008, "reason": "invalid handshake: first request must be connect" }
+      ]
+    }
+  ],
+  "connect_params_schema": {
+    "type": "object",
+    "source": "src/gateway/protocol/schema/frames.ts ConnectParamsSchema",
+    "required": ["minProtocol", "maxProtocol", "client"],
+    "properties": {
+      "minProtocol": { "type": "integer", "minimum": 1 },
+      "maxProtocol": { "type": "integer", "minimum": 1 },
+      "client": {
+        "type": "object",
+        "required": ["id", "version", "platform", "mode"],
+        "properties": {
+          "id": { "type": "string", "enum": ["webchat-ui", "clawdbot-control-ui", "webchat", "cli", "gateway-client", "clawdbot-macos", "clawdbot-ios", "clawdbot-android", "node-host", "test", "fingerprint", "clawdbot-probe"] },
+          "displayName": { "type": "string" },
+          "version": { "type": "string", "minLength": 1 },
+          "platform": { "type": "string", "minLength": 1 },
+          "deviceFamily": { "type": "string" },
+          "modelIdentifier": { "type": "string" },
+          "mode": { "type": "string", "enum": ["webchat", "cli", "ui", "backend", "node", "probe", "test"] },
+          "instanceId": { "type": "string" }
+        }
+      },
+      "caps": { "type": "array", "items": { "type": "string" } },
+      "commands": { "type": "array", "items": { "type": "string" }, "description": "Available commands for node role" },
+      "permissions": { "type": "object", "additionalProperties": { "type": "boolean" } },
+      "pathEnv": { "type": "string" },
+      "role": { "type": "string", "minLength": 1, "description": "Role is validated semantically after schema validation; currently 'operator' or 'node' are recognized" },
+      "scopes": { "type": "array", "items": { "type": "string" }, "description": "Permission scopes: operator.admin, operator.approvals, operator.pairing" },
+      "device": {
+        "type": "object",
+        "required": ["id", "publicKey", "signature", "signedAt"],
+        "properties": {
+          "id": { "type": "string", "description": "Device ID derived from publicKey" },
+          "publicKey": { "type": "string", "description": "Base64URL-encoded Ed25519 public key" },
+          "signature": { "type": "string", "description": "Base64URL-encoded Ed25519 signature" },
+          "signedAt": { "type": "integer", "description": "Timestamp when signature was created (ms)" },
+          "nonce": { "type": "string", "description": "Challenge nonce from connect.challenge event (required for remote)" }
+        }
+      },
+      "auth": {
+        "type": "object",
+        "properties": {
+          "token": { "type": "string", "description": "Gateway auth token or device token" },
+          "password": { "type": "string", "description": "Gateway auth password" }
+        }
+      },
+      "locale": { "type": "string" },
+      "userAgent": { "type": "string" }
+    }
+  },
+  "hello_ok_schema": {
+    "type": "object",
+    "source": "src/gateway/protocol/schema/frames.ts HelloOkSchema",
+    "required": ["type", "protocol", "server", "features", "snapshot", "policy"],
+    "properties": {
+      "type": { "const": "hello-ok" },
+      "protocol": { "type": "integer", "description": "Negotiated protocol version (currently 3)" },
+      "server": {
+        "type": "object",
+        "required": ["version", "connId"],
+        "properties": {
+          "version": { "type": "string", "description": "Server version from CLAWDBOT_VERSION env or package.json" },
+          "commit": { "type": "string", "description": "Git commit hash from GIT_COMMIT env" },
+          "host": { "type": "string", "description": "Server hostname from os.hostname()" },
+          "connId": { "type": "string", "description": "Unique connection ID (UUID)" }
+        }
+      },
+      "features": {
+        "type": "object",
+        "required": ["methods", "events"],
+        "properties": {
+          "methods": { "type": "array", "items": { "type": "string" }, "description": "List of available RPC methods" },
+          "events": { "type": "array", "items": { "type": "string" }, "description": "List of events the server may emit" }
+        }
+      },
+      "snapshot": {
+        "type": "object",
+        "required": ["presence", "health", "stateVersion", "uptimeMs"],
+        "properties": {
+          "presence": { "type": "array", "description": "Current connected clients" },
+          "health": { "type": "object", "description": "Health status snapshot" },
+          "stateVersion": {
+            "type": "object",
+            "properties": {
+              "presence": { "type": "integer" },
+              "health": { "type": "integer" }
+            }
+          },
+          "uptimeMs": { "type": "integer" },
+          "configPath": { "type": "string" },
+          "stateDir": { "type": "string" },
+          "sessionDefaults": {
+            "type": "object",
+            "properties": {
+              "defaultAgentId": { "type": "string" },
+              "mainKey": { "type": "string" },
+              "mainSessionKey": { "type": "string" },
+              "scope": { "type": "string" }
+            }
+          }
+        }
+      },
+      "canvasHostUrl": { "type": "string", "description": "URL for canvas host if enabled" },
+      "auth": {
+        "type": "object",
+        "description": "Issued device token (only if device identity provided)",
+        "properties": {
+          "deviceToken": { "type": "string" },
+          "role": { "type": "string" },
+          "scopes": { "type": "array", "items": { "type": "string" } },
+          "issuedAtMs": { "type": "integer" }
+        }
+      },
+      "policy": {
+        "type": "object",
+        "required": ["maxPayload", "maxBufferedBytes", "tickIntervalMs"],
+        "properties": {
+          "maxPayload": { "type": "integer", "const": 524288, "description": "MAX_PAYLOAD_BYTES = 512 * 1024" },
+          "maxBufferedBytes": { "type": "integer", "const": 1572864, "description": "MAX_BUFFERED_BYTES = 1.5 * 1024 * 1024" },
+          "tickIntervalMs": { "type": "integer", "const": 30000, "description": "TICK_INTERVAL_MS = 30000" }
+        }
+      }
+    }
+  }
+}

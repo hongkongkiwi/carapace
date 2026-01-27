@@ -1,0 +1,372 @@
+{
+  "$schema": "golden-trace-v1",
+  "description": "OpenAI-compatible /v1/chat/completions endpoint - provides chat completion API",
+  "source_files": [
+    "src/gateway/openai-http.ts",
+    "src/gateway/http-utils.ts"
+  ],
+  "endpoint": "/v1/chat/completions",
+  "method": "POST",
+  "authentication": {
+    "required": true,
+    "methods": ["Authorization: Bearer <token>"],
+    "config_requirement": "gateway.http.openAiChatCompletions.enabled: true (default: false)"
+  },
+  "request_schema": {
+    "type": "object",
+    "required": ["messages"],
+    "properties": {
+      "model": {
+        "type": "string",
+        "default": "clawdbot",
+        "description": "Model identifier. Can include agent ID as 'clawdbot:<agentId>' or 'agent:<agentId>'",
+        "examples": ["clawdbot", "clawdbot:email-agent", "agent:main"]
+      },
+      "messages": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "role": {
+              "type": "string",
+              "enum": ["system", "developer", "user", "assistant", "function", "tool"],
+              "description": "Message role. 'system' and 'developer' become system prompts. 'function' normalized to 'tool'."
+            },
+            "content": {
+              "oneOf": [
+                { "type": "string" },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "type": { "type": "string", "enum": ["text", "input_text"] },
+                      "text": { "type": "string" },
+                      "input_text": { "type": "string" }
+                    }
+                  }
+                }
+              ],
+              "description": "Message content as string or array of content parts"
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional name for tool messages"
+            }
+          }
+        },
+        "description": "Array of conversation messages"
+      },
+      "stream": {
+        "type": "boolean",
+        "default": false,
+        "description": "Enable streaming responses via SSE"
+      },
+      "user": {
+        "type": "string",
+        "description": "Optional user identifier for session management"
+      }
+    }
+  },
+  "response_schema": {
+    "non_streaming": {
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "body": {
+        "type": "object",
+        "required": ["id", "object", "created", "model", "choices", "usage"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^chatcmpl_" },
+          "object": { "type": "string", "const": "chat.completion" },
+          "created": { "type": "integer", "description": "Unix timestamp" },
+          "model": { "type": "string" },
+          "choices": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "index": { "type": "integer" },
+                "message": {
+                  "type": "object",
+                  "properties": {
+                    "role": { "type": "string", "const": "assistant" },
+                    "content": { "type": "string" }
+                  }
+                },
+                "finish_reason": { "type": "string", "const": "stop" }
+              }
+            }
+          },
+          "usage": {
+            "type": "object",
+            "properties": {
+              "prompt_tokens": { "type": "integer" },
+              "completion_tokens": { "type": "integer" },
+              "total_tokens": { "type": "integer" }
+            }
+          }
+        }
+      }
+    },
+    "streaming": {
+      "status": 200,
+      "content_type": "text/event-stream; charset=utf-8",
+      "headers": {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive"
+      },
+      "events": [
+        {
+          "description": "First chunk includes role",
+          "data": {
+            "id": "chatcmpl_<uuid>",
+            "object": "chat.completion.chunk",
+            "created": "<unix_timestamp>",
+            "model": "<model>",
+            "choices": [{ "index": 0, "delta": { "role": "assistant" } }]
+          }
+        },
+        {
+          "description": "Content chunks",
+          "data": {
+            "id": "chatcmpl_<uuid>",
+            "object": "chat.completion.chunk",
+            "choices": [{ "index": 0, "delta": { "content": "<text>" }, "finish_reason": null }]
+          }
+        },
+        {
+          "description": "Final event",
+          "data": "[DONE]"
+        }
+      ]
+    },
+    "error_unauthorized": {
+      "status": 401,
+      "body": {
+        "error": { "message": "Unauthorized", "type": "unauthorized" }
+      }
+    },
+    "error_validation": {
+      "status": 400,
+      "body": {
+        "error": { "message": "<description>", "type": "invalid_request_error" }
+      }
+    },
+    "error_server": {
+      "status": 500,
+      "body": {
+        "error": { "message": "<error>", "type": "api_error" }
+      }
+    }
+  },
+  "headers": {
+    "X-Clawdbot-Agent-Id": {
+      "description": "Override agent ID (alternative to model field)",
+      "aliases": ["X-Clawdbot-Agent"]
+    },
+    "X-Clawdbot-Session-Key": {
+      "description": "Explicit session key for conversation context"
+    }
+  },
+  "session_key_resolution": {
+    "priority": [
+      "X-Clawdbot-Session-Key header if present",
+      "Auto-generated: openai-user:<user> if user field provided",
+      "Auto-generated: openai:<uuid> otherwise"
+    ],
+    "format": "Built with buildAgentMainSessionKey using resolved agentId"
+  },
+  "scenarios": [
+    {
+      "name": "simple_completion",
+      "description": "Basic non-streaming chat completion",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": { "Authorization": "Bearer {{gateway_token}}" },
+        "body": {
+          "model": "clawdbot",
+          "messages": [
+            { "role": "user", "content": "Hello" }
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "body_schema": {
+          "properties": {
+            "object": { "const": "chat.completion" },
+            "choices": {
+              "items": {
+                "properties": {
+                  "message": {
+                    "properties": {
+                      "role": { "const": "assistant" }
+                    }
+                  },
+                  "finish_reason": { "const": "stop" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "streaming_completion",
+      "description": "Streaming chat completion via SSE",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": { "Authorization": "Bearer {{gateway_token}}" },
+        "body": {
+          "model": "clawdbot",
+          "messages": [{ "role": "user", "content": "Hello" }],
+          "stream": true
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-cache"
+        }
+      }
+    },
+    {
+      "name": "with_system_message",
+      "description": "System message becomes extra system prompt",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": { "Authorization": "Bearer {{gateway_token}}" },
+        "body": {
+          "model": "clawdbot",
+          "messages": [
+            { "role": "system", "content": "You are a helpful assistant." },
+            { "role": "user", "content": "Hi" }
+          ]
+        }
+      },
+      "response": { "status": 200 }
+    },
+    {
+      "name": "with_agent_override",
+      "description": "Agent ID specified via model field",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": { "Authorization": "Bearer {{gateway_token}}" },
+        "body": {
+          "model": "clawdbot:email-agent",
+          "messages": [{ "role": "user", "content": "Send summary" }]
+        }
+      },
+      "response": { "status": 200 },
+      "notes": ["agentId resolved to 'email-agent'"]
+    },
+    {
+      "name": "with_header_agent_override",
+      "description": "Agent ID specified via header (takes precedence over model)",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": {
+          "Authorization": "Bearer {{gateway_token}}",
+          "X-Clawdbot-Agent-Id": "special-agent"
+        },
+        "body": {
+          "model": "clawdbot:email-agent",
+          "messages": [{ "role": "user", "content": "test" }]
+        }
+      },
+      "response": { "status": 200 },
+      "notes": ["agentId resolved to 'special-agent' (header takes precedence)"]
+    },
+    {
+      "name": "error_missing_user_message",
+      "description": "No user message in messages array",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": { "Authorization": "Bearer {{gateway_token}}" },
+        "body": {
+          "model": "clawdbot",
+          "messages": [
+            { "role": "system", "content": "You are helpful" }
+          ]
+        }
+      },
+      "response": {
+        "status": 400,
+        "body_schema": {
+          "properties": {
+            "error": {
+              "properties": {
+                "message": { "const": "Missing user message in `messages`." },
+                "type": { "const": "invalid_request_error" }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "error_method_not_allowed",
+      "description": "Only POST is allowed",
+      "request": {
+        "method": "GET",
+        "path": "/v1/chat/completions"
+      },
+      "response": {
+        "status": 405,
+        "headers": { "Allow": "POST" }
+      }
+    },
+    {
+      "name": "error_unauthorized",
+      "description": "Missing or invalid token",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "body": { "model": "clawdbot", "messages": [] }
+      },
+      "response": {
+        "status": 401,
+        "body_schema": {
+          "properties": {
+            "error": {
+              "properties": {
+                "message": { "const": "Unauthorized" },
+                "type": { "const": "unauthorized" }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "multipart_content",
+      "description": "Content as array of parts",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": { "Authorization": "Bearer {{gateway_token}}" },
+        "body": {
+          "model": "clawdbot",
+          "messages": [
+            {
+              "role": "user",
+              "content": [
+                { "type": "text", "text": "Hello " },
+                { "type": "text", "text": "World" }
+              ]
+            }
+          ]
+        }
+      },
+      "response": { "status": 200 },
+      "notes": ["Text parts are concatenated with newlines"]
+    }
+  ]
+}

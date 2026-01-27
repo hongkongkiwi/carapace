@@ -1,0 +1,218 @@
+{
+  "$schema": "golden-trace-v1",
+  "description": "Channel webhook HTTP endpoints - receive events from messaging platforms",
+  "source_files": [
+    "src/slack/http/registry.ts",
+    "src/line/http-registry.ts",
+    "src/gateway/server/plugins-http.ts"
+  ],
+  "endpoints": {
+    "slack": {
+      "default_path": "/slack/events",
+      "description": "Slack Events API webhook endpoint",
+      "configurable": true,
+      "config_key": "slack.accounts.<id>.webhookPath"
+    },
+    "line": {
+      "default_path": "/line/webhook",
+      "description": "LINE Messaging API webhook endpoint",
+      "configurable": true,
+      "config_key": "line.accounts.<id>.webhookPath"
+    },
+    "plugins": {
+      "description": "Plugin-registered HTTP routes",
+      "notes": ["Plugins can register custom routes via PluginRegistry.httpRoutes"]
+    }
+  },
+  "notes": [
+    "Webhook paths are configurable per account",
+    "Multiple accounts can register different paths",
+    "Duplicate path registration logs warning and is ignored",
+    "Handlers are registered/unregistered dynamically as channels connect/disconnect"
+  ],
+  "slack_scenarios": [
+    {
+      "name": "slack_url_verification",
+      "description": "Slack URL verification challenge (initial setup)",
+      "request": {
+        "method": "POST",
+        "path": "/slack/events",
+        "headers": { "Content-Type": "application/json" },
+        "body": {
+          "type": "url_verification",
+          "challenge": "3eZbrw1aBm2rZgRNFdxV2595E9CY3gmdALWMmHkvFXO7tYXAYM8P",
+          "token": "Jhj5dZrVaK7ZwHHjRyZWjbDl"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": "3eZbrw1aBm2rZgRNFdxV2595E9CY3gmdALWMmHkvFXO7tYXAYM8P"
+      },
+      "notes": ["Must echo back the challenge string"]
+    },
+    {
+      "name": "slack_event_callback",
+      "description": "Slack event callback (message, reaction, etc.)",
+      "request": {
+        "method": "POST",
+        "path": "/slack/events",
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Slack-Signature": "v0=...",
+          "X-Slack-Request-Timestamp": "1531420618"
+        },
+        "body": {
+          "type": "event_callback",
+          "event": {
+            "type": "message",
+            "channel": "C024BE91L",
+            "user": "U2147483697",
+            "text": "Hello world"
+          }
+        }
+      },
+      "response": {
+        "status": 200
+      },
+      "notes": ["Request signature should be verified"]
+    },
+    {
+      "name": "slack_custom_path",
+      "description": "Custom webhook path configured",
+      "config_note": "slack.accounts.work.webhookPath: '/webhooks/slack-work'",
+      "request": {
+        "method": "POST",
+        "path": "/webhooks/slack-work"
+      },
+      "response": {
+        "status": 200
+      }
+    },
+    {
+      "name": "slack_path_not_registered",
+      "description": "Unregistered path falls through",
+      "request": {
+        "method": "POST",
+        "path": "/slack/events"
+      },
+      "response": {
+        "status": 404
+      },
+      "notes": ["Returns 404 if no handler registered for this path"]
+    }
+  ],
+  "line_scenarios": [
+    {
+      "name": "line_webhook_event",
+      "description": "LINE webhook event (message, follow, etc.)",
+      "request": {
+        "method": "POST",
+        "path": "/line/webhook",
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Line-Signature": "..."
+        },
+        "body": {
+          "destination": "xxxxxxxxxx",
+          "events": [
+            {
+              "type": "message",
+              "message": {
+                "type": "text",
+                "id": "14353798921116",
+                "text": "Hello"
+              },
+              "replyToken": "nHuyWiB7yP5Zw52FIkcQobQuGDXCTA"
+            }
+          ]
+        }
+      },
+      "response": {
+        "status": 200
+      },
+      "notes": ["Request signature should be verified using channel secret"]
+    },
+    {
+      "name": "line_custom_path",
+      "description": "Custom LINE webhook path",
+      "config_note": "line.accounts.main.webhookPath: '/api/line/events'",
+      "request": {
+        "method": "POST",
+        "path": "/api/line/events"
+      },
+      "response": {
+        "status": 200
+      }
+    }
+  ],
+  "plugin_http_scenarios": [
+    {
+      "_note": "BREAKING CHANGE IN RUST GATEWAY: Plugin paths will be namespaced under /plugins/{pluginId}/. These traces document Node gateway behavior for reference.",
+      "name": "plugin_route_match",
+      "description": "Plugin-registered route is matched (Node gateway allows arbitrary paths)",
+      "request": {
+        "method": "POST",
+        "path": "/custom/plugin/endpoint"
+      },
+      "response": {
+        "status": 200
+      },
+      "notes": [
+        "Handled by registered plugin handler",
+        "Node gateway: arbitrary paths allowed",
+        "Rust gateway: paths namespaced to /plugins/{pluginId}/..."
+      ]
+    },
+    {
+      "name": "plugin_handler_error",
+      "description": "Plugin handler throws error",
+      "request": {
+        "method": "POST",
+        "path": "/custom/plugin/endpoint"
+      },
+      "response": {
+        "status": 500,
+        "body": "Internal Server Error"
+      },
+      "notes": ["Error logged as 'plugin http route failed (pluginId): <error>'"]
+    },
+    {
+      "name": "plugin_fallback_handlers",
+      "description": "Plugin fallback handlers checked in order",
+      "notes": [
+        "After path-based routes, generic handlers are checked",
+        "First handler returning true stops chain"
+      ]
+    }
+  ],
+  "path_normalization": {
+    "slack": {
+      "function": "normalizeSlackWebhookPath",
+      "default": "/slack/events",
+      "rules": [
+        "Empty/whitespace -> '/slack/events'",
+        "Leading slash added if missing",
+        "Path is trimmed"
+      ]
+    },
+    "line": {
+      "function": "normalizeLineWebhookPath",
+      "default": "/line/webhook",
+      "rules": [
+        "Empty/whitespace -> '/line/webhook'",
+        "Leading slash added if missing",
+        "Path is trimmed"
+      ]
+    }
+  },
+  "registration_behavior": {
+    "duplicate_path": {
+      "action": "Logs warning, returns no-op unregister function",
+      "message_pattern": "{channel}: webhook path {path} already registered"
+    },
+    "unregister": {
+      "description": "Returns function to remove handler from registry",
+      "usage": "Called when channel disconnects or account removed"
+    }
+  }
+}

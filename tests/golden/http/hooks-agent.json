@@ -1,0 +1,321 @@
+{
+  "$schema": "golden-trace-v1",
+  "description": "HTTP /hooks/agent endpoint - triggers an agent job with message and options",
+  "source_files": [
+    "src/gateway/server-http.ts",
+    "src/gateway/hooks.ts"
+  ],
+  "endpoint": "/hooks/agent",
+  "method": "POST",
+  "authentication": {
+    "required": true,
+    "methods": [
+      "Authorization: Bearer <token>",
+      "X-Clawdbot-Token: <token>",
+      "?token=<token> (deprecated)"
+    ]
+  },
+  "request_schema": {
+    "type": "object",
+    "required": ["message"],
+    "properties": {
+      "message": {
+        "type": "string",
+        "description": "Message for the agent to process (will be trimmed, must be non-empty)"
+      },
+      "name": {
+        "type": "string",
+        "default": "Hook",
+        "description": "Display name for this hook invocation"
+      },
+      "channel": {
+        "type": "string",
+        "default": "last",
+        "description": "Target messaging channel for delivery. 'last' uses the most recent active channel.",
+        "enum_note": "Valid values depend on enabled channel plugins"
+      },
+      "to": {
+        "type": "string",
+        "description": "Optional recipient identifier (e.g., phone number, chat ID)"
+      },
+      "model": {
+        "type": "string",
+        "description": "Optional model override (e.g., 'openai/gpt-4.1-mini')"
+      },
+      "thinking": {
+        "type": "string",
+        "description": "Optional thinking/reasoning level (e.g., 'low', 'medium', 'high')"
+      },
+      "deliver": {
+        "type": "boolean",
+        "default": true,
+        "description": "Whether to deliver the response to the channel"
+      },
+      "wakeMode": {
+        "type": "string",
+        "enum": ["now", "next-heartbeat"],
+        "default": "now",
+        "description": "When to trigger the agent job"
+      },
+      "sessionKey": {
+        "type": "string",
+        "description": "Optional session key for conversation context. Auto-generated if not provided."
+      },
+      "timeoutSeconds": {
+        "type": "integer",
+        "minimum": 1,
+        "description": "Optional timeout in seconds for the agent job"
+      },
+      "allowUnsafeExternalContent": {
+        "type": "boolean",
+        "description": "Whether to allow processing of potentially unsafe external content"
+      }
+    }
+  },
+  "response_schema": {
+    "success": {
+      "status": 202,
+      "body": {
+        "type": "object",
+        "required": ["ok", "runId"],
+        "properties": {
+          "ok": { "type": "boolean", "const": true },
+          "runId": { "type": "string", "description": "Unique identifier for the agent run" }
+        }
+      }
+    },
+    "error_validation": {
+      "status": 400,
+      "body": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean", "const": false },
+          "error": { "type": "string" }
+        }
+      }
+    }
+  },
+  "valid_channels": {
+    "note": "Depends on loaded channel plugins. Common values:",
+    "core": ["last", "telegram", "discord", "slack", "signal", "imessage", "whatsapp", "webchat"],
+    "extensions": ["msteams", "matrix", "zalo", "line"],
+    "aliases": {
+      "imsg": "imessage",
+      "wa": "whatsapp",
+      "tg": "telegram",
+      "teams": "msteams"
+    }
+  },
+  "scenarios": [
+    {
+      "name": "agent_success_minimal",
+      "description": "Minimal request with just message - uses all defaults",
+      "request": {
+        "method": "POST",
+        "path": "/hooks/agent",
+        "headers": { "Authorization": "Bearer {{hooks_token}}" },
+        "body": { "message": "Do something" }
+      },
+      "response": {
+        "status": 202,
+        "body_schema": {
+          "type": "object",
+          "required": ["ok", "runId"],
+          "properties": {
+            "ok": { "const": true },
+            "runId": { "type": "string", "minLength": 1 }
+          }
+        }
+      },
+      "notes": [
+        "Defaults: name='Hook', channel='last', deliver=true, wakeMode='now'",
+        "sessionKey auto-generated as 'hook:<uuid>'"
+      ]
+    },
+    {
+      "name": "agent_success_full_options",
+      "description": "Request with all optional parameters specified",
+      "request": {
+        "method": "POST",
+        "path": "/hooks/agent",
+        "headers": { "Authorization": "Bearer {{hooks_token}}" },
+        "body": {
+          "message": "Send email summary",
+          "name": "Email Hook",
+          "channel": "telegram",
+          "to": "+1234567890",
+          "model": "openai/gpt-4.1-mini",
+          "thinking": "low",
+          "deliver": true,
+          "wakeMode": "next-heartbeat",
+          "sessionKey": "my-custom-session",
+          "timeoutSeconds": 300
+        }
+      },
+      "response": {
+        "status": 202,
+        "body_schema": {
+          "properties": {
+            "ok": { "const": true },
+            "runId": { "type": "string" }
+          }
+        }
+      }
+    },
+    {
+      "name": "agent_success_no_deliver",
+      "description": "Agent runs but does not deliver response to channel",
+      "request": {
+        "method": "POST",
+        "path": "/hooks/agent",
+        "headers": { "Authorization": "Bearer {{hooks_token}}" },
+        "body": {
+          "message": "Process this silently",
+          "deliver": false
+        }
+      },
+      "response": { "status": 202 }
+    },
+    {
+      "name": "agent_success_channel_alias",
+      "description": "Channel aliases are normalized (imsg -> imessage)",
+      "request": {
+        "method": "POST",
+        "path": "/hooks/agent",
+        "headers": { "Authorization": "Bearer {{hooks_token}}" },
+        "body": {
+          "message": "Send via iMessage",
+          "channel": "imsg"
+        }
+      },
+      "response": { "status": 202 },
+      "notes": ["'imsg' is normalized to 'imessage'"]
+    },
+    {
+      "name": "agent_error_missing_message",
+      "description": "Missing message field returns validation error",
+      "request": {
+        "method": "POST",
+        "path": "/hooks/agent",
+        "headers": { "Authorization": "Bearer {{hooks_token}}" },
+        "body": {}
+      },
+      "response": {
+        "status": 400,
+        "body_schema": {
+          "properties": {
+            "ok": { "const": false },
+            "error": { "const": "message required" }
+          }
+        }
+      }
+    },
+    {
+      "name": "agent_error_blank_message",
+      "description": "Blank/whitespace-only message returns validation error",
+      "request": {
+        "method": "POST",
+        "path": "/hooks/agent",
+        "headers": { "Authorization": "Bearer {{hooks_token}}" },
+        "body": { "message": "   " }
+      },
+      "response": {
+        "status": 400,
+        "body_schema": {
+          "properties": {
+            "ok": { "const": false },
+            "error": { "const": "message required" }
+          }
+        }
+      }
+    },
+    {
+      "name": "agent_error_invalid_channel",
+      "description": "Unknown channel identifier returns validation error",
+      "request": {
+        "method": "POST",
+        "path": "/hooks/agent",
+        "headers": { "Authorization": "Bearer {{hooks_token}}" },
+        "body": {
+          "message": "test",
+          "channel": "sms"
+        }
+      },
+      "response": {
+        "status": 400,
+        "body_schema": {
+          "properties": {
+            "ok": { "const": false },
+            "error": { "type": "string", "pattern": "channel must be" }
+          }
+        }
+      },
+      "notes": ["Error message lists valid channel options based on loaded plugins"]
+    },
+    {
+      "name": "agent_error_empty_model",
+      "description": "Empty model string after trim returns validation error",
+      "request": {
+        "method": "POST",
+        "path": "/hooks/agent",
+        "headers": { "Authorization": "Bearer {{hooks_token}}" },
+        "body": {
+          "message": "test",
+          "model": "   "
+        }
+      },
+      "response": {
+        "status": 400,
+        "body_schema": {
+          "properties": {
+            "ok": { "const": false },
+            "error": { "const": "model required" }
+          }
+        }
+      },
+      "notes": ["If model key is present, it must be a non-empty string after trimming"]
+    },
+    {
+      "name": "agent_session_key_auto_generated",
+      "description": "Session key auto-generated with 'hook:' prefix when not provided",
+      "request": {
+        "method": "POST",
+        "path": "/hooks/agent",
+        "headers": { "Authorization": "Bearer {{hooks_token}}" },
+        "body": { "message": "test" }
+      },
+      "response": { "status": 202 },
+      "notes": ["Session key will be 'hook:<uuid>'"]
+    },
+    {
+      "name": "agent_timeout_seconds_floor",
+      "description": "timeoutSeconds is floored to integer",
+      "request": {
+        "method": "POST",
+        "path": "/hooks/agent",
+        "headers": { "Authorization": "Bearer {{hooks_token}}" },
+        "body": {
+          "message": "test",
+          "timeoutSeconds": 60.7
+        }
+      },
+      "response": { "status": 202 },
+      "notes": ["timeoutSeconds 60.7 becomes 60"]
+    },
+    {
+      "name": "agent_timeout_seconds_invalid_ignored",
+      "description": "Non-positive or non-finite timeoutSeconds is ignored",
+      "request": {
+        "method": "POST",
+        "path": "/hooks/agent",
+        "headers": { "Authorization": "Bearer {{hooks_token}}" },
+        "body": {
+          "message": "test",
+          "timeoutSeconds": -1
+        }
+      },
+      "response": { "status": 202 },
+      "notes": ["Invalid timeoutSeconds is silently ignored"]
+    }
+  ]
+}

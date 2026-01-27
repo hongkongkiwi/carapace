@@ -1,0 +1,410 @@
+{
+  "$schema": "golden-trace-v1",
+  "description": "Hook mappings - custom webhook transformations for /hooks/<path> endpoints",
+  "source_files": [
+    "src/gateway/hooks-mapping.ts",
+    "src/gateway/server-http.ts"
+  ],
+  "config_key": "hooks.mappings",
+  "notes": [
+    "Mappings allow custom paths under /hooks/* to trigger wake or agent actions",
+    "Mappings are processed in order; first matching mapping wins",
+    "Supports template variables for dynamic message/session generation",
+    "Custom transform modules can override or skip actions"
+  ],
+  "mapping_config_schema": {
+    "type": "object",
+    "properties": {
+      "id": {
+        "type": "string",
+        "description": "Unique identifier for the mapping (auto-generated if not provided)"
+      },
+      "match": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to match (e.g., 'gmail' matches /hooks/gmail)"
+          },
+          "source": {
+            "type": "string",
+            "description": "Match payload.source field value"
+          }
+        }
+      },
+      "action": {
+        "type": "string",
+        "enum": ["wake", "agent"],
+        "default": "agent"
+      },
+      "wakeMode": {
+        "type": "string",
+        "enum": ["now", "next-heartbeat"],
+        "default": "now"
+      },
+      "name": {
+        "type": "string",
+        "description": "Display name (supports templates)"
+      },
+      "sessionKey": {
+        "type": "string",
+        "description": "Session key (supports templates)"
+      },
+      "messageTemplate": {
+        "type": "string",
+        "description": "Message template for agent action"
+      },
+      "textTemplate": {
+        "type": "string",
+        "description": "Text template for wake action"
+      },
+      "deliver": {
+        "type": "boolean"
+      },
+      "allowUnsafeExternalContent": {
+        "type": "boolean"
+      },
+      "channel": {
+        "type": "string",
+        "description": "Target channel"
+      },
+      "to": {
+        "type": "string",
+        "description": "Recipient (supports templates)"
+      },
+      "model": {
+        "type": "string",
+        "description": "Model override (supports templates)"
+      },
+      "thinking": {
+        "type": "string",
+        "description": "Thinking level (supports templates)"
+      },
+      "timeoutSeconds": {
+        "type": "integer"
+      },
+      "transform": {
+        "type": "object",
+        "properties": {
+          "module": {
+            "type": "string",
+            "description": "Path to transform module (relative to transformsDir or config dir)"
+          },
+          "export": {
+            "type": "string",
+            "description": "Export name (default: 'default' or 'transform')"
+          }
+        }
+      }
+    }
+  },
+  "template_variables": {
+    "description": "Variables available in template strings (messageTemplate, textTemplate, sessionKey, etc.)",
+    "syntax": "{{expression}}",
+    "builtins": {
+      "path": "Request path (without /hooks/ prefix)",
+      "now": "ISO timestamp of request"
+    },
+    "context_access": {
+      "headers.<name>": "Access request header by name",
+      "query.<name>": "Access URL query parameter",
+      "payload.<path>": "Access payload field by dot notation",
+      "<path>": "Shorthand for payload.<path>"
+    },
+    "path_notation": {
+      "examples": [
+        "messages[0].id - First array element property",
+        "user.name - Nested object property",
+        "data[0][1].value - Multiple array indexes"
+      ]
+    }
+  },
+  "presets": {
+    "gmail": {
+      "description": "Gmail webhook preset for email notifications",
+      "path": "gmail",
+      "config_override": "hooks.gmail.allowUnsafeExternalContent",
+      "template": {
+        "sessionKey": "hook:gmail:{{messages[0].id}}",
+        "messageTemplate": "New email from {{messages[0].from}}\nSubject: {{messages[0].subject}}\n{{messages[0].snippet}}\n{{messages[0].body}}"
+      }
+    }
+  },
+  "transform_module": {
+    "description": "Custom JavaScript/TypeScript module for webhook transformation",
+    "export_signature": "(ctx: HookMappingContext) => HookTransformResult | Promise<HookTransformResult>",
+    "context_type": {
+      "payload": "Record<string, unknown> - Request body",
+      "headers": "Record<string, string> - Request headers (lowercase keys)",
+      "url": "URL - Parsed request URL",
+      "path": "string - Path after /hooks/ prefix"
+    },
+    "return_type": {
+      "null": "Skip this webhook (return 204 No Content)",
+      "partial_object": "Override specific fields",
+      "fields": [
+        "kind: 'wake' | 'agent'",
+        "text (for wake)",
+        "mode (for wake)",
+        "message (for agent)",
+        "wakeMode, name, sessionKey, deliver, allowUnsafeExternalContent, channel, to, model, thinking, timeoutSeconds"
+      ]
+    },
+    "caching": "Transform modules are cached after first load"
+  },
+  "scenarios": [
+    {
+      "name": "custom_path_mapping",
+      "description": "Custom path triggers agent action",
+      "config": {
+        "hooks.mappings": [{
+          "id": "github-webhook",
+          "match": { "path": "github" },
+          "action": "agent",
+          "messageTemplate": "GitHub {{action}}: {{repository.full_name}}"
+        }]
+      },
+      "request": {
+        "method": "POST",
+        "path": "/hooks/github",
+        "headers": { "Authorization": "Bearer {{hooks_token}}" },
+        "body": {
+          "action": "push",
+          "repository": { "full_name": "user/repo" }
+        }
+      },
+      "response": {
+        "status": 202,
+        "body_schema": {
+          "properties": {
+            "ok": { "const": true },
+            "runId": { "type": "string" }
+          }
+        }
+      }
+    },
+    {
+      "name": "wake_action_mapping",
+      "description": "Mapping triggers wake action",
+      "config": {
+        "hooks.mappings": [{
+          "id": "wake-trigger",
+          "match": { "path": "trigger" },
+          "action": "wake",
+          "textTemplate": "Wake triggered: {{reason}}"
+        }]
+      },
+      "request": {
+        "method": "POST",
+        "path": "/hooks/trigger",
+        "headers": { "Authorization": "Bearer {{hooks_token}}" },
+        "body": { "reason": "scheduled task" }
+      },
+      "response": {
+        "status": 200,
+        "body_schema": {
+          "properties": {
+            "ok": { "const": true },
+            "mode": { "type": "string" }
+          }
+        }
+      }
+    },
+    {
+      "name": "source_matching",
+      "description": "Match by payload.source field",
+      "config": {
+        "hooks.mappings": [{
+          "match": { "path": "events", "source": "stripe" },
+          "messageTemplate": "Stripe event: {{type}}"
+        }]
+      },
+      "request": {
+        "method": "POST",
+        "path": "/hooks/events",
+        "headers": { "Authorization": "Bearer {{hooks_token}}" },
+        "body": {
+          "source": "stripe",
+          "type": "payment.succeeded"
+        }
+      },
+      "response": { "status": 202 }
+    },
+    {
+      "name": "template_with_array_access",
+      "description": "Template accessing array elements",
+      "config": {
+        "hooks.mappings": [{
+          "match": { "path": "batch" },
+          "messageTemplate": "First: {{items[0].name}}, Second: {{items[1].name}}"
+        }]
+      },
+      "request": {
+        "method": "POST",
+        "path": "/hooks/batch",
+        "headers": { "Authorization": "Bearer {{hooks_token}}" },
+        "body": {
+          "items": [
+            { "name": "Alpha" },
+            { "name": "Beta" }
+          ]
+        }
+      },
+      "response": { "status": 202 }
+    },
+    {
+      "name": "template_with_headers",
+      "description": "Template accessing request headers",
+      "config": {
+        "hooks.mappings": [{
+          "match": { "path": "notify" },
+          "messageTemplate": "From: {{headers.x-source}} - {{message}}"
+        }]
+      },
+      "request": {
+        "method": "POST",
+        "path": "/hooks/notify",
+        "headers": {
+          "Authorization": "Bearer {{hooks_token}}",
+          "X-Source": "monitoring-system"
+        },
+        "body": { "message": "Alert triggered" }
+      },
+      "response": { "status": 202 }
+    },
+    {
+      "name": "gmail_preset",
+      "description": "Gmail preset enabled via presets config",
+      "config": {
+        "hooks.presets": ["gmail"]
+      },
+      "request": {
+        "method": "POST",
+        "path": "/hooks/gmail",
+        "headers": { "Authorization": "Bearer {{hooks_token}}" },
+        "body": {
+          "messages": [{
+            "id": "msg123",
+            "from": "sender@example.com",
+            "subject": "Test email",
+            "snippet": "Email preview...",
+            "body": "Full email body"
+          }]
+        }
+      },
+      "response": { "status": 202 }
+    },
+    {
+      "name": "transform_skip",
+      "description": "Transform returns null to skip webhook",
+      "config": {
+        "hooks.mappings": [{
+          "match": { "path": "filtered" },
+          "transform": { "module": "./filter-transform.js" }
+        }]
+      },
+      "transform_module_behavior": "Returns null for unwanted events",
+      "request": {
+        "method": "POST",
+        "path": "/hooks/filtered",
+        "headers": { "Authorization": "Bearer {{hooks_token}}" },
+        "body": { "skip": true }
+      },
+      "response": {
+        "status": 204,
+        "body": ""
+      }
+    },
+    {
+      "name": "transform_override",
+      "description": "Transform overrides mapping fields",
+      "config": {
+        "hooks.mappings": [{
+          "match": { "path": "transform" },
+          "messageTemplate": "Default message",
+          "transform": { "module": "./custom-transform.js", "export": "process" }
+        }]
+      },
+      "transform_module_behavior": "Returns { message: 'Custom: ' + ctx.payload.data }",
+      "request": {
+        "method": "POST",
+        "path": "/hooks/transform",
+        "headers": { "Authorization": "Bearer {{hooks_token}}" },
+        "body": { "data": "input value" }
+      },
+      "response": { "status": 202 },
+      "notes": ["Message will be 'Custom: input value' from transform"]
+    },
+    {
+      "name": "no_matching_mapping",
+      "description": "Path with no matching mapping returns 404",
+      "request": {
+        "method": "POST",
+        "path": "/hooks/unknown-path",
+        "headers": { "Authorization": "Bearer {{hooks_token}}" },
+        "body": {}
+      },
+      "response": {
+        "status": 404,
+        "body": "Not Found"
+      }
+    },
+    {
+      "name": "mapping_error_empty_message",
+      "description": "Mapping produces empty message",
+      "config": {
+        "hooks.mappings": [{
+          "match": { "path": "empty" },
+          "messageTemplate": "{{nonexistent}}"
+        }]
+      },
+      "request": {
+        "method": "POST",
+        "path": "/hooks/empty",
+        "headers": { "Authorization": "Bearer {{hooks_token}}" },
+        "body": {}
+      },
+      "response": {
+        "status": 400,
+        "body_schema": {
+          "properties": {
+            "ok": { "const": false },
+            "error": { "const": "hook mapping requires message" }
+          }
+        }
+      }
+    },
+    {
+      "name": "transform_error",
+      "description": "Transform module throws error",
+      "request": {
+        "method": "POST",
+        "path": "/hooks/error-transform",
+        "headers": { "Authorization": "Bearer {{hooks_token}}" },
+        "body": {}
+      },
+      "response": {
+        "status": 500,
+        "body_schema": {
+          "properties": {
+            "ok": { "const": false },
+            "error": { "const": "hook mapping failed" }
+          }
+        }
+      }
+    }
+  ],
+  "path_normalization": {
+    "description": "Match path is normalized before comparison",
+    "rules": [
+      "Leading/trailing slashes removed",
+      "Trimmed",
+      "Empty becomes undefined"
+    ],
+    "examples": [
+      "'/gmail/' -> 'gmail'",
+      "'  github  ' -> 'github'",
+      "'/' -> undefined"
+    ]
+  }
+}

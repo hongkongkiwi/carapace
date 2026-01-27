@@ -1,0 +1,566 @@
+{
+  "$schema": "golden-trace-v1",
+  "description": "OpenResponses /v1/responses endpoint - AI agent response API with streaming and tool support",
+  "source_files": [
+    "src/gateway/openresponses-http.ts",
+    "src/gateway/open-responses.schema.ts",
+    "src/gateway/http-utils.ts"
+  ],
+  "spec_reference": "https://www.open-responses.com/",
+  "endpoint": "/v1/responses",
+  "method": "POST",
+  "authentication": {
+    "required": true,
+    "methods": ["Authorization: Bearer <token>"],
+    "config_requirement": "gateway.http.openResponses.enabled: true (default: false)"
+  },
+  "request_schema": {
+    "type": "object",
+    "required": ["model", "input"],
+    "properties": {
+      "model": {
+        "type": "string",
+        "description": "Model identifier. Can include agent ID as 'clawdbot:<agentId>' or 'agent:<agentId>'"
+      },
+      "input": {
+        "oneOf": [
+          { "type": "string", "description": "Simple text input" },
+          {
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "description": "Message item",
+                  "properties": {
+                    "type": { "const": "message" },
+                    "role": { "enum": ["system", "developer", "user", "assistant"] },
+                    "content": {
+                      "oneOf": [
+                        { "type": "string" },
+                        {
+                          "type": "array",
+                          "items": {
+                            "oneOf": [
+                              { "type": "object", "properties": { "type": { "const": "input_text" }, "text": { "type": "string" } } },
+                              { "type": "object", "properties": { "type": { "const": "output_text" }, "text": { "type": "string" } } },
+                              { "type": "object", "properties": { "type": { "const": "input_image" }, "source": { "type": "object" } } },
+                              { "type": "object", "properties": { "type": { "const": "input_file" }, "source": { "type": "object" } } }
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "description": "Function call item",
+                  "properties": {
+                    "type": { "const": "function_call" },
+                    "name": { "type": "string" },
+                    "arguments": { "type": "string" }
+                  }
+                },
+                {
+                  "type": "object",
+                  "description": "Function call output item",
+                  "properties": {
+                    "type": { "const": "function_call_output" },
+                    "call_id": { "type": "string" },
+                    "output": { "type": "string" }
+                  }
+                },
+                {
+                  "type": "object",
+                  "description": "Reasoning item",
+                  "properties": { "type": { "const": "reasoning" } }
+                },
+                {
+                  "type": "object",
+                  "description": "Item reference",
+                  "properties": { "type": { "const": "item_reference" }, "id": { "type": "string" } }
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "instructions": { "type": "string", "description": "System instructions" },
+      "tools": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "type": { "const": "function" },
+            "function": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "description": { "type": "string" },
+                "parameters": { "type": "object" }
+              }
+            }
+          }
+        }
+      },
+      "tool_choice": {
+        "oneOf": [
+          { "type": "string", "enum": ["auto", "none", "required"] },
+          { "type": "object", "properties": { "type": { "const": "function" }, "function": { "type": "object", "properties": { "name": { "type": "string" } } } } }
+        ]
+      },
+      "stream": { "type": "boolean", "default": false },
+      "max_output_tokens": { "type": "integer", "minimum": 1 },
+      "max_tool_calls": { "type": "integer", "minimum": 1 },
+      "user": { "type": "string" },
+      "temperature": { "type": "number", "description": "Accepted but ignored in Phase 1" },
+      "top_p": { "type": "number", "description": "Accepted but ignored in Phase 1" },
+      "metadata": { "type": "object", "description": "Accepted but ignored in Phase 1" },
+      "store": { "type": "boolean", "description": "Accepted but ignored in Phase 1" },
+      "previous_response_id": { "type": "string", "description": "Accepted but ignored in Phase 1" },
+      "reasoning": {
+        "type": "object",
+        "properties": {
+          "effort": { "enum": ["low", "medium", "high"] },
+          "summary": { "enum": ["auto", "concise", "detailed"] }
+        }
+      },
+      "truncation": { "enum": ["auto", "disabled"] }
+    }
+  },
+  "response_schema": {
+    "non_streaming": {
+      "status": 200,
+      "body": {
+        "type": "object",
+        "required": ["id", "object", "created_at", "status", "model", "output", "usage"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^resp_" },
+          "object": { "const": "response" },
+          "created_at": { "type": "integer" },
+          "status": { "enum": ["in_progress", "completed", "failed", "cancelled", "incomplete"] },
+          "model": { "type": "string" },
+          "output": {
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "description": "Message output",
+                  "properties": {
+                    "type": { "const": "message" },
+                    "id": { "type": "string", "pattern": "^msg_" },
+                    "role": { "const": "assistant" },
+                    "content": { "type": "array", "items": { "type": "object", "properties": { "type": { "const": "output_text" }, "text": { "type": "string" } } } },
+                    "status": { "enum": ["in_progress", "completed"] }
+                  }
+                },
+                {
+                  "type": "object",
+                  "description": "Function call output",
+                  "properties": {
+                    "type": { "const": "function_call" },
+                    "id": { "type": "string", "pattern": "^call_" },
+                    "call_id": { "type": "string" },
+                    "name": { "type": "string" },
+                    "arguments": { "type": "string" }
+                  }
+                }
+              ]
+            }
+          },
+          "usage": {
+            "type": "object",
+            "properties": {
+              "input_tokens": { "type": "integer", "minimum": 0 },
+              "output_tokens": { "type": "integer", "minimum": 0 },
+              "total_tokens": { "type": "integer", "minimum": 0 }
+            }
+          },
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": { "type": "string" },
+              "message": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "streaming": {
+      "status": 200,
+      "content_type": "text/event-stream; charset=utf-8",
+      "events": [
+        { "type": "response.created", "description": "Initial response object created" },
+        { "type": "response.in_progress", "description": "Response processing started" },
+        { "type": "response.output_item.added", "description": "New output item added" },
+        { "type": "response.content_part.added", "description": "Content part added to output" },
+        { "type": "response.output_text.delta", "description": "Text content delta" },
+        { "type": "response.output_text.done", "description": "Text content complete" },
+        { "type": "response.content_part.done", "description": "Content part complete" },
+        { "type": "response.output_item.done", "description": "Output item complete" },
+        { "type": "response.completed", "description": "Response fully complete" },
+        { "type": "response.failed", "description": "Response failed with error" }
+      ]
+    }
+  },
+  "input_file_handling": {
+    "images": {
+      "supported_sources": ["url", "base64"],
+      "supported_mimes": ["image/jpeg", "image/png", "image/gif", "image/webp"],
+      "limits": {
+        "maxBytes": "DEFAULT_INPUT_IMAGE_MAX_BYTES",
+        "maxRedirects": "DEFAULT_INPUT_MAX_REDIRECTS (5)"
+      }
+    },
+    "files": {
+      "supported_sources": ["url", "base64"],
+      "default_mimes": "DEFAULT_INPUT_FILE_MIMES",
+      "limits": {
+        "maxBytes": "DEFAULT_INPUT_FILE_MAX_BYTES",
+        "maxChars": "DEFAULT_INPUT_FILE_MAX_CHARS"
+      },
+      "pdf_handling": {
+        "maxPages": "DEFAULT_INPUT_PDF_MAX_PAGES",
+        "maxPixels": "DEFAULT_INPUT_PDF_MAX_PIXELS",
+        "minTextChars": "DEFAULT_INPUT_PDF_MIN_TEXT_CHARS"
+      }
+    }
+  },
+  "scenarios": [
+    {
+      "name": "simple_text_input",
+      "description": "Basic response with string input",
+      "request": {
+        "method": "POST",
+        "path": "/v1/responses",
+        "headers": { "Authorization": "Bearer {{gateway_token}}" },
+        "body": {
+          "model": "clawdbot",
+          "input": "Hello, how are you?"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body_schema": {
+          "properties": {
+            "object": { "const": "response" },
+            "status": { "const": "completed" }
+          }
+        }
+      }
+    },
+    {
+      "name": "message_array_input",
+      "description": "Response with message array input",
+      "request": {
+        "method": "POST",
+        "path": "/v1/responses",
+        "headers": { "Authorization": "Bearer {{gateway_token}}" },
+        "body": {
+          "model": "clawdbot",
+          "input": [
+            { "type": "message", "role": "user", "content": "What is 2+2?" }
+          ]
+        }
+      },
+      "response": { "status": 200 }
+    },
+    {
+      "name": "with_instructions",
+      "description": "Response with system instructions",
+      "request": {
+        "method": "POST",
+        "path": "/v1/responses",
+        "headers": { "Authorization": "Bearer {{gateway_token}}" },
+        "body": {
+          "model": "clawdbot",
+          "input": "Hello",
+          "instructions": "Always respond in French"
+        }
+      },
+      "response": { "status": 200 }
+    },
+    {
+      "name": "streaming_response",
+      "description": "Streaming response via SSE",
+      "request": {
+        "method": "POST",
+        "path": "/v1/responses",
+        "headers": { "Authorization": "Bearer {{gateway_token}}" },
+        "body": {
+          "model": "clawdbot",
+          "input": "Tell me a story",
+          "stream": true
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": { "Content-Type": "text/event-stream; charset=utf-8" }
+      }
+    },
+    {
+      "name": "with_tools",
+      "description": "Response with client tools defined",
+      "request": {
+        "method": "POST",
+        "path": "/v1/responses",
+        "headers": { "Authorization": "Bearer {{gateway_token}}" },
+        "body": {
+          "model": "clawdbot",
+          "input": "What's the weather in Tokyo?",
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "description": "Get current weather",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "location": { "type": "string" }
+                  },
+                  "required": ["location"]
+                }
+              }
+            }
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "notes": ["If tool is called, status will be 'incomplete' with function_call in output"]
+      }
+    },
+    {
+      "name": "tool_choice_required",
+      "description": "Force tool use with tool_choice=required",
+      "request": {
+        "method": "POST",
+        "path": "/v1/responses",
+        "headers": { "Authorization": "Bearer {{gateway_token}}" },
+        "body": {
+          "model": "clawdbot",
+          "input": "Do something",
+          "tools": [{ "type": "function", "function": { "name": "my_tool", "description": "A tool" } }],
+          "tool_choice": "required"
+        }
+      },
+      "response": { "status": 200 },
+      "notes": ["Adds system prompt: 'You must call one of the available tools before responding.'"]
+    },
+    {
+      "name": "tool_choice_specific",
+      "description": "Force specific tool with tool_choice object",
+      "request": {
+        "method": "POST",
+        "path": "/v1/responses",
+        "headers": { "Authorization": "Bearer {{gateway_token}}" },
+        "body": {
+          "model": "clawdbot",
+          "input": "Do something",
+          "tools": [
+            { "type": "function", "function": { "name": "tool_a" } },
+            { "type": "function", "function": { "name": "tool_b" } }
+          ],
+          "tool_choice": { "type": "function", "function": { "name": "tool_a" } }
+        }
+      },
+      "response": { "status": 200 },
+      "notes": ["Only tool_a is available; system prompt forces its use"]
+    },
+    {
+      "name": "function_call_output",
+      "description": "Continue conversation with tool result",
+      "request": {
+        "method": "POST",
+        "path": "/v1/responses",
+        "headers": { "Authorization": "Bearer {{gateway_token}}" },
+        "body": {
+          "model": "clawdbot",
+          "input": [
+            { "type": "message", "role": "user", "content": "What's the weather?" },
+            { "type": "function_call_output", "call_id": "call_123", "output": "Sunny, 72F" }
+          ]
+        }
+      },
+      "response": { "status": 200 }
+    },
+    {
+      "name": "with_image_url",
+      "description": "Response with image from URL",
+      "request": {
+        "method": "POST",
+        "path": "/v1/responses",
+        "headers": { "Authorization": "Bearer {{gateway_token}}" },
+        "body": {
+          "model": "clawdbot",
+          "input": [
+            {
+              "type": "message",
+              "role": "user",
+              "content": [
+                { "type": "input_text", "text": "What's in this image?" },
+                { "type": "input_image", "source": { "type": "url", "url": "https://example.com/image.png" } }
+              ]
+            }
+          ]
+        }
+      },
+      "response": { "status": 200 }
+    },
+    {
+      "name": "with_image_base64",
+      "description": "Response with base64 encoded image",
+      "request": {
+        "method": "POST",
+        "path": "/v1/responses",
+        "headers": { "Authorization": "Bearer {{gateway_token}}" },
+        "body": {
+          "model": "clawdbot",
+          "input": [
+            {
+              "type": "message",
+              "role": "user",
+              "content": [
+                { "type": "input_text", "text": "Describe this" },
+                { "type": "input_image", "source": { "type": "base64", "media_type": "image/png", "data": "<base64_data>" } }
+              ]
+            }
+          ]
+        }
+      },
+      "response": { "status": 200 }
+    },
+    {
+      "name": "with_file_url",
+      "description": "Response with file from URL (e.g., PDF)",
+      "request": {
+        "method": "POST",
+        "path": "/v1/responses",
+        "headers": { "Authorization": "Bearer {{gateway_token}}" },
+        "body": {
+          "model": "clawdbot",
+          "input": [
+            {
+              "type": "message",
+              "role": "user",
+              "content": [
+                { "type": "input_text", "text": "Summarize this document" },
+                { "type": "input_file", "source": { "type": "url", "url": "https://example.com/doc.pdf" } }
+              ]
+            }
+          ]
+        }
+      },
+      "response": { "status": 200 }
+    },
+    {
+      "name": "error_missing_input",
+      "description": "Missing user message in input",
+      "request": {
+        "method": "POST",
+        "path": "/v1/responses",
+        "headers": { "Authorization": "Bearer {{gateway_token}}" },
+        "body": {
+          "model": "clawdbot",
+          "input": [
+            { "type": "message", "role": "system", "content": "You are helpful" }
+          ]
+        }
+      },
+      "response": {
+        "status": 400,
+        "body_schema": {
+          "properties": {
+            "error": {
+              "properties": {
+                "message": { "const": "Missing user message in `input`." },
+                "type": { "const": "invalid_request_error" }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "error_validation",
+      "description": "Invalid request body (Zod validation fails)",
+      "request": {
+        "method": "POST",
+        "path": "/v1/responses",
+        "headers": { "Authorization": "Bearer {{gateway_token}}" },
+        "body": {
+          "model": 123,
+          "input": "test"
+        }
+      },
+      "response": {
+        "status": 400,
+        "body_schema": {
+          "properties": {
+            "error": {
+              "properties": {
+                "type": { "const": "invalid_request_error" }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "error_tool_choice_no_tools",
+      "description": "tool_choice=required but no tools provided",
+      "request": {
+        "method": "POST",
+        "path": "/v1/responses",
+        "headers": { "Authorization": "Bearer {{gateway_token}}" },
+        "body": {
+          "model": "clawdbot",
+          "input": "test",
+          "tool_choice": "required"
+        }
+      },
+      "response": {
+        "status": 400,
+        "body_schema": {
+          "properties": {
+            "error": {
+              "properties": {
+                "message": { "const": "tool_choice=required but no tools were provided" }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "error_tool_choice_unknown_tool",
+      "description": "tool_choice references unknown tool",
+      "request": {
+        "method": "POST",
+        "path": "/v1/responses",
+        "headers": { "Authorization": "Bearer {{gateway_token}}" },
+        "body": {
+          "model": "clawdbot",
+          "input": "test",
+          "tools": [{ "type": "function", "function": { "name": "tool_a" } }],
+          "tool_choice": { "type": "function", "function": { "name": "unknown_tool" } }
+        }
+      },
+      "response": {
+        "status": 400,
+        "body_schema": {
+          "properties": {
+            "error": {
+              "properties": {
+                "message": { "pattern": "tool_choice requested unknown tool" }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

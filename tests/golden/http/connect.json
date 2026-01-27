@@ -1,0 +1,137 @@
+{
+  "$schema": "golden-trace-v1",
+  "description": "HTTP authentication scenarios for hooks endpoints - validates token extraction and authentication flow",
+  "source_files": [
+    "src/gateway/server-http.ts",
+    "src/gateway/hooks.ts"
+  ],
+  "notes": [
+    "Token extraction priority: Authorization Bearer > X-Clawdbot-Token header > ?token query param",
+    "Query param token triggers deprecation warning in server logs",
+    "Hooks must be enabled via config: hooks.enabled=true, hooks.token required",
+    "Default base path is /hooks, configurable via hooks.path",
+    "Max body size defaults to 256KB (DEFAULT_HOOKS_MAX_BODY_BYTES = 256 * 1024)"
+  ],
+  "scenarios": [
+    {
+      "name": "unauthorized_no_token",
+      "description": "Request without any authentication token returns 401",
+      "request": {
+        "method": "POST",
+        "path": "/hooks/wake",
+        "headers": { "Content-Type": "application/json" },
+        "body": { "text": "test message" }
+      },
+      "response": {
+        "status": 401,
+        "headers": { "Content-Type": "text/plain; charset=utf-8" },
+        "body": "Unauthorized"
+      }
+    },
+    {
+      "name": "unauthorized_wrong_token",
+      "description": "Request with incorrect token returns 401",
+      "request": {
+        "method": "POST",
+        "path": "/hooks/wake",
+        "headers": {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer wrong-token"
+        },
+        "body": { "text": "test message" }
+      },
+      "response": {
+        "status": 401,
+        "body": "Unauthorized"
+      }
+    },
+    {
+      "name": "authorized_bearer_token",
+      "description": "Authorization: Bearer <token> header (preferred method)",
+      "request": {
+        "method": "POST",
+        "path": "/hooks/wake",
+        "headers": {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer {{hooks_token}}"
+        },
+        "body": { "text": "test message" }
+      },
+      "response": {
+        "status": 200,
+        "headers": { "Content-Type": "application/json; charset=utf-8" },
+        "body_schema": {
+          "type": "object",
+          "required": ["ok", "mode"],
+          "properties": {
+            "ok": { "type": "boolean", "const": true },
+            "mode": { "type": "string", "enum": ["now", "next-heartbeat"] }
+          }
+        }
+      }
+    },
+    {
+      "name": "authorized_header_token",
+      "description": "X-Clawdbot-Token header (alternative to Bearer)",
+      "request": {
+        "method": "POST",
+        "path": "/hooks/wake",
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Clawdbot-Token": "{{hooks_token}}"
+        },
+        "body": { "text": "test message" }
+      },
+      "response": {
+        "status": 200,
+        "body_schema": {
+          "type": "object",
+          "required": ["ok"],
+          "properties": { "ok": { "type": "boolean", "const": true } }
+        }
+      }
+    },
+    {
+      "name": "authorized_query_token_deprecated",
+      "description": "Query parameter token works but is deprecated - logs security warning",
+      "request": {
+        "method": "POST",
+        "path": "/hooks/wake?token={{hooks_token}}",
+        "headers": { "Content-Type": "application/json" },
+        "body": { "text": "test message" }
+      },
+      "response": { "status": 200 },
+      "notes": [
+        "Server logs deprecation warning about security implications",
+        "Tokens in URLs appear in logs, browser history, and referrer headers"
+      ]
+    },
+    {
+      "name": "hooks_disabled",
+      "description": "When hooks.enabled=false, hook endpoints return 404 (not matched)",
+      "config_requirement": "hooks.enabled: false",
+      "request": {
+        "method": "POST",
+        "path": "/hooks/wake",
+        "headers": { "Authorization": "Bearer {{hooks_token}}" },
+        "body": { "text": "test" }
+      },
+      "response": {
+        "status": 404,
+        "body": "Not Found"
+      }
+    },
+    {
+      "name": "custom_base_path",
+      "description": "Hooks can be mounted at a custom base path via hooks.path config",
+      "config_requirement": "hooks.path: '/api/webhooks'",
+      "request": {
+        "method": "POST",
+        "path": "/api/webhooks/wake",
+        "headers": { "Authorization": "Bearer {{hooks_token}}" },
+        "body": { "text": "test" }
+      },
+      "response": { "status": 200 }
+    }
+  ]
+}

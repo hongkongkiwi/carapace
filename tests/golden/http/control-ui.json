@@ -1,0 +1,281 @@
+{
+  "$schema": "golden-trace-v1",
+  "description": "Control UI HTTP endpoints - serves the web-based control interface and avatar assets",
+  "source_files": [
+    "src/gateway/control-ui.ts",
+    "src/gateway/control-ui-shared.ts"
+  ],
+  "endpoints": {
+    "ui_root": {
+      "path": "/ui/*",
+      "description": "Control UI SPA serving (configurable base path)",
+      "methods": ["GET", "HEAD"]
+    },
+    "avatar": {
+      "path": "/__clawdbot_avatar__/<agentId>",
+      "description": "Agent avatar image or metadata endpoint",
+      "methods": ["GET", "HEAD"]
+    }
+  },
+  "config_requirement": "gateway.http.controlUi.enabled: true (default varies)",
+  "notes": [
+    "Control UI assets must be built with 'pnpm ui:build'",
+    "Base path configurable via gateway.http.controlUi.basePath (default: '')",
+    "SPA fallback: unknown paths serve index.html for client-side routing",
+    "Avatar endpoint serves local files or returns metadata JSON"
+  ],
+  "control_ui_scenarios": [
+    {
+      "name": "ui_root_redirect",
+      "description": "Base path without trailing slash redirects to add slash",
+      "request": {
+        "method": "GET",
+        "path": "/ui"
+      },
+      "response": {
+        "status": 302,
+        "headers": { "Location": "/ui/" }
+      },
+      "notes": ["When basePath is '/ui'"]
+    },
+    {
+      "name": "ui_index_html",
+      "description": "Serves index.html with injected configuration",
+      "request": {
+        "method": "GET",
+        "path": "/ui/"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "text/html; charset=utf-8",
+          "Cache-Control": "no-cache"
+        },
+        "body_contains": [
+          "__CLAWDBOT_CONTROL_UI_BASE_PATH__",
+          "__CLAWDBOT_ASSISTANT_NAME__",
+          "__CLAWDBOT_ASSISTANT_AVATAR__"
+        ]
+      },
+      "notes": ["index.html has runtime config injected in <head>"]
+    },
+    {
+      "name": "ui_assets",
+      "description": "Serves static assets (JS, CSS, etc.)",
+      "request": {
+        "method": "GET",
+        "path": "/ui/assets/main.js"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/javascript; charset=utf-8",
+          "Cache-Control": "no-cache"
+        }
+      }
+    },
+    {
+      "name": "ui_spa_fallback",
+      "description": "Unknown paths serve index.html for SPA routing",
+      "request": {
+        "method": "GET",
+        "path": "/ui/chat/12345"
+      },
+      "response": {
+        "status": 200,
+        "headers": { "Content-Type": "text/html; charset=utf-8" }
+      },
+      "notes": ["Client-side router handles the /chat/12345 route"]
+    },
+    {
+      "name": "ui_head_request",
+      "description": "HEAD requests supported for assets",
+      "request": {
+        "method": "HEAD",
+        "path": "/ui/assets/main.css"
+      },
+      "response": {
+        "status": 200,
+        "headers": { "Content-Type": "text/css; charset=utf-8" }
+      }
+    },
+    {
+      "name": "ui_method_not_allowed",
+      "description": "Only GET/HEAD methods allowed",
+      "request": {
+        "method": "POST",
+        "path": "/ui/"
+      },
+      "response": {
+        "status": 405,
+        "body": "Method Not Allowed"
+      }
+    },
+    {
+      "name": "ui_assets_not_found",
+      "description": "UI assets not built returns 503",
+      "config_note": "When control-ui directory does not contain index.html",
+      "request": {
+        "method": "GET",
+        "path": "/ui/"
+      },
+      "response": {
+        "status": 503,
+        "body_pattern": "Control UI assets not found"
+      }
+    },
+    {
+      "name": "ui_path_traversal_blocked",
+      "description": "Path traversal attempts are blocked",
+      "request": {
+        "method": "GET",
+        "path": "/ui/../../../etc/passwd"
+      },
+      "response": {
+        "status": 404,
+        "body": "Not Found"
+      }
+    },
+    {
+      "name": "ui_disabled_fallthrough",
+      "description": "When /ui path not configured, returns 404",
+      "config_note": "When controlUiEnabled is false or basePath is different",
+      "request": {
+        "method": "GET",
+        "path": "/ui/"
+      },
+      "response": {
+        "status": 404
+      }
+    }
+  ],
+  "avatar_scenarios": [
+    {
+      "name": "avatar_get_local_image",
+      "description": "Retrieve agent avatar as local file",
+      "request": {
+        "method": "GET",
+        "path": "/__clawdbot_avatar__/main"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "image/png|image/jpeg|image/webp|image/gif",
+          "Cache-Control": "no-cache"
+        }
+      },
+      "notes": ["Returns avatar image if agent has local file avatar configured"]
+    },
+    {
+      "name": "avatar_get_metadata",
+      "description": "Get avatar metadata (URL for remote/data avatars)",
+      "request": {
+        "method": "GET",
+        "path": "/__clawdbot_avatar__/main?meta=1"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8",
+          "Cache-Control": "no-cache"
+        },
+        "body_schema": {
+          "type": "object",
+          "properties": {
+            "avatarUrl": {
+              "oneOf": [
+                { "type": "string" },
+                { "type": "null" }
+              ],
+              "description": "URL to avatar image (local path, remote URL, or data URI)"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "avatar_head_request",
+      "description": "HEAD request for avatar existence check",
+      "request": {
+        "method": "HEAD",
+        "path": "/__clawdbot_avatar__/main"
+      },
+      "response": {
+        "status": 200,
+        "headers": { "Cache-Control": "no-cache" }
+      }
+    },
+    {
+      "name": "avatar_not_found",
+      "description": "No avatar configured for agent",
+      "request": {
+        "method": "GET",
+        "path": "/__clawdbot_avatar__/unknown-agent"
+      },
+      "response": {
+        "status": 404,
+        "body": "Not Found"
+      }
+    },
+    {
+      "name": "avatar_invalid_agent_id",
+      "description": "Invalid agent ID format returns 404",
+      "request": {
+        "method": "GET",
+        "path": "/__clawdbot_avatar__/invalid..agent"
+      },
+      "response": {
+        "status": 404,
+        "body": "Not Found"
+      },
+      "notes": ["Agent ID must match pattern: /^[a-z0-9][a-z0-9_-]{0,63}$/i"]
+    },
+    {
+      "name": "avatar_remote_returns_404",
+      "description": "Remote avatar URL - image endpoint returns 404",
+      "config_note": "When avatar is remote URL or data URI",
+      "request": {
+        "method": "GET",
+        "path": "/__clawdbot_avatar__/remote-avatar-agent"
+      },
+      "response": {
+        "status": 404
+      },
+      "notes": ["Use ?meta=1 to get the remote URL instead"]
+    },
+    {
+      "name": "avatar_with_basepath",
+      "description": "Avatar endpoint respects control UI base path",
+      "config_note": "When basePath is '/ui'",
+      "request": {
+        "method": "GET",
+        "path": "/ui/__clawdbot_avatar__/main"
+      },
+      "response": {
+        "status": 200
+      }
+    }
+  ],
+  "content_type_mapping": {
+    ".html": "text/html; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".map": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".ico": "image/x-icon",
+    ".txt": "text/plain; charset=utf-8",
+    "default": "application/octet-stream"
+  },
+  "avatar_resolution_kinds": {
+    "none": "No avatar configured",
+    "local": "Local file path - served directly",
+    "remote": "Remote URL - returned in metadata",
+    "data": "Data URI - returned in metadata"
+  }
+}

@@ -1,0 +1,1 @@
+//! macOS Keychain credential storage

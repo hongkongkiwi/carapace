@@ -1,0 +1,399 @@
+{
+  "$schema": "golden-trace-v1",
+  "description": "WebSocket error codes and close codes - based on clawdbot gateway source code",
+  "source_files": [
+    "src/gateway/protocol/schema/error-codes.ts",
+    "src/gateway/server/ws-connection/message-handler.ts",
+    "src/gateway/server/ws-connection.ts"
+  ],
+  "error_codes": {
+    "source": "src/gateway/protocol/schema/error-codes.ts ErrorCodes",
+    "codes": {
+      "NOT_LINKED": {
+        "description": "Channel or service not linked/configured",
+        "retryable": false,
+        "example_message": "channel not linked"
+      },
+      "NOT_PAIRED": {
+        "description": "Device identity not paired with gateway",
+        "retryable": false,
+        "example_message": "device identity required",
+        "notes": [
+          "Returned when device identity is required but not provided",
+          "Also returned when device needs to re-pair (role/scope upgrade)"
+        ]
+      },
+      "AGENT_TIMEOUT": {
+        "description": "Agent execution timed out",
+        "retryable": true,
+        "example_message": "agent timed out after 300000ms"
+      },
+      "INVALID_REQUEST": {
+        "description": "Request validation failed or invalid operation",
+        "retryable": false,
+        "common_messages": [
+          "invalid connect params: ...",
+          "invalid handshake: first request must be connect",
+          "protocol mismatch",
+          "invalid role",
+          "device identity required",
+          "device identity mismatch",
+          "device signature expired",
+          "device signature invalid",
+          "device nonce required",
+          "device nonce mismatch",
+          "pairing required",
+          "unauthorized: gateway token missing",
+          "unauthorized: gateway token mismatch",
+          "control ui requires HTTPS or localhost (secure context)"
+        ]
+      },
+      "UNAVAILABLE": {
+        "description": "Service temporarily unavailable",
+        "retryable": true,
+        "example_message": "service temporarily unavailable"
+      }
+    }
+  },
+  "error_shape": {
+    "source": "src/gateway/protocol/schema/frames.ts ErrorShapeSchema",
+    "schema": {
+      "type": "object",
+      "required": ["code", "message"],
+      "additionalProperties": false,
+      "properties": {
+        "code": { "type": "string", "minLength": 1, "description": "Error code from ErrorCodes enum" },
+        "message": { "type": "string", "minLength": 1, "description": "Human-readable error description" },
+        "details": { "description": "Additional context (e.g., expectedProtocol, requestId)" },
+        "retryable": { "type": "boolean", "description": "Whether the client should retry" },
+        "retryAfterMs": { "type": "integer", "minimum": 0, "description": "Suggested retry delay" }
+      }
+    },
+    "examples": [
+      {
+        "code": "INVALID_REQUEST",
+        "message": "invalid connect params: at /client/id: must be string"
+      },
+      {
+        "code": "INVALID_REQUEST",
+        "message": "protocol mismatch",
+        "details": { "expectedProtocol": 3 }
+      },
+      {
+        "code": "NOT_PAIRED",
+        "message": "pairing required",
+        "details": { "requestId": "req-abc123" }
+      },
+      {
+        "code": "AGENT_TIMEOUT",
+        "message": "agent timed out after 300000ms",
+        "retryable": true
+      }
+    ]
+  },
+  "close_codes": {
+    "notes": [
+      "WebSocket close codes used by the gateway",
+      "See ws-connection.ts and message-handler.ts for usage"
+    ],
+    "codes": {
+      "1000": {
+        "name": "Normal Closure",
+        "description": "Normal closure (handshake timeout, graceful disconnect)",
+        "usage": [
+          "Handshake timeout (no connect within 10 seconds)",
+          "Normal shutdown"
+        ]
+      },
+      "1002": {
+        "name": "Protocol Error",
+        "description": "Protocol version mismatch",
+        "usage": [
+          "Client minProtocol > server protocol",
+          "Client maxProtocol < server protocol"
+        ]
+      },
+      "1008": {
+        "name": "Policy Violation",
+        "description": "Request violates policy or authentication failed",
+        "usage": [
+          "Invalid handshake (first request not connect)",
+          "Invalid connect params",
+          "Invalid role",
+          "Device identity required but missing",
+          "Device signature invalid/expired",
+          "Device nonce required/mismatch",
+          "Pairing required",
+          "Authentication failed (wrong token/password)",
+          "Slow consumer (buffered bytes exceeded)",
+          "Control UI requires secure context"
+        ]
+      }
+    }
+  },
+  "error_scenarios": {
+    "handshake_errors": [
+      {
+        "name": "invalid_first_request_not_connect",
+        "description": "First request after connect.challenge is not a connect method",
+        "source_reference": "message-handler.ts lines 263-301",
+        "trigger": { "type": "req", "id": "h1", "method": "health" },
+        "response": {
+          "type": "res",
+          "id": "h1",
+          "ok": false,
+          "error": { "code": "INVALID_REQUEST", "message": "invalid handshake: first request must be connect" }
+        },
+        "close_code": 1008,
+        "close_reason": "invalid handshake: first request must be connect"
+      },
+      {
+        "name": "invalid_connect_params",
+        "description": "Connect params fail schema validation",
+        "source_reference": "message-handler.ts lines 263-301",
+        "trigger": {
+          "type": "req",
+          "id": "c1",
+          "method": "connect",
+          "params": { "minProtocol": 3 }
+        },
+        "response": {
+          "type": "res",
+          "id": "c1",
+          "ok": false,
+          "error": { "code": "INVALID_REQUEST", "message": "invalid connect params: at /maxProtocol: must have required property 'maxProtocol'" }
+        },
+        "close_code": 1008
+      },
+      {
+        "name": "protocol_mismatch",
+        "description": "Client protocol version incompatible with server",
+        "source_reference": "message-handler.ts lines 307-333",
+        "trigger": {
+          "type": "req",
+          "id": "c1",
+          "method": "connect",
+          "params": {
+            "minProtocol": 99,
+            "maxProtocol": 99,
+            "client": { "id": "test", "version": "1.0.0", "platform": "test", "mode": "test" }
+          }
+        },
+        "response": {
+          "type": "res",
+          "id": "c1",
+          "ok": false,
+          "error": {
+            "code": "INVALID_REQUEST",
+            "message": "protocol mismatch",
+            "details": { "expectedProtocol": 3 }
+          }
+        },
+        "close_code": 1002,
+        "close_reason": "protocol mismatch"
+      },
+      {
+        "name": "invalid_role",
+        "description": "Connect with invalid role value",
+        "source_reference": "message-handler.ts lines 335-354",
+        "trigger": {
+          "type": "req",
+          "id": "c1",
+          "method": "connect",
+          "params": {
+            "minProtocol": 3,
+            "maxProtocol": 3,
+            "client": { "id": "test", "version": "1.0.0", "platform": "test", "mode": "test" },
+            "role": "invalid"
+          }
+        },
+        "response": {
+          "type": "res",
+          "id": "c1",
+          "ok": false,
+          "error": { "code": "INVALID_REQUEST", "message": "invalid role" }
+        },
+        "close_code": 1008,
+        "close_reason": "invalid role"
+      }
+    ],
+    "device_auth_errors": [
+      {
+        "name": "device_identity_required",
+        "description": "Remote connection without device identity and without token",
+        "source_reference": "message-handler.ts lines 399-416",
+        "trigger": {
+          "type": "req",
+          "id": "c1",
+          "method": "connect",
+          "params": {
+            "minProtocol": 3,
+            "maxProtocol": 3,
+            "client": { "id": "clawdbot-macos", "version": "1.0.0", "platform": "darwin", "mode": "ui" }
+          }
+        },
+        "response": {
+          "type": "res",
+          "id": "c1",
+          "ok": false,
+          "error": { "code": "NOT_PAIRED", "message": "device identity required" }
+        },
+        "close_code": 1008,
+        "close_reason": "device identity required"
+      },
+      {
+        "name": "device_id_mismatch",
+        "description": "Device ID does not match public key",
+        "source_reference": "message-handler.ts lines 418-434",
+        "response": {
+          "type": "res",
+          "ok": false,
+          "error": { "code": "INVALID_REQUEST", "message": "device identity mismatch" }
+        },
+        "close_code": 1008,
+        "close_reason": "device identity mismatch"
+      },
+      {
+        "name": "device_signature_expired",
+        "description": "Device signature timestamp outside 10-minute window",
+        "source_reference": "message-handler.ts lines 436-455",
+        "notes": "DEVICE_SIGNATURE_SKEW_MS = 10 * 60 * 1000 (10 minutes)",
+        "response": {
+          "type": "res",
+          "ok": false,
+          "error": { "code": "INVALID_REQUEST", "message": "device signature expired" }
+        },
+        "close_code": 1008
+      },
+      {
+        "name": "device_nonce_required",
+        "description": "Remote connection requires nonce from connect.challenge",
+        "source_reference": "message-handler.ts lines 456-472",
+        "response": {
+          "type": "res",
+          "ok": false,
+          "error": { "code": "INVALID_REQUEST", "message": "device nonce required" }
+        },
+        "close_code": 1008
+      },
+      {
+        "name": "device_nonce_mismatch",
+        "description": "Provided nonce does not match connect.challenge nonce",
+        "source_reference": "message-handler.ts lines 474-489",
+        "response": {
+          "type": "res",
+          "ok": false,
+          "error": { "code": "INVALID_REQUEST", "message": "device nonce mismatch" }
+        },
+        "close_code": 1008
+      },
+      {
+        "name": "device_signature_invalid",
+        "description": "Ed25519 signature verification failed",
+        "source_reference": "message-handler.ts lines 517-546",
+        "response": {
+          "type": "res",
+          "ok": false,
+          "error": { "code": "INVALID_REQUEST", "message": "device signature invalid" }
+        },
+        "close_code": 1008
+      },
+      {
+        "name": "pairing_required",
+        "description": "Device is not paired or needs to upgrade role/scopes",
+        "source_reference": "message-handler.ts lines 626-676",
+        "response": {
+          "type": "res",
+          "ok": false,
+          "error": {
+            "code": "NOT_PAIRED",
+            "message": "pairing required",
+            "details": { "requestId": "{{pairing_request_id}}" }
+          }
+        },
+        "close_code": 1008,
+        "close_reason": "pairing required"
+      }
+    ],
+    "auth_errors": [
+      {
+        "name": "unauthorized_token_missing",
+        "description": "Gateway requires token auth but none provided",
+        "source_reference": "message-handler.ts lines 588-620",
+        "response": {
+          "type": "res",
+          "ok": false,
+          "error": { "code": "INVALID_REQUEST", "message": "unauthorized: gateway token missing (set gateway.remote.token to match gateway.auth.token)" }
+        },
+        "close_code": 1008
+      },
+      {
+        "name": "unauthorized_token_mismatch",
+        "description": "Provided token does not match gateway.auth.token",
+        "response": {
+          "type": "res",
+          "ok": false,
+          "error": { "code": "INVALID_REQUEST", "message": "unauthorized: gateway token mismatch (set gateway.remote.token to match gateway.auth.token)" }
+        },
+        "close_code": 1008
+      },
+      {
+        "name": "unauthorized_password_missing",
+        "description": "Gateway requires password auth but none provided",
+        "response": {
+          "type": "res",
+          "ok": false,
+          "error": { "code": "INVALID_REQUEST", "message": "unauthorized: gateway password missing (set gateway.remote.password to match gateway.auth.password)" }
+        },
+        "close_code": 1008
+      },
+      {
+        "name": "control_ui_insecure",
+        "description": "Control UI connection without HTTPS or localhost",
+        "source_reference": "message-handler.ts lines 380-397",
+        "response": {
+          "type": "res",
+          "ok": false,
+          "error": { "code": "INVALID_REQUEST", "message": "control ui requires HTTPS or localhost (secure context)" }
+        },
+        "close_code": 1008
+      }
+    ],
+    "runtime_errors": [
+      {
+        "name": "connect_after_handshake",
+        "description": "Calling connect method after already connected",
+        "source_reference": "src/gateway/server-methods/connect.ts",
+        "trigger": {
+          "type": "req",
+          "id": "c2",
+          "method": "connect",
+          "params": {}
+        },
+        "response": {
+          "type": "res",
+          "id": "c2",
+          "ok": false,
+          "error": { "code": "INVALID_REQUEST", "message": "connect is only valid as the first request" }
+        },
+        "notes": "Does not close connection"
+      },
+      {
+        "name": "slow_consumer",
+        "description": "Client buffered bytes exceed MAX_BUFFERED_BYTES",
+        "source_reference": "src/gateway/server-broadcast.ts lines 60-67",
+        "notes": "MAX_BUFFERED_BYTES = 1.5 * 1024 * 1024 = 1572864",
+        "close_code": 1008,
+        "close_reason": "slow consumer"
+      },
+      {
+        "name": "handshake_timeout",
+        "description": "Client did not complete connect handshake within timeout",
+        "source_reference": "src/gateway/server/ws-connection.ts lines 214-224",
+        "notes": "DEFAULT_HANDSHAKE_TIMEOUT_MS = 10000 (10 seconds)",
+        "close_code": 1000,
+        "close_reason": ""
+      }
+    ]
+  }
+}
