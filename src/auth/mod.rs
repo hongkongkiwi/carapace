@@ -247,10 +247,8 @@ pub fn authorize_gateway_connect(
 /// Check if the request is from loopback (HTTP-only helper).
 pub fn is_loopback_request(remote_addr: Option<IpAddr>, headers: &HeaderMap) -> bool {
     if let Some(addr) = remote_addr {
-        if is_loopback_addr(addr) {
-            if !has_proxy_headers(headers) {
-                return true;
-            }
+        if is_loopback_addr(addr) && !has_proxy_headers(headers) {
+            return true;
         }
     }
     false

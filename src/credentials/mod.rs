@@ -213,10 +213,7 @@ impl CredentialKey {
     /// Create a plugin-prefixed key
     pub fn with_plugin_prefix(plugin_id: &str, kind: &str, id: &str) -> Self {
         // Sanitize plugin_id to prevent path traversal attacks
-        let sanitized_plugin_id = plugin_id
-            .replace("..", "_")
-            .replace('/', "_")
-            .replace('\\', "_");
+        let sanitized_plugin_id = plugin_id.replace("..", "_").replace(['/', '\\'], "_");
 
         Self {
             kind: format!("plugin:{}", sanitized_plugin_id),
