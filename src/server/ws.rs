@@ -3617,9 +3617,9 @@ fn handle_node_pair_request(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let request = state
+    let outcome = state
         .node_pairing
-        .request_pairing(
+        .request_pairing_with_status(
             node_id.to_string(),
             public_key,
             commands,
@@ -3635,6 +3635,25 @@ fn handle_node_pair_request(
             }
             _ => error_shape(ERROR_UNAVAILABLE, &e.to_string(), None),
         })?;
+
+    if outcome.created {
+        let request = &outcome.request;
+        broadcast_event(
+            state,
+            "node.pair.requested",
+            json!({
+                "requestId": request.request_id,
+                "nodeId": request.node_id,
+                "publicKey": request.public_key,
+                "displayName": request.display_name,
+                "platform": request.platform,
+                "commands": request.commands,
+                "createdAtMs": request.created_at_ms
+            }),
+        );
+    }
+
+    let request = outcome.request;
 
     Ok(json!({
         "ok": true,
@@ -3707,6 +3726,17 @@ fn handle_node_pair_approve(
             _ => error_shape(ERROR_UNAVAILABLE, &e.to_string(), None),
         })?;
 
+    broadcast_event(
+        state,
+        "node.pair.resolved",
+        json!({
+            "requestId": request_id,
+            "nodeId": node.node_id,
+            "decision": "approved",
+            "ts": now_ms()
+        }),
+    );
+
     Ok(json!({
         "ok": true,
         "requestId": request_id,
@@ -3741,6 +3771,17 @@ fn handle_node_pair_reject(
             }
             _ => error_shape(ERROR_UNAVAILABLE, &e.to_string(), None),
         })?;
+
+    broadcast_event(
+        state,
+        "node.pair.resolved",
+        json!({
+            "requestId": request_id,
+            "nodeId": request.node_id,
+            "decision": "rejected",
+            "ts": now_ms()
+        }),
+    );
 
     Ok(json!({
         "ok": true,

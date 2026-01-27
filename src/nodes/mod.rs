@@ -72,6 +72,11 @@ pub struct NodePairingRequest {
     pub rejection_reason: Option<String>,
 }
 
+pub struct NodePairingOutcome {
+    pub request: NodePairingRequest,
+    pub created: bool,
+}
+
 impl NodePairingRequest {
     /// Create a new pending pairing request
     pub fn new(
@@ -466,6 +471,24 @@ impl NodePairingRegistry {
         display_name: Option<String>,
         platform: Option<String>,
     ) -> Result<NodePairingRequest, NodePairingError> {
+        let outcome = self.request_pairing_with_status(
+            node_id,
+            public_key,
+            commands,
+            display_name,
+            platform,
+        )?;
+        Ok(outcome.request)
+    }
+
+    pub fn request_pairing_with_status(
+        &self,
+        node_id: String,
+        public_key: Option<String>,
+        commands: Vec<String>,
+        display_name: Option<String>,
+        platform: Option<String>,
+    ) -> Result<NodePairingOutcome, NodePairingError> {
         self.cleanup_expired();
 
         let mut store = self.store.write();
@@ -481,8 +504,10 @@ impl NodePairingRegistry {
             .values()
             .find(|r| r.node_id == node_id && r.state == PairingState::Pending)
         {
-            // Return existing request instead of creating a new one
-            return Ok(existing.clone());
+            return Ok(NodePairingOutcome {
+                request: existing.clone(),
+                created: false,
+            });
         }
 
         // Check pending request limit
@@ -503,7 +528,10 @@ impl NodePairingRegistry {
         drop(store);
 
         let _ = self.save();
-        Ok(request)
+        Ok(NodePairingOutcome {
+            request,
+            created: true,
+        })
     }
 
     /// List all pairing requests (pending and recent resolved)
