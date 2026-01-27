@@ -110,10 +110,7 @@ mod tests {
             "authorization",
             HeaderValue::from_static("Bearer bearer-token"),
         );
-        headers.insert(
-            "x-clawdbot-token",
-            HeaderValue::from_static("header-token"),
-        );
+        headers.insert("x-clawdbot-token", HeaderValue::from_static("header-token"));
         let uri: Uri = "/hooks/wake?token=query-token".parse().unwrap();
 
         let result = extract_hooks_token(&headers, &uri);

@@ -4,15 +4,13 @@
 //! in wit/plugin.wit. This module provides the bridge between the host
 //! (Rust gateway) and guest (WASM plugins).
 
-use std::sync::Arc;
 use parking_lot::Mutex;
+use std::sync::Arc;
 use thiserror::Error;
 
 use crate::credentials::CredentialBackend;
 
-use super::host::{
-    HostError, HttpRequest, HttpResponse, MediaFetchResult, PluginHostContext,
-};
+use super::host::{HostError, HttpRequest, HttpResponse, MediaFetchResult, PluginHostContext};
 
 /// Binding errors
 #[derive(Error, Debug)]
@@ -319,10 +317,7 @@ impl<B: CredentialBackend + 'static> WitHost<B> {
     // ============== HTTP ==============
 
     pub async fn http_fetch(&self, req: HttpRequest) -> Result<HttpResponse, String> {
-        self.ctx
-            .http_fetch(req)
-            .await
-            .map_err(|e| e.to_string())
+        self.ctx.http_fetch(req).await.map_err(|e| e.to_string())
     }
 
     // ============== Media ==============
@@ -415,7 +410,10 @@ impl PluginRegistry {
     /// Get a channel plugin by ID
     pub fn get_channel(&self, id: &str) -> Option<Arc<dyn ChannelPluginInstance>> {
         let plugins = self.channel_plugins.lock();
-        plugins.iter().find(|(pid, _)| pid == id).map(|(_, p)| p.clone())
+        plugins
+            .iter()
+            .find(|(pid, _)| pid == id)
+            .map(|(_, p)| p.clone())
     }
 
     /// Get all tool plugins
@@ -426,7 +424,10 @@ impl PluginRegistry {
     /// Get a tool plugin by ID
     pub fn get_tool(&self, id: &str) -> Option<Arc<dyn ToolPluginInstance>> {
         let plugins = self.tool_plugins.lock();
-        plugins.iter().find(|(pid, _)| pid == id).map(|(_, p)| p.clone())
+        plugins
+            .iter()
+            .find(|(pid, _)| pid == id)
+            .map(|(_, p)| p.clone())
     }
 
     /// Get all webhook plugins
@@ -437,7 +438,10 @@ impl PluginRegistry {
     /// Get a webhook plugin by ID
     pub fn get_webhook(&self, id: &str) -> Option<Arc<dyn WebhookPluginInstance>> {
         let plugins = self.webhook_plugins.lock();
-        plugins.iter().find(|(pid, _)| pid == id).map(|(_, p)| p.clone())
+        plugins
+            .iter()
+            .find(|(pid, _)| pid == id)
+            .map(|(_, p)| p.clone())
     }
 
     /// Get all service plugins

@@ -25,8 +25,9 @@ impl LinuxCredentialBackend {
 
     /// Get or create a keyring entry for the given key
     fn get_entry(&self, key: &CredentialKey) -> Result<Entry, CredentialError> {
-        Entry::new(SERVICE_NAME, &key.to_account_key())
-            .map_err(|e| CredentialError::Internal(format!("Failed to create keyring entry: {}", e)))
+        Entry::new(SERVICE_NAME, &key.to_account_key()).map_err(|e| {
+            CredentialError::Internal(format!("Failed to create keyring entry: {}", e))
+        })
     }
 
     /// Map keyring errors to our error types

@@ -28,8 +28,9 @@ impl WindowsCredentialBackend {
     fn get_entry(&self, key: &CredentialKey) -> Result<Entry, CredentialError> {
         // Windows Credential Manager uses target name as the unique identifier
         // We use service:account format which keyring translates to target name
-        Entry::new(SERVICE_NAME, &key.to_account_key())
-            .map_err(|e| CredentialError::Internal(format!("Failed to create keyring entry: {}", e)))
+        Entry::new(SERVICE_NAME, &key.to_account_key()).map_err(|e| {
+            CredentialError::Internal(format!("Failed to create keyring entry: {}", e))
+        })
     }
 
     /// Map keyring errors to our error types
@@ -216,7 +217,10 @@ mod tests {
             let backend = WindowsCredentialBackend::new();
             let available = backend.is_available().await;
             // On Windows with a logged-in user, this should be true
-            assert!(available, "Credential Manager should be available on Windows");
+            assert!(
+                available,
+                "Credential Manager should be available on Windows"
+            );
         }
     }
 }

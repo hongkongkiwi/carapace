@@ -13,10 +13,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use std::net::SocketAddr;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
@@ -25,8 +25,8 @@ use uuid::Uuid;
 
 use crate::hooks::auth::{extract_hooks_token, timing_safe_equal, validate_hooks_token};
 use crate::hooks::handler::{
-    validate_agent_request, validate_wake_request, AgentRequest, AgentResponse,
-    HooksErrorResponse, WakeRequest, WakeResponse,
+    validate_agent_request, validate_wake_request, AgentRequest, AgentResponse, HooksErrorResponse,
+    WakeRequest, WakeResponse,
 };
 
 /// Default max body size for hooks (256KB)
@@ -265,11 +265,7 @@ async fn hooks_agent_handler(
                 "Agent job: message='{}', channel='{}', runId='{}'",
                 validated.message, validated.channel, run_id
             );
-            (
-                StatusCode::ACCEPTED,
-                Json(AgentResponse::success(run_id)),
-            )
-                .into_response()
+            (StatusCode::ACCEPTED, Json(AgentResponse::success(run_id))).into_response()
         }
         Err(e) => (StatusCode::BAD_REQUEST, Json(AgentResponse::error(&e))).into_response(),
     }
@@ -1068,8 +1064,15 @@ mod tests {
         let headers = HeaderMap::new();
 
         // Loopback address should be allowed
-        let result = check_gateway_auth(&config, &headers, Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
-        assert!(result.is_none(), "Loopback should be allowed when no auth configured");
+        let result = check_gateway_auth(
+            &config,
+            &headers,
+            Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
+        );
+        assert!(
+            result.is_none(),
+            "Loopback should be allowed when no auth configured"
+        );
     }
 
     #[test]
@@ -1084,8 +1087,15 @@ mod tests {
         let headers = HeaderMap::new();
 
         // Non-loopback address should be rejected
-        let result = check_gateway_auth(&config, &headers, Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100))));
-        assert!(result.is_some(), "Non-loopback should be rejected when no auth configured");
+        let result = check_gateway_auth(
+            &config,
+            &headers,
+            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100))),
+        );
+        assert!(
+            result.is_some(),
+            "Non-loopback should be rejected when no auth configured"
+        );
     }
 
     #[test]
@@ -1099,7 +1109,10 @@ mod tests {
 
         // Unknown address (None) should be rejected for safety
         let result = check_gateway_auth(&config, &headers, None);
-        assert!(result.is_some(), "Unknown address should be rejected when no auth configured");
+        assert!(
+            result.is_some(),
+            "Unknown address should be rejected when no auth configured"
+        );
     }
 
     #[test]
@@ -1119,7 +1132,11 @@ mod tests {
         );
 
         // Non-loopback address with valid token should be allowed
-        let result = check_gateway_auth(&config, &headers, Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        let result = check_gateway_auth(
+            &config,
+            &headers,
+            Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+        );
         assert!(result.is_none(), "Valid token should allow any address");
     }
 
@@ -1137,7 +1154,14 @@ mod tests {
         headers.insert("x-forwarded-for", "203.0.113.50".parse().unwrap());
 
         // Loopback with proxy headers should be rejected (could be spoofed)
-        let result = check_gateway_auth(&config, &headers, Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
-        assert!(result.is_some(), "Loopback with proxy headers should be rejected");
+        let result = check_gateway_auth(
+            &config,
+            &headers,
+            Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
+        );
+        assert!(
+            result.is_some(),
+            "Loopback with proxy headers should be rejected"
+        );
     }
 }

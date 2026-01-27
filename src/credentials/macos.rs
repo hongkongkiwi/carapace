@@ -24,8 +24,9 @@ impl MacOsCredentialBackend {
 
     /// Get or create a keyring entry for the given key
     fn get_entry(&self, key: &CredentialKey) -> Result<Entry, CredentialError> {
-        Entry::new(SERVICE_NAME, &key.to_account_key())
-            .map_err(|e| CredentialError::Internal(format!("Failed to create keyring entry: {}", e)))
+        Entry::new(SERVICE_NAME, &key.to_account_key()).map_err(|e| {
+            CredentialError::Internal(format!("Failed to create keyring entry: {}", e))
+        })
     }
 
     /// Map keyring errors to our error types
@@ -57,8 +58,7 @@ impl MacOsCredentialBackend {
             }
             keyring::Error::PlatformFailure(platform_err) => {
                 let err_str = platform_err.to_string().to_lowercase();
-                if err_str.contains("user interaction not allowed")
-                    || err_str.contains("-25308")
+                if err_str.contains("user interaction not allowed") || err_str.contains("-25308")
                 // errSecInteractionNotAllowed
                 {
                     CredentialError::StoreLocked

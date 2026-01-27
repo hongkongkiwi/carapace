@@ -180,7 +180,13 @@ fn validate_schema_structure(schema: &Value, context: &str) {
         let has_properties = map.contains_key("properties");
 
         assert!(
-            has_type || has_ref || has_const || has_enum || has_oneof || has_anyof || has_properties,
+            has_type
+                || has_ref
+                || has_const
+                || has_enum
+                || has_oneof
+                || has_anyof
+                || has_properties,
             "{}: schema should have type, $ref, const, enum, oneOf, anyOf, or properties",
             context
         );
@@ -196,28 +202,45 @@ fn test_ws_handshake_trace_valid() {
     let path = format!("{}/ws/handshake.json", golden_dir());
     let content = fs::read_to_string(&path).expect("Failed to read handshake.json");
 
-    let trace: WsHandshakeTrace = serde_json::from_str(&content)
-        .expect("Failed to parse handshake.json");
+    let trace: WsHandshakeTrace =
+        serde_json::from_str(&content).expect("Failed to parse handshake.json");
 
     // Validate required fields
     assert_eq!(trace.schema.as_deref(), Some("golden-trace-v1"));
-    assert!(!trace.description.is_empty(), "description should not be empty");
-    assert!(!trace.source_files.is_empty(), "source_files should not be empty");
+    assert!(
+        !trace.description.is_empty(),
+        "description should not be empty"
+    );
+    assert!(
+        !trace.source_files.is_empty(),
+        "source_files should not be empty"
+    );
     assert_eq!(trace.protocol_version, 3, "protocol version should be 3");
     assert!(!trace.scenarios.is_empty(), "scenarios should not be empty");
 
     // Validate scenarios have required structure
     for scenario in &trace.scenarios {
-        assert!(!scenario.name.is_empty(), "scenario name should not be empty");
-        assert!(!scenario.description.is_empty(), "scenario description should not be empty");
-        assert!(!scenario.steps.is_empty(), "scenario '{}' should have steps", scenario.name);
+        assert!(
+            !scenario.name.is_empty(),
+            "scenario name should not be empty"
+        );
+        assert!(
+            !scenario.description.is_empty(),
+            "scenario description should not be empty"
+        );
+        assert!(
+            !scenario.steps.is_empty(),
+            "scenario '{}' should have steps",
+            scenario.name
+        );
 
         // Validate each step has an action
         for (i, step) in scenario.steps.iter().enumerate() {
             assert!(
                 !step.action.is_empty(),
                 "scenario '{}' step {} should have action",
-                scenario.name, i
+                scenario.name,
+                i
             );
         }
     }
@@ -230,14 +253,14 @@ fn test_ws_handshake_trace_valid() {
     validate_has_fields(
         &trace.connect_params_schema,
         &["type", "required", "properties"],
-        "connect_params_schema"
+        "connect_params_schema",
     );
 
     // Validate hello_ok_schema has expected fields
     validate_has_fields(
         &trace.hello_ok_schema,
         &["type", "required", "properties"],
-        "hello_ok_schema"
+        "hello_ok_schema",
     );
 }
 
@@ -271,17 +294,29 @@ fn test_ws_messages_trace_valid() {
     let path = format!("{}/ws/messages.json", golden_dir());
     let content = fs::read_to_string(&path).expect("Failed to read messages.json");
 
-    let trace: WsMessagesTrace = serde_json::from_str(&content)
-        .expect("Failed to parse messages.json");
+    let trace: WsMessagesTrace =
+        serde_json::from_str(&content).expect("Failed to parse messages.json");
 
     assert_eq!(trace.schema.as_deref(), Some("golden-trace-v1"));
     assert!(!trace.source_files.is_empty());
-    assert!(!trace.frame_types.is_empty(), "frame_types should not be empty");
+    assert!(
+        !trace.frame_types.is_empty(),
+        "frame_types should not be empty"
+    );
 
     // Validate frame types include req, res, event
-    assert!(trace.frame_types.contains_key("request"), "missing request frame type");
-    assert!(trace.frame_types.contains_key("response"), "missing response frame type");
-    assert!(trace.frame_types.contains_key("event"), "missing event frame type");
+    assert!(
+        trace.frame_types.contains_key("request"),
+        "missing request frame type"
+    );
+    assert!(
+        trace.frame_types.contains_key("response"),
+        "missing response frame type"
+    );
+    assert!(
+        trace.frame_types.contains_key("event"),
+        "missing event frame type"
+    );
 }
 
 #[test]
@@ -289,21 +324,18 @@ fn test_ws_events_trace_valid() {
     let path = format!("{}/ws/events.json", golden_dir());
     let content = fs::read_to_string(&path).expect("Failed to read events.json");
 
-    let trace: WsEventsTrace = serde_json::from_str(&content)
-        .expect("Failed to parse events.json");
+    let trace: WsEventsTrace = serde_json::from_str(&content).expect("Failed to parse events.json");
 
     assert_eq!(trace.schema.as_deref(), Some("golden-trace-v1"));
     assert!(!trace.source_files.is_empty());
     assert!(!trace.events.is_empty(), "events should not be empty");
-    assert!(!trace.event_list.is_empty(), "event_list should not be empty");
+    assert!(
+        !trace.event_list.is_empty(),
+        "event_list should not be empty"
+    );
 
     // Validate key events are present in event_list
-    let required_events = [
-        "connect.challenge",
-        "tick",
-        "presence",
-        "agent",
-    ];
+    let required_events = ["connect.challenge", "tick", "presence", "agent"];
 
     for required in required_events {
         assert!(
@@ -320,7 +352,11 @@ fn test_ws_events_trace_valid() {
 
     // Validate each event definition has description
     for (name, event) in &trace.events {
-        assert!(!event.description.is_empty(), "event '{}' description should not be empty", name);
+        assert!(
+            !event.description.is_empty(),
+            "event '{}' description should not be empty",
+            name
+        );
     }
 }
 
@@ -329,13 +365,18 @@ fn test_ws_errors_trace_valid() {
     let path = format!("{}/ws/errors.json", golden_dir());
     let content = fs::read_to_string(&path).expect("Failed to read errors.json");
 
-    let trace: WsErrorsTrace = serde_json::from_str(&content)
-        .expect("Failed to parse errors.json");
+    let trace: WsErrorsTrace = serde_json::from_str(&content).expect("Failed to parse errors.json");
 
     assert_eq!(trace.schema.as_deref(), Some("golden-trace-v1"));
     assert!(!trace.source_files.is_empty());
-    assert!(!trace.error_codes.codes.is_empty(), "error_codes.codes should not be empty");
-    assert!(!trace.close_codes.codes.is_empty(), "close_codes.codes should not be empty");
+    assert!(
+        !trace.error_codes.codes.is_empty(),
+        "error_codes.codes should not be empty"
+    );
+    assert!(
+        !trace.close_codes.codes.is_empty(),
+        "close_codes.codes should not be empty"
+    );
 
     // Validate required error codes
     let required_error_codes = ["INVALID_REQUEST", "NOT_LINKED", "NOT_PAIRED"];
@@ -359,7 +400,11 @@ fn test_ws_errors_trace_valid() {
 
     // Validate error code definitions have required fields
     for (code, def) in &trace.error_codes.codes {
-        assert!(!def.description.is_empty(), "error code '{}' should have description", code);
+        assert!(
+            !def.description.is_empty(),
+            "error code '{}' should have description",
+            code
+        );
     }
 }
 
@@ -369,8 +414,8 @@ fn test_ws_errors_trace_valid() {
 
 fn validate_http_trace(filename: &str) {
     let path = format!("{}/http/{}", golden_dir(), filename);
-    let content = fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("Failed to read {}: {}", filename, e));
+    let content =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("Failed to read {}: {}", filename, e));
 
     let trace: HttpEndpointTrace = serde_json::from_str(&content)
         .unwrap_or_else(|e| panic!("Failed to parse {}: {}", filename, e));
@@ -413,15 +458,24 @@ fn test_http_hooks_agent_trace_valid() {
     let trace: Value = serde_json::from_str(&content).unwrap();
 
     // Validate request_schema exists and has required fields
-    let request_schema = trace.get("request_schema")
+    let request_schema = trace
+        .get("request_schema")
         .expect("hooks-agent.json should have request_schema");
-    validate_has_fields(request_schema, &["type", "required", "properties"], "request_schema");
+    validate_has_fields(
+        request_schema,
+        &["type", "required", "properties"],
+        "request_schema",
+    );
 
     // Validate scenarios exist
-    let scenarios = trace.get("scenarios")
+    let scenarios = trace
+        .get("scenarios")
         .expect("hooks-agent.json should have scenarios");
     assert!(scenarios.is_array(), "scenarios should be an array");
-    assert!(!scenarios.as_array().unwrap().is_empty(), "scenarios should not be empty");
+    assert!(
+        !scenarios.as_array().unwrap().is_empty(),
+        "scenarios should not be empty"
+    );
 }
 
 #[test]

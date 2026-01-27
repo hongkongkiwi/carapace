@@ -87,10 +87,18 @@ impl std::fmt::Display for CredentialError {
             Self::IoError(msg) => write!(f, "I/O error: {}", msg),
             Self::JsonError(msg) => write!(f, "JSON error: {}", msg),
             Self::KeyTooLong => {
-                write!(f, "Key exceeds maximum length of {} characters", MAX_KEY_LENGTH)
+                write!(
+                    f,
+                    "Key exceeds maximum length of {} characters",
+                    MAX_KEY_LENGTH
+                )
             }
             Self::ValueTooLong => {
-                write!(f, "Value exceeds maximum length of {} bytes", MAX_VALUE_LENGTH)
+                write!(
+                    f,
+                    "Value exceeds maximum length of {} bytes",
+                    MAX_VALUE_LENGTH
+                )
             }
             Self::QuotaExceeded => write!(
                 f,
@@ -116,9 +124,7 @@ impl std::error::Error for CredentialError {}
 pub fn is_retryable(error: &CredentialError) -> bool {
     matches!(
         error,
-        CredentialError::Timeout
-            | CredentialError::IoError(_)
-            | CredentialError::RateLimitExceeded
+        CredentialError::Timeout | CredentialError::IoError(_) | CredentialError::RateLimitExceeded
     )
 }
 
@@ -173,7 +179,11 @@ pub struct CredentialKey {
 
 impl CredentialKey {
     /// Create a new credential key
-    pub fn new(kind: impl Into<String>, agent_id: impl Into<String>, id: impl Into<String>) -> Self {
+    pub fn new(
+        kind: impl Into<String>,
+        agent_id: impl Into<String>,
+        id: impl Into<String>,
+    ) -> Self {
         Self {
             kind: kind.into(),
             agent_id: agent_id.into(),
@@ -360,7 +370,8 @@ impl<B: CredentialBackend> CredentialStore<B> {
     /// Create a new credential store with the given backend and state directory
     pub async fn new(backend: B, state_dir: PathBuf) -> Result<Self, CredentialError> {
         let credentials_dir = state_dir.join("credentials");
-        fs::create_dir_all(&credentials_dir).map_err(|e| CredentialError::IoError(e.to_string()))?;
+        fs::create_dir_all(&credentials_dir)
+            .map_err(|e| CredentialError::IoError(e.to_string()))?;
 
         let index_path = credentials_dir.join("index.json");
         let index = Self::load_or_create_index(&index_path)?;
@@ -393,7 +404,8 @@ impl<B: CredentialBackend> CredentialStore<B> {
             return Ok(CredentialIndex::new());
         }
 
-        let content = fs::read_to_string(path).map_err(|e| CredentialError::IoError(e.to_string()))?;
+        let content =
+            fs::read_to_string(path).map_err(|e| CredentialError::IoError(e.to_string()))?;
 
         match serde_json::from_str::<CredentialIndex>(&content) {
             Ok(index) => Ok(index),
@@ -422,8 +434,8 @@ impl<B: CredentialBackend> CredentialStore<B> {
     /// Save the index with file locking
     async fn save_index(&self) -> Result<(), CredentialError> {
         let index = self.index.read().await;
-        let content =
-            serde_json::to_string_pretty(&*index).map_err(|e| CredentialError::JsonError(e.to_string()))?;
+        let content = serde_json::to_string_pretty(&*index)
+            .map_err(|e| CredentialError::JsonError(e.to_string()))?;
         drop(index);
 
         // Use file locking for writes
@@ -442,7 +454,11 @@ impl<B: CredentialBackend> CredentialStore<B> {
                         // Check if lock is stale (older than 30s)
                         if let Ok(metadata) = fs::metadata(&lock_path) {
                             if let Ok(modified) = metadata.modified() {
-                                if modified.elapsed().map(|d| d.as_secs() > 30).unwrap_or(false) {
+                                if modified
+                                    .elapsed()
+                                    .map(|d| d.as_secs() > 30)
+                                    .unwrap_or(false)
+                                {
                                     // Stale lock, remove it
                                     let _ = fs::remove_file(&lock_path);
                                     continue;
@@ -466,12 +482,14 @@ impl<B: CredentialBackend> CredentialStore<B> {
         // Write the file atomically
         let temp_path = self.index_path.with_extension("tmp");
         let result = (|| {
-            let mut file = File::create(&temp_path).map_err(|e| CredentialError::IoError(e.to_string()))?;
+            let mut file =
+                File::create(&temp_path).map_err(|e| CredentialError::IoError(e.to_string()))?;
             IoWrite::write_all(&mut file, content.as_bytes())
                 .map_err(|e| CredentialError::IoError(e.to_string()))?;
             file.sync_all()
                 .map_err(|e| CredentialError::IoError(e.to_string()))?;
-            fs::rename(&temp_path, &self.index_path).map_err(|e| CredentialError::IoError(e.to_string()))?;
+            fs::rename(&temp_path, &self.index_path)
+                .map_err(|e| CredentialError::IoError(e.to_string()))?;
             Ok(())
         })();
 
@@ -629,8 +647,7 @@ impl<B: CredentialBackend> CredentialStore<B> {
         };
 
         // Set the credential (this updates the index.entries via set())
-        self.set(&key, value, Some(plugin_key.clone()))
-            .await?;
+        self.set(&key, value, Some(plugin_key.clone())).await?;
 
         // Update plugin quota if this was a new key
         // Note: There's a small race window here where another concurrent call
@@ -1158,7 +1175,10 @@ mod tests {
         }
 
         // Verify the value was actually updated
-        let value = store.plugin_get(plugin_id, "token", "api-key").await.unwrap();
+        let value = store
+            .plugin_get(plugin_id, "token", "api-key")
+            .await
+            .unwrap();
         assert_eq!(value, Some("secret-v9".to_string()));
     }
 
@@ -1175,7 +1195,12 @@ mod tests {
         // Set multiple different credentials
         for i in 1..=5 {
             store
-                .plugin_set(plugin_id, "token", &format!("key-{}", i), &format!("secret-{}", i))
+                .plugin_set(
+                    plugin_id,
+                    "token",
+                    &format!("key-{}", i),
+                    &format!("secret-{}", i),
+                )
                 .await
                 .unwrap();
         }
