@@ -76,3 +76,14 @@ watch:
 # Watch for changes and run clippy
 watch-lint:
     cargo watch -x clippy
+
+# Setup git hooks for pre-commit (fmt, clippy) and pre-push (tests)
+setup-hooks:
+    git config core.hooksPath .githooks
+    @echo "✓ Git hooks enabled (.githooks/pre-commit, .githooks/pre-push)"
+
+# Run pre-commit checks manually
+pre-commit: fmt-check lint
+
+# Run pre-push checks manually
+pre-push: test
