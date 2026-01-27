@@ -422,8 +422,9 @@ pub(super) fn handle_system_event(
     {
         use super::super::PresenceEntry;
         let mut presence = state.presence.lock();
-        let entry = presence.entry(presence_key.clone()).or_insert_with(|| {
-            PresenceEntry {
+        let entry = presence
+            .entry(presence_key.clone())
+            .or_insert_with(|| PresenceEntry {
                 conn_id: conn.conn_id.clone(),
                 client_id: Some(conn.client.id.clone()),
                 ts,
@@ -442,8 +443,7 @@ pub(super) fn handle_system_event(
                 instance_id: None,
                 text: None,
                 last_input_seconds: None,
-            }
-        });
+            });
 
         // Update fields if provided (explicit params or parsed from text)
         if instance_id.is_some() {
@@ -662,7 +662,12 @@ mod tests {
     #[test]
     fn test_derive_presence_key_instance_id_second() {
         let parsed = ParsedPresence::default();
-        let key = derive_presence_key(&None, &Some("instance-456".to_string()), &parsed, "fallback");
+        let key = derive_presence_key(
+            &None,
+            &Some("instance-456".to_string()),
+            &parsed,
+            "fallback",
+        );
         assert_eq!(key, "instance-456");
     }
 

@@ -275,10 +275,7 @@ pub(super) fn handle_tts_configure(params: Option<&Value>) -> Result<Value, Erro
         state.rate = rate.clamp(0.5, 2.0);
     }
 
-    if let Some(pitch) = params
-        .and_then(|v| v.get("pitch"))
-        .and_then(|v| v.as_f64())
-    {
+    if let Some(pitch) = params.and_then(|v| v.get("pitch")).and_then(|v| v.as_f64()) {
         state.pitch = pitch.clamp(-1.0, 1.0);
     }
 

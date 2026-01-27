@@ -158,9 +158,7 @@ impl WizardManager {
 
     /// Get the currently active wizard (if any)
     fn active_wizard(&self) -> Option<&WizardSession> {
-        self.wizards
-            .values()
-            .find(|w| !w.complete && !w.cancelled)
+        self.wizards.values().find(|w| !w.complete && !w.cancelled)
     }
 
     /// Clean up expired wizard sessions
@@ -224,7 +222,9 @@ fn create_wizard_steps(wizard_type: &str) -> Vec<WizardStep> {
             WizardStep {
                 id: "complete".to_string(),
                 title: "Setup Complete".to_string(),
-                description: Some("You're all set! Start chatting with your assistant.".to_string()),
+                description: Some(
+                    "You're all set! Start chatting with your assistant.".to_string(),
+                ),
                 input_type: "confirm".to_string(),
                 options: None,
                 required: true,
@@ -492,7 +492,9 @@ pub(super) fn handle_wizard_back(params: Option<&Value>) -> Result<Value, ErrorS
 
 /// Cancel an active wizard
 pub(super) fn handle_wizard_cancel(params: Option<&Value>) -> Result<Value, ErrorShape> {
-    let wizard_id = params.and_then(|v| v.get("wizardId")).and_then(|v| v.as_str());
+    let wizard_id = params
+        .and_then(|v| v.get("wizardId"))
+        .and_then(|v| v.as_str());
 
     let mut manager = WIZARD_STATE.write();
 
@@ -524,7 +526,9 @@ pub(super) fn handle_wizard_cancel(params: Option<&Value>) -> Result<Value, Erro
 
 /// Get wizard status
 pub(super) fn handle_wizard_status(params: Option<&Value>) -> Result<Value, ErrorShape> {
-    let wizard_id = params.and_then(|v| v.get("wizardId")).and_then(|v| v.as_str());
+    let wizard_id = params
+        .and_then(|v| v.get("wizardId"))
+        .and_then(|v| v.as_str());
 
     let manager = WIZARD_STATE.read();
 

@@ -84,10 +84,7 @@ mod tests {
     #[test]
     fn test_extract_x_moltbot_token() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-moltbot-token",
-            HeaderValue::from_static("another-token"),
-        );
+        headers.insert("x-moltbot-token", HeaderValue::from_static("another-token"));
         let uri: Uri = "/hooks/wake".parse().unwrap();
 
         let result = extract_hooks_token(&headers, &uri);
