@@ -3,6 +3,8 @@
 //! Implements:
 //! - Hooks API (POST /hooks/wake, /hooks/agent, /hooks/<mapping>)
 //! - Tools API (POST /tools/invoke)
+//! - OpenAI compatibility (POST /v1/chat/completions, /v1/responses)
+//! - Control endpoints (GET /control/status, /control/channels, POST /control/config)
 //! - Control UI (static files + SPA fallback + avatar endpoint)
 //! - Auth middleware (hooks token, gateway auth, loopback bypass)
 //! - Security middleware (headers, CSRF, rate limiting)
@@ -17,6 +19,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -25,16 +28,21 @@ use tokio::fs;
 use tracing::debug;
 use uuid::Uuid;
 
+use crate::server::control::{self, ControlState};
 use crate::server::csrf::{csrf_middleware, CsrfConfig, CsrfTokenStore};
 use crate::server::headers::{security_headers_middleware, SecurityHeadersConfig};
+use crate::server::openai::{self, OpenAiState};
 use crate::server::ratelimit::{rate_limit_middleware, RateLimitConfig, RateLimiter};
 
 use crate::auth;
+use crate::channels::ChannelRegistry;
 use crate::hooks::auth::{extract_hooks_token, validate_hooks_token};
 use crate::hooks::handler::{
     validate_agent_request, validate_wake_request, AgentRequest, AgentResponse, HooksErrorResponse,
     WakeRequest, WakeResponse,
 };
+use crate::hooks::registry::{HookMappingContext, HookMappingResult, HookRegistry};
+use crate::plugins::tools::{ToolInvokeContext, ToolInvokeResult, ToolsRegistry};
 
 /// Default max body size for hooks (256KB)
 pub const DEFAULT_MAX_BODY_BYTES: usize = 262144;
@@ -67,6 +75,12 @@ pub struct HttpConfig {
     pub valid_channels: Vec<String>,
     /// Agents directory for avatar resolution
     pub agents_dir: PathBuf,
+    /// Whether OpenAI chat completions endpoint is enabled
+    pub openai_chat_completions_enabled: bool,
+    /// Whether OpenResponses endpoint is enabled
+    pub openai_responses_enabled: bool,
+    /// Whether control endpoints are enabled
+    pub control_endpoints_enabled: bool,
 }
 
 impl Default for HttpConfig {
@@ -85,6 +99,9 @@ impl Default for HttpConfig {
             agents_dir: dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join(".clawdbot/agents"),
+            openai_chat_completions_enabled: false,
+            openai_responses_enabled: false,
+            control_endpoints_enabled: false,
         }
     }
 }
@@ -93,6 +110,14 @@ impl Default for HttpConfig {
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<HttpConfig>,
+    /// Hook mappings registry
+    pub hook_registry: Arc<HookRegistry>,
+    /// Tools registry
+    pub tools_registry: Arc<ToolsRegistry>,
+    /// Channel registry
+    pub channel_registry: Arc<ChannelRegistry>,
+    /// Gateway start time (Unix timestamp)
+    pub start_time: i64,
 }
 
 /// Middleware configuration for the HTTP server
@@ -161,8 +186,31 @@ pub fn create_router_with_middleware(
     config: HttpConfig,
     middleware_config: MiddlewareConfig,
 ) -> Router {
+    create_router_with_state(
+        config,
+        middleware_config,
+        Arc::new(HookRegistry::new()),
+        Arc::new(ToolsRegistry::new()),
+        Arc::new(ChannelRegistry::new()),
+    )
+}
+
+/// Create the HTTP router with custom registries
+pub fn create_router_with_state(
+    config: HttpConfig,
+    middleware_config: MiddlewareConfig,
+    hook_registry: Arc<HookRegistry>,
+    tools_registry: Arc<ToolsRegistry>,
+    channel_registry: Arc<ChannelRegistry>,
+) -> Router {
+    let start_time = chrono::Utc::now().timestamp();
+
     let state = AppState {
         config: Arc::new(config.clone()),
+        hook_registry,
+        tools_registry,
+        channel_registry: channel_registry.clone(),
+        start_time,
     };
 
     let mut router: Router<AppState> = Router::new();
@@ -181,6 +229,84 @@ pub fn create_router_with_middleware(
 
     // Tools API
     router = router.route("/tools/invoke", post(tools_invoke_handler));
+
+    // OpenAI compatibility endpoints
+    if config.openai_chat_completions_enabled || config.openai_responses_enabled {
+        let openai_state = OpenAiState {
+            chat_completions_enabled: config.openai_chat_completions_enabled,
+            responses_enabled: config.openai_responses_enabled,
+            gateway_token: config.gateway_token.clone(),
+            gateway_password: config.gateway_password.clone(),
+        };
+
+        if config.openai_chat_completions_enabled {
+            router =
+                router.route(
+                    "/v1/chat/completions",
+                    post(move |headers, body| {
+                        let state = openai_state.clone();
+                        async move {
+                            openai::chat_completions_handler(State(state), headers, body).await
+                        }
+                    }),
+                );
+        }
+
+        let openai_state2 = OpenAiState {
+            chat_completions_enabled: config.openai_chat_completions_enabled,
+            responses_enabled: config.openai_responses_enabled,
+            gateway_token: config.gateway_token.clone(),
+            gateway_password: config.gateway_password.clone(),
+        };
+
+        if config.openai_responses_enabled {
+            router = router.route(
+                "/v1/responses",
+                post(move |headers, body| {
+                    let state = openai_state2.clone();
+                    async move { openai::responses_handler(State(state), headers, body).await }
+                }),
+            );
+        }
+    }
+
+    // Control endpoints
+    if config.control_endpoints_enabled {
+        let control_state = ControlState {
+            gateway_token: config.gateway_token.clone(),
+            gateway_password: config.gateway_password.clone(),
+            channel_registry: channel_registry.clone(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            start_time,
+        };
+
+        let control_state_status = control_state.clone();
+        let control_state_channels = control_state.clone();
+        let control_state_config = control_state.clone();
+
+        router = router
+            .route(
+                "/control/status",
+                get(move |headers| {
+                    let state = control_state_status.clone();
+                    async move { control::status_handler(State(state), headers).await }
+                }),
+            )
+            .route(
+                "/control/channels",
+                get(move |headers| {
+                    let state = control_state_channels.clone();
+                    async move { control::channels_handler(State(state), headers).await }
+                }),
+            )
+            .route(
+                "/control/config",
+                post(move |headers, body| {
+                    let state = control_state_config.clone();
+                    async move { control::config_handler(State(state), headers, body).await }
+                }),
+            );
+    }
 
     // Control UI routes (when enabled)
     if config.control_ui_enabled {
@@ -394,10 +520,85 @@ async fn hooks_mapping_handler(
             .into_response();
     }
 
-    // In the real implementation, look up hook mappings here
-    // For now, return 404 for unknown paths
-    debug!("Hook mapping request for path: {}", path);
-    (StatusCode::NOT_FOUND, "Not Found").into_response()
+    // Parse payload
+    let payload: Value = if body.is_empty() {
+        json!({})
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(p) => p,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(HooksErrorResponse::new(&format!("SyntaxError: {}", e))),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    // Build hook context
+    let mut header_map: HashMap<String, String> = HashMap::new();
+    for (key, value) in headers.iter() {
+        if let Ok(v) = value.to_str() {
+            header_map.insert(key.as_str().to_lowercase(), v.to_string());
+        }
+    }
+
+    let ctx = HookMappingContext {
+        path: path.clone(),
+        headers: header_map,
+        payload,
+        query: uri.query().map(|s| s.to_string()),
+        now: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+    };
+
+    // Look up matching mapping
+    let mapping = match state.hook_registry.find_match(&ctx) {
+        Some(m) => m,
+        None => {
+            debug!("No hook mapping found for path: {}", path);
+            return (StatusCode::NOT_FOUND, "Not Found").into_response();
+        }
+    };
+
+    debug!("Hook mapping found for path '{}': {:?}", path, mapping.id);
+
+    // Evaluate the mapping
+    match state.hook_registry.evaluate(&mapping, &ctx) {
+        Ok(HookMappingResult::Skip) => {
+            // Transform returned null - skip this webhook
+            (StatusCode::NO_CONTENT, "").into_response()
+        }
+        Ok(HookMappingResult::Wake { text, mode }) => {
+            debug!("Hook triggered wake: text='{}', mode='{}'", text, mode);
+            (StatusCode::OK, Json(json!({ "ok": true, "mode": mode }))).into_response()
+        }
+        Ok(HookMappingResult::Agent {
+            message,
+            session_key,
+            ..
+        }) => {
+            let run_id = Uuid::new_v4().to_string();
+            debug!(
+                "Hook triggered agent: message='{}', session_key='{}', runId='{}'",
+                message, session_key, run_id
+            );
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({ "ok": true, "runId": run_id })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            let status = match &e {
+                crate::hooks::HookMappingError::TransformError(_) => {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+                _ => StatusCode::BAD_REQUEST,
+            };
+            (status, Json(json!({ "ok": false, "error": e.to_string() }))).into_response()
+        }
+    }
 }
 
 /// Check hooks authentication
@@ -500,42 +701,71 @@ async fn tools_invoke_handler(
     };
 
     // Normalize args (non-object/array becomes empty object)
-    let _args = match &req.args {
+    let mut args = match &req.args {
         Some(Value::Object(obj)) => Value::Object(obj.clone()),
         _ => Value::Object(serde_json::Map::new()),
     };
 
-    // In real implementation, look up and execute the tool here
-    // For now, return not found for all tools except a mock "time" tool
-    if tool_name == "time" {
-        let result = json!({
-            "timestamp": utc_now_iso8601(),
-            "timezone": "UTC"
-        });
-        return (
+    // If action is provided, merge it into args (if args has 'action' property in schema)
+    if let Some(action) = &req.action {
+        if let Value::Object(ref mut obj) = args {
+            obj.insert("action".to_string(), Value::String(action.clone()));
+        }
+    }
+
+    // Extract context from headers
+    let message_channel = headers
+        .get("x-clawdbot-message-channel")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let account_id = headers
+        .get("x-clawdbot-account-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    // Build tool invoke context
+    let ctx = ToolInvokeContext {
+        agent_id: None,
+        session_key: req.session_key.unwrap_or_else(|| "main".to_string()),
+        message_channel,
+        account_id,
+        sandboxed: false,
+        dry_run: req.dry_run.unwrap_or(false),
+    };
+
+    // Invoke the tool via the registry
+    let result = state.tools_registry.invoke(&tool_name, args, &ctx);
+
+    match result {
+        ToolInvokeResult::Success { ok, result } => (
             StatusCode::OK,
             Json(ToolsInvokeResponse {
-                ok: true,
+                ok,
                 result: Some(result),
                 error: None,
             }),
         )
-            .into_response();
+            .into_response(),
+        ToolInvokeResult::Error { ok, error } => {
+            let status = if error.r#type == "not_found" {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (
+                status,
+                Json(ToolsInvokeResponse {
+                    ok,
+                    result: None,
+                    error: Some(ToolsError {
+                        r#type: error.r#type,
+                        message: error.message,
+                    }),
+                }),
+            )
+                .into_response()
+        }
     }
-
-    // Tool not found
-    (
-        StatusCode::NOT_FOUND,
-        Json(ToolsInvokeResponse {
-            ok: false,
-            result: None,
-            error: Some(ToolsError {
-                r#type: "not_found".to_string(),
-                message: format!("Tool not available: {}", tool_name),
-            }),
-        }),
-    )
-        .into_response()
 }
 
 /// Get current UTC timestamp in ISO 8601 format
