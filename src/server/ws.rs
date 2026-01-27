@@ -4086,6 +4086,8 @@ fn handle_device_pair_list(state: &WsServerState) -> Result<Value, ErrorShape> {
                 "displayName": device.display_name,
                 "platform": device.platform,
                 "clientId": device.client_id,
+                "clientMode": device.client_mode,
+                "remoteIp": device.remote_ip,
                 "roles": device.roles,
                 "scopes": device.scopes,
                 "createdAtMs": device.paired_at_ms,
@@ -4673,6 +4675,26 @@ fn ensure_paired(
                     remote_addr,
                 );
             }
+        }
+
+        let remote_ip = if is_local {
+            None
+        } else {
+            Some(remote_addr.ip().to_string())
+        };
+        if let Err(err) = state.device_registry.update_metadata(
+            &device.id,
+            devices::DeviceMetadataPatch {
+                display_name: connect.client.display_name.clone(),
+                platform: Some(connect.client.platform.clone()),
+                client_id: Some(connect.client.id.clone()),
+                client_mode: Some(connect.client.mode.clone()),
+                remote_ip,
+                role: Some(role.to_string()),
+                scopes: Some(scopes.to_vec()),
+            },
+        ) {
+            warn!(error = %err, device_id = %device.id, "failed to update device metadata");
         }
 
         return Ok(());

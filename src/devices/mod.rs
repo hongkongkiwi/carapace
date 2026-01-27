@@ -97,6 +97,17 @@ pub struct PairingRequestOutcome {
     pub created: bool,
 }
 
+#[derive(Default, Clone)]
+pub struct DeviceMetadataPatch {
+    pub display_name: Option<String>,
+    pub platform: Option<String>,
+    pub client_id: Option<String>,
+    pub client_mode: Option<String>,
+    pub remote_ip: Option<String>,
+    pub role: Option<String>,
+    pub scopes: Option<Vec<String>>,
+}
+
 impl DevicePairingRequest {
     /// Create a new pending pairing request
     pub fn new(
@@ -185,6 +196,12 @@ pub struct PairedDevice {
     /// Client ID
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
+    /// Client mode
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_mode: Option<String>,
+    /// Remote IP address
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_ip: Option<String>,
     /// Timestamp when paired (Unix ms)
     pub paired_at_ms: u64,
     /// Last seen timestamp (Unix ms)
@@ -207,6 +224,8 @@ impl PairedDevice {
             display_name: request.display_name.clone(),
             platform: request.platform.clone(),
             client_id: request.client_id.clone(),
+            client_mode: request.client_mode.clone(),
+            remote_ip: request.remote_ip.clone(),
             paired_at_ms: now_ms(),
             last_seen_ms: None,
         }
@@ -700,6 +719,8 @@ impl DevicePairingRegistry {
         let display_name = request.display_name.clone();
         let platform = request.platform.clone();
         let client_id = request.client_id.clone();
+        let client_mode = request.client_mode.clone();
+        let remote_ip = request.remote_ip.clone();
 
         // Check paired device limit and evict if needed
         if store.paired_devices.len() >= MAX_PAIRED_DEVICES {
@@ -733,6 +754,8 @@ impl DevicePairingRegistry {
             display_name,
             platform,
             client_id,
+            client_mode,
+            remote_ip,
             paired_at_ms: now_ms(),
             last_seen_ms: None,
         };
@@ -818,6 +841,52 @@ impl DevicePairingRegistry {
             device.touch();
         }
         // Don't save on every touch to avoid excessive I/O
+    }
+
+    /// Update metadata for a paired device
+    pub fn update_metadata(
+        &self,
+        device_id: &str,
+        patch: DeviceMetadataPatch,
+    ) -> Result<(), DevicePairingError> {
+        let mut store = self.store.write();
+        let device = store
+            .paired_devices
+            .get_mut(device_id)
+            .ok_or(DevicePairingError::DeviceNotPaired)?;
+
+        if let Some(display_name) = patch.display_name {
+            device.display_name = Some(display_name);
+        }
+        if let Some(platform) = patch.platform {
+            device.platform = Some(platform);
+        }
+        if let Some(client_id) = patch.client_id {
+            device.client_id = Some(client_id);
+        }
+        if let Some(client_mode) = patch.client_mode {
+            device.client_mode = Some(client_mode);
+        }
+        if let Some(remote_ip) = patch.remote_ip {
+            device.remote_ip = Some(remote_ip);
+        }
+        if let Some(role) = patch.role {
+            if !device.roles.contains(&role) {
+                device.roles.push(role);
+            }
+        }
+        if let Some(scopes) = patch.scopes {
+            for scope in scopes {
+                if !device.scopes.contains(&scope) {
+                    device.scopes.push(scope);
+                }
+            }
+        }
+        device.touch();
+
+        drop(store);
+        let _ = self.save();
+        Ok(())
     }
 
     /// Unpair a device
