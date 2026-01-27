@@ -10,20 +10,24 @@ use base64::Engine as _;
 use ed25519_dalek::{Signature, VerifyingKey};
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::fs;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::{auth, config, credentials};
+use crate::{auth, channels, config, credentials, devices, messages, nodes, sessions};
 
 const PROTOCOL_VERSION: u32 = 3;
 const MAX_PAYLOAD_BYTES: usize = 512 * 1024;
@@ -31,6 +35,10 @@ const MAX_BUFFERED_BYTES: usize = (1024 * 1024 * 3) / 2;
 const TICK_INTERVAL_MS: u64 = 30_000;
 const HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
 const SIGNATURE_SKEW_MS: i64 = 600_000;
+const LOGS_DEFAULT_LIMIT: usize = 500;
+const LOGS_DEFAULT_MAX_BYTES: usize = 250_000;
+const LOGS_MAX_LIMIT: usize = 5_000;
+const LOGS_MAX_BYTES: usize = 1_000_000;
 
 const ERROR_INVALID_REQUEST: &str = "INVALID_REQUEST";
 const ERROR_NOT_PAIRED: &str = "NOT_PAIRED";
@@ -217,8 +225,12 @@ impl Default for WsPolicy {
 pub struct WsServerState {
     config: WsServerConfig,
     start_time: Instant,
-    device_store: Mutex<DeviceStore>,
+    device_registry: Arc<devices::DevicePairingRegistry>,
     node_registry: Mutex<NodeRegistry>,
+    node_pairing: Arc<nodes::NodePairingRegistry>,
+    channel_registry: Arc<channels::ChannelRegistry>,
+    message_pipeline: Arc<messages::outbound::MessagePipeline>,
+    session_store: Arc<sessions::SessionStore>,
     event_seq: Mutex<u64>,
 }
 
@@ -227,10 +239,47 @@ impl WsServerState {
         Self {
             config,
             start_time: Instant::now(),
-            device_store: Mutex::new(DeviceStore::default()),
+            device_registry: Arc::new(devices::DevicePairingRegistry::in_memory()),
             node_registry: Mutex::new(NodeRegistry::default()),
+            node_pairing: Arc::new(nodes::NodePairingRegistry::in_memory()),
+            channel_registry: channels::create_registry(),
+            message_pipeline: messages::outbound::create_pipeline(),
+            session_store: Arc::new(sessions::SessionStore::with_base_path(
+                resolve_state_dir().join("sessions"),
+            )),
             event_seq: Mutex::new(0),
         }
+    }
+
+    pub fn new_persistent(
+        config: WsServerConfig,
+        state_dir: PathBuf,
+    ) -> Result<Self, WsConfigError> {
+        let node_pairing = nodes::create_registry(state_dir.clone())?;
+        let device_registry = devices::create_registry(state_dir.clone())?;
+        Ok(Self {
+            config,
+            start_time: Instant::now(),
+            device_registry,
+            node_registry: Mutex::new(NodeRegistry::default()),
+            node_pairing,
+            channel_registry: channels::create_registry(),
+            message_pipeline: messages::outbound::create_pipeline(),
+            session_store: Arc::new(sessions::SessionStore::with_base_path(
+                state_dir.join("sessions"),
+            )),
+            event_seq: Mutex::new(0),
+        })
+    }
+
+    pub fn with_node_pairing(mut self, registry: Arc<nodes::NodePairingRegistry>) -> Self {
+        self.node_pairing = registry;
+        self
+    }
+
+    pub fn with_device_registry(mut self, registry: Arc<devices::DevicePairingRegistry>) -> Self {
+        self.device_registry = registry;
+        self
     }
 
     fn next_event_seq(&self) -> u64 {
@@ -246,11 +295,16 @@ pub enum WsConfigError {
     Config(#[from] config::ConfigError),
     #[error(transparent)]
     Credentials(#[from] credentials::CredentialError),
+    #[error(transparent)]
+    Nodes(#[from] nodes::NodePairingError),
+    #[error(transparent)]
+    Devices(#[from] devices::DevicePairingError),
 }
 
 pub async fn build_ws_state_from_config() -> Result<Arc<WsServerState>, WsConfigError> {
     let config = build_ws_config_from_files().await?;
-    Ok(Arc::new(WsServerState::new(config)))
+    let state_dir = resolve_state_dir();
+    Ok(Arc::new(WsServerState::new_persistent(config, state_dir)?))
 }
 
 pub async fn build_ws_config_from_files() -> Result<WsServerConfig, WsConfigError> {
@@ -378,80 +432,6 @@ pub async fn build_ws_config_from_files() -> Result<WsServerConfig, WsConfigErro
     })
 }
 
-/// Maximum number of paired devices to prevent unbounded memory growth
-const MAX_PAIRED_DEVICES: usize = 100;
-
-/// Maximum number of active tokens (across all devices)
-const MAX_DEVICE_TOKENS: usize = 500;
-
-#[derive(Debug, Default)]
-struct DeviceStore {
-    paired: HashMap<String, PairedDevice>,
-    tokens: HashMap<String, DeviceToken>,
-}
-
-impl DeviceStore {
-    /// Add a paired device, evicting oldest if at capacity
-    fn add_paired_device(&mut self, device: PairedDevice) {
-        // If already exists (update), just replace
-        if self.paired.contains_key(&device.device_id) {
-            self.paired.insert(device.device_id.clone(), device);
-            return;
-        }
-
-        // Evict oldest if at capacity
-        if self.paired.len() >= MAX_PAIRED_DEVICES {
-            if let Some(oldest_id) = self.find_oldest_paired_device() {
-                self.paired.remove(&oldest_id);
-                // Also remove tokens for evicted device
-                self.tokens.retain(|_, t| t.device_id != oldest_id);
-            }
-        }
-
-        self.paired.insert(device.device_id.clone(), device);
-    }
-
-    /// Add a device token with the given key, evicting oldest if at capacity
-    fn add_token(&mut self, key: String, token: DeviceToken) {
-        // If already exists, replace
-        if self.tokens.contains_key(&key) {
-            self.tokens.insert(key, token);
-            return;
-        }
-
-        // Evict oldest if at capacity
-        if self.tokens.len() >= MAX_DEVICE_TOKENS {
-            if let Some(oldest_key) = self.find_oldest_token_key() {
-                self.tokens.remove(&oldest_key);
-            }
-        }
-
-        self.tokens.insert(key, token);
-    }
-
-    /// Find the oldest paired device (by paired_at_ms)
-    fn find_oldest_paired_device(&self) -> Option<String> {
-        self.paired
-            .values()
-            .min_by_key(|d| d.paired_at_ms)
-            .map(|d| d.device_id.clone())
-    }
-
-    /// Find the key of the oldest token (by issued_at_ms)
-    fn find_oldest_token_key(&self) -> Option<String> {
-        self.tokens
-            .iter()
-            .min_by_key(|(_, t)| t.issued_at_ms)
-            .map(|(k, _)| k.clone())
-    }
-
-    /// Get current counts for diagnostics
-    #[allow(dead_code)]
-    fn stats(&self) -> (usize, usize) {
-        (self.paired.len(), self.tokens.len())
-    }
-}
-
 #[derive(Debug, Clone)]
 struct NodeSession {
     node_id: String,
@@ -497,24 +477,6 @@ impl NodeRegistry {
     fn get(&self, node_id: &str) -> Option<&NodeSession> {
         self.nodes_by_id.get(node_id)
     }
-}
-
-#[derive(Debug, Clone)]
-struct PairedDevice {
-    device_id: String,
-    public_key: String,
-    roles: Vec<String>,
-    scopes: Vec<String>,
-    paired_at_ms: u64,
-}
-
-#[derive(Debug, Clone)]
-struct DeviceToken {
-    token: String,
-    device_id: String,
-    role: String,
-    scopes: Vec<String>,
-    issued_at_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -922,7 +884,7 @@ async fn handle_socket(
     }
 
     if let Some(device) = device_opt {
-        if let Err(err) = ensure_paired(&state, device, &role, &scopes, is_local) {
+        if let Err(err) = ensure_paired(&state, device, &connect_params, &role, &scopes, is_local) {
             let _ = send_response(&tx, &req_id, false, None, Some(err.clone()));
             let _ = send_close(&tx, 1008, err.message.as_str());
             return;
@@ -1185,11 +1147,253 @@ fn handle_health() -> Value {
 }
 
 fn handle_status(state: &WsServerState) -> Value {
+    let sessions = state
+        .session_store
+        .list_sessions(sessions::SessionFilter::new())
+        .unwrap_or_default();
+    let recent_sessions = sessions
+        .iter()
+        .take(10)
+        .map(|session| {
+            json!({
+                "sessionId": session.id,
+                "key": session.session_key,
+                "updatedAt": session.updated_at
+            })
+        })
+        .collect::<Vec<_>>();
     json!({
         "ts": now_ms(),
         "status": "ok",
-        "uptimeMs": state.start_time.elapsed().as_millis() as u64
+        "uptimeMs": state.start_time.elapsed().as_millis() as u64,
+        "version": env!("CARGO_PKG_VERSION"),
+        "runtime": {
+            "name": "rusty-clawd",
+            "platform": std::env::consts::OS,
+            "arch": std::env::consts::ARCH
+        },
+        "channels": {
+            "total": state.channel_registry.len(),
+            "connected": state
+                .channel_registry
+                .count_by_status(channels::ChannelStatus::Connected)
+        },
+        "sessions": {
+            "count": sessions.len(),
+            "recent": recent_sessions
+        }
     })
+}
+
+#[derive(Debug, Serialize)]
+struct ConfigIssue {
+    path: String,
+    message: String,
+}
+
+#[derive(Debug)]
+struct ConfigSnapshot {
+    path: String,
+    exists: bool,
+    raw: Option<String>,
+    parsed: Value,
+    valid: bool,
+    config: Value,
+    hash: Option<String>,
+    issues: Vec<ConfigIssue>,
+}
+
+fn map_validation_issues(issues: Vec<config::ValidationIssue>) -> Vec<ConfigIssue> {
+    issues
+        .into_iter()
+        .map(|issue| ConfigIssue {
+            path: issue.path,
+            message: issue.message,
+        })
+        .collect()
+}
+
+fn sha256_hex(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    format!("{:x}", digest)
+}
+
+fn read_config_snapshot() -> ConfigSnapshot {
+    let path = config::get_config_path();
+    let path_str = path.display().to_string();
+    if !path.exists() {
+        return ConfigSnapshot {
+            path: path_str,
+            exists: false,
+            raw: None,
+            parsed: Value::Object(serde_json::Map::new()),
+            valid: true,
+            config: Value::Object(serde_json::Map::new()),
+            hash: None,
+            issues: Vec::new(),
+        };
+    }
+
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) => {
+            return ConfigSnapshot {
+                path: path_str,
+                exists: true,
+                raw: None,
+                parsed: Value::Object(serde_json::Map::new()),
+                valid: false,
+                config: Value::Object(serde_json::Map::new()),
+                hash: None,
+                issues: vec![ConfigIssue {
+                    path: "".to_string(),
+                    message: format!("read failed: {}", err),
+                }],
+            }
+        }
+    };
+
+    let hash = Some(sha256_hex(&raw));
+    let parsed = json5::from_str::<Value>(&raw).unwrap_or(Value::Null);
+
+    let (config_value, mut issues, valid) = match config::load_config_uncached(&path) {
+        Ok(cfg) => {
+            let issues = map_validation_issues(config::validate_config(&cfg));
+            let valid = issues.is_empty();
+            (cfg, issues, valid)
+        }
+        Err(err) => {
+            let mut issues = Vec::new();
+            issues.push(ConfigIssue {
+                path: "".to_string(),
+                message: err.to_string(),
+            });
+            (parsed.clone(), issues, false)
+        }
+    };
+
+    if !valid && issues.is_empty() {
+        issues.push(ConfigIssue {
+            path: "".to_string(),
+            message: "invalid config".to_string(),
+        });
+    }
+
+    ConfigSnapshot {
+        path: path_str,
+        exists: true,
+        raw: Some(raw),
+        parsed,
+        valid,
+        config: config_value,
+        hash,
+        issues,
+    }
+}
+
+fn require_config_base_hash(
+    params: Option<&Value>,
+    snapshot: &ConfigSnapshot,
+) -> Result<(), ErrorShape> {
+    if !snapshot.exists {
+        return Ok(());
+    }
+    let base_hash = params
+        .and_then(|v| v.get("baseHash"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    let expected = snapshot.hash.as_deref();
+    if expected.is_none() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "config base hash unavailable; re-run config.get and retry",
+            None,
+        ));
+    }
+    let Some(base_hash) = base_hash else {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "config base hash required; re-run config.get and retry",
+            None,
+        ));
+    };
+    if Some(base_hash) != expected {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "config changed since last load; re-run config.get and retry",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn write_config_file(path: &PathBuf, config_value: &Value) -> Result<(), ErrorShape> {
+    if let Some(parent) = path.parent() {
+        if let Err(err) = fs::create_dir_all(parent) {
+            return Err(error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("failed to create config dir: {}", err),
+                None,
+            ));
+        }
+    }
+
+    let content = serde_json::to_string_pretty(config_value)
+        .map_err(|err| error_shape(ERROR_UNAVAILABLE, &err.to_string(), None))?;
+    let tmp_path = path.with_extension("json.tmp");
+    {
+        let mut file = fs::File::create(&tmp_path).map_err(|err| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("failed to write config: {}", err),
+                None,
+            )
+        })?;
+        file.write_all(content.as_bytes()).map_err(|err| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("failed to write config: {}", err),
+                None,
+            )
+        })?;
+        file.write_all(b"\n").map_err(|err| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("failed to write config: {}", err),
+                None,
+            )
+        })?;
+    }
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        return Err(error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("failed to replace config: {}", err),
+            None,
+        ));
+    }
+
+    config::clear_cache();
+    Ok(())
+}
+
+fn merge_patch(base: Value, patch: Value) -> Value {
+    match (base, patch) {
+        (_, Value::Null) => Value::Null,
+        (Value::Object(mut base_map), Value::Object(patch_map)) => {
+            for (key, patch_value) in patch_map {
+                if patch_value.is_null() {
+                    base_map.remove(&key);
+                } else {
+                    let base_value = base_map.remove(&key).unwrap_or(Value::Null);
+                    let merged = merge_patch(base_value, patch_value);
+                    base_map.insert(key, merged);
+                }
+            }
+            Value::Object(base_map)
+        }
+        (_, patch_value) => patch_value,
+    }
 }
 
 /// Methods exclusively for the `node` role
@@ -1566,31 +1770,31 @@ fn dispatch_method(
         // Config
         "config.get" => handle_config_get(params),
         "config.set" => handle_config_set(params),
-        "config.apply" => handle_config_apply(),
+        "config.apply" => handle_config_apply(params),
         "config.patch" => handle_config_patch(params),
         "config.schema" => handle_config_schema(),
 
         // Sessions
-        "sessions.list" => handle_sessions_list(state),
-        "sessions.preview" => handle_sessions_preview(params),
-        "sessions.patch" => handle_sessions_patch(params),
-        "sessions.reset" => handle_sessions_reset(params),
-        "sessions.delete" => handle_sessions_delete(params),
-        "sessions.compact" => handle_sessions_compact(params),
+        "sessions.list" => handle_sessions_list(state, params),
+        "sessions.preview" => handle_sessions_preview(state, params),
+        "sessions.patch" => handle_sessions_patch(state, params),
+        "sessions.reset" => handle_sessions_reset(state, params),
+        "sessions.delete" => handle_sessions_delete(state, params),
+        "sessions.compact" => handle_sessions_compact(state, params),
 
         // Channels
         "channels.status" => handle_channels_status(state),
-        "channels.logout" => handle_channels_logout(params),
+        "channels.logout" => handle_channels_logout(params, state),
 
         // Agent
-        "agent" => handle_agent(params, conn),
+        "agent" => handle_agent(params, state, conn),
         "agent.identity.get" => handle_agent_identity_get(state),
         "agent.wait" => handle_agent_wait(params),
 
         // Chat
-        "chat.history" => handle_chat_history(params),
-        "chat.send" => handle_chat_send(params, conn),
-        "chat.abort" => handle_chat_abort(params),
+        "chat.history" => handle_chat_history(state, params),
+        "chat.send" => handle_chat_send(state, params, conn),
+        "chat.abort" => handle_chat_abort(state, params),
 
         // TTS
         "tts.status" => handle_tts_status(),
@@ -1632,17 +1836,17 @@ fn dispatch_method(
         "cron.runs" => handle_cron_runs(params),
 
         // Node pairing
-        "node.pair.request" => handle_node_pair_request(params),
-        "node.pair.list" => handle_node_pair_list(),
-        "node.pair.approve" => handle_node_pair_approve(params),
-        "node.pair.reject" => handle_node_pair_reject(params),
-        "node.pair.verify" => handle_node_pair_verify(params),
-        "node.rename" => handle_node_rename(params),
-        "node.list" => handle_node_list(),
-        "node.describe" => handle_node_describe(params),
+        "node.pair.request" => handle_node_pair_request(params, state),
+        "node.pair.list" => handle_node_pair_list(state),
+        "node.pair.approve" => handle_node_pair_approve(params, state),
+        "node.pair.reject" => handle_node_pair_reject(params, state),
+        "node.pair.verify" => handle_node_pair_verify(params, state),
+        "node.rename" => handle_node_rename(params, state),
+        "node.list" => handle_node_list(state),
+        "node.describe" => handle_node_describe(params, state),
         "node.invoke" => handle_node_invoke(params, state),
-        "node.invoke.result" => handle_node_invoke_result(params),
-        "node.event" => handle_node_event(params),
+        "node.invoke.result" => handle_node_invoke_result(params, state, conn),
+        "node.event" => handle_node_event(params, state, conn),
 
         // Device pairing
         "device.pair.list" => handle_device_pair_list(state),
@@ -1670,7 +1874,7 @@ fn dispatch_method(
         "last-heartbeat" => handle_last_heartbeat(),
         "set-heartbeats" => handle_set_heartbeats(params),
         "wake" => handle_wake(params),
-        "send" => handle_send(params, conn),
+        "send" => handle_send(state, params, conn),
         "system-presence" => handle_system_presence(params),
         "system-event" => handle_system_event(params),
 
@@ -1683,59 +1887,134 @@ fn dispatch_method(
 }
 
 fn handle_config_get(params: Option<&Value>) -> Result<Value, ErrorShape> {
-    let cfg = config::load_config()
-        .map_err(|_| error_shape(ERROR_UNAVAILABLE, "config load failed", None))?;
+    let snapshot = read_config_snapshot();
     let key = params
         .and_then(|v| v.get("key"))
         .and_then(|v| v.as_str())
         .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
+        .filter(|s| !s.is_empty());
 
     if let Some(key) = key {
-        let value = get_value_at_path(&cfg, &key).unwrap_or(Value::Null);
-        Ok(json!({ "key": key, "value": value }))
-    } else {
-        Ok(json!({ "value": cfg }))
+        let value = get_value_at_path(&snapshot.config, key).unwrap_or(Value::Null);
+        return Ok(json!({
+            "key": key,
+            "value": value
+        }));
     }
-}
 
-fn handle_config_set(params: Option<&Value>) -> Result<Value, ErrorShape> {
-    let key = params
-        .and_then(|v| v.get("key"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "key is required", None))?;
-    let value = params
-        .and_then(|v| v.get("value"))
-        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "value is required", None))?;
-
-    // In the Rust gateway, config is immutable at runtime for now
-    // This would require file write + reload
     Ok(json!({
-        "ok": true,
-        "key": key,
-        "value": value.clone()
+        "path": snapshot.path,
+        "exists": snapshot.exists,
+        "raw": snapshot.raw,
+        "parsed": snapshot.parsed,
+        "valid": snapshot.valid,
+        "config": snapshot.config,
+        "hash": snapshot.hash,
+        "issues": snapshot.issues,
+        "warnings": [],
+        "legacyIssues": []
     }))
 }
 
-fn handle_config_apply() -> Result<Value, ErrorShape> {
-    // Reload config from disk
-    config::clear_cache();
-    let _ = config::load_config()
-        .map_err(|_| error_shape(ERROR_UNAVAILABLE, "config reload failed", None))?;
-    Ok(json!({ "ok": true }))
+fn handle_config_set(params: Option<&Value>) -> Result<Value, ErrorShape> {
+    let snapshot = read_config_snapshot();
+    require_config_base_hash(params, &snapshot)?;
+
+    let raw = params
+        .and_then(|v| v.get("raw"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "raw is required", None))?;
+    let parsed = json5::from_str::<Value>(raw)
+        .map_err(|err| error_shape(ERROR_INVALID_REQUEST, &err.to_string(), None))?;
+    if !parsed.is_object() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "config.set raw must be an object",
+            None,
+        ));
+    }
+    let issues = map_validation_issues(config::validate_config(&parsed));
+    if !issues.is_empty() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "invalid config",
+            Some(json!({ "issues": issues })),
+        ));
+    }
+    write_config_file(&config::get_config_path(), &parsed)?;
+    Ok(json!({
+        "ok": true,
+        "path": config::get_config_path().display().to_string(),
+        "config": parsed
+    }))
+}
+
+fn handle_config_apply(params: Option<&Value>) -> Result<Value, ErrorShape> {
+    let snapshot = read_config_snapshot();
+    require_config_base_hash(params, &snapshot)?;
+
+    let raw = params
+        .and_then(|v| v.get("raw"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "raw is required", None))?;
+    let parsed = json5::from_str::<Value>(raw)
+        .map_err(|err| error_shape(ERROR_INVALID_REQUEST, &err.to_string(), None))?;
+    if !parsed.is_object() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "config.apply raw must be an object",
+            None,
+        ));
+    }
+    let issues = map_validation_issues(config::validate_config(&parsed));
+    if !issues.is_empty() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "invalid config",
+            Some(json!({ "issues": issues })),
+        ));
+    }
+    write_config_file(&config::get_config_path(), &parsed)?;
+    Ok(json!({
+        "ok": true,
+        "path": config::get_config_path().display().to_string(),
+        "config": parsed
+    }))
 }
 
 fn handle_config_patch(params: Option<&Value>) -> Result<Value, ErrorShape> {
-    let patch = params
-        .and_then(|v| v.get("patch"))
-        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "patch is required", None))?;
-    // For now, just acknowledge the patch - actual implementation would merge
+    let snapshot = read_config_snapshot();
+    require_config_base_hash(params, &snapshot)?;
+
+    let raw = params
+        .and_then(|v| v.get("raw"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "raw is required", None))?;
+    let patch_value = json5::from_str::<Value>(raw)
+        .map_err(|err| error_shape(ERROR_INVALID_REQUEST, &err.to_string(), None))?;
+    if !patch_value.is_object() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "config.patch raw must be an object",
+            None,
+        ));
+    }
+
+    let merged = merge_patch(snapshot.config.clone(), patch_value);
+    let issues = map_validation_issues(config::validate_config(&merged));
+    if !issues.is_empty() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "invalid config",
+            Some(json!({ "issues": issues })),
+        ));
+    }
+
+    write_config_file(&config::get_config_path(), &merged)?;
     Ok(json!({
         "ok": true,
-        "applied": patch.clone()
+        "path": config::get_config_path().display().to_string(),
+        "config": merged
     }))
 }
 
@@ -1752,102 +2031,917 @@ fn handle_config_schema() -> Result<Value, ErrorShape> {
     }))
 }
 
-fn handle_sessions_list(_state: &WsServerState) -> Result<Value, ErrorShape> {
-    // Return empty sessions list for now - full implementation would read from state dir
-    Ok(json!({ "sessions": [] }))
-}
-
-fn handle_sessions_preview(params: Option<&Value>) -> Result<Value, ErrorShape> {
-    let session_key = params
-        .and_then(|v| v.get("sessionKey"))
+fn handle_sessions_list(
+    state: &WsServerState,
+    params: Option<&Value>,
+) -> Result<Value, ErrorShape> {
+    let mut filter = sessions::SessionFilter::new();
+    if let Some(limit) = params.and_then(|v| v.get("limit")).and_then(|v| v.as_i64()) {
+        if limit > 0 {
+            filter = filter.with_limit(limit as usize);
+        }
+    }
+    if let Some(offset) = params
+        .and_then(|v| v.get("offset"))
+        .and_then(|v| v.as_i64())
+    {
+        if offset >= 0 {
+            filter = filter.with_offset(offset as usize);
+        }
+    }
+    if let Some(agent_id) = params
+        .and_then(|v| v.get("agentId"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "sessionKey is required", None))?;
-    Ok(json!({
-        "sessionKey": session_key,
-        "preview": null,
-        "messageCount": 0
-    }))
-}
-
-fn handle_sessions_patch(params: Option<&Value>) -> Result<Value, ErrorShape> {
-    let session_key = params
-        .and_then(|v| v.get("sessionKey"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "sessionKey is required", None))?;
-    Ok(json!({
-        "ok": true,
-        "sessionKey": session_key
-    }))
-}
-
-fn handle_sessions_reset(params: Option<&Value>) -> Result<Value, ErrorShape> {
-    let session_key = params
-        .and_then(|v| v.get("sessionKey"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "sessionKey is required", None))?;
-    Ok(json!({
-        "ok": true,
-        "sessionKey": session_key
-    }))
-}
-
-fn handle_sessions_delete(params: Option<&Value>) -> Result<Value, ErrorShape> {
-    let session_key = params
-        .and_then(|v| v.get("sessionKey"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "sessionKey is required", None))?;
-    Ok(json!({
-        "ok": true,
-        "sessionKey": session_key,
-        "deleted": true
-    }))
-}
-
-fn handle_sessions_compact(params: Option<&Value>) -> Result<Value, ErrorShape> {
-    let session_key = params
-        .and_then(|v| v.get("sessionKey"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "sessionKey is required", None))?;
-    Ok(json!({
-        "ok": true,
-        "sessionKey": session_key,
-        "compacted": true
-    }))
-}
-
-fn handle_channels_status(_state: &WsServerState) -> Result<Value, ErrorShape> {
-    Ok(json!({
-        "channels": [],
-        "ts": now_ms()
-    }))
-}
-
-fn handle_channels_logout(params: Option<&Value>) -> Result<Value, ErrorShape> {
-    let channel = params
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        filter = filter.with_agent_id(agent_id);
+    }
+    if let Some(channel) = params
         .and_then(|v| v.get("channel"))
         .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        filter = filter.with_channel(channel);
+    }
+    if let Some(user_id) = params
+        .and_then(|v| v.get("userId"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        filter.user_id = Some(user_id.to_string());
+    }
+    if let Some(status) = params
+        .and_then(|v| v.get("status"))
+        .and_then(|v| v.as_str())
+        .and_then(parse_session_status)
+    {
+        filter = filter.with_status(status);
+    }
+    let active_minutes = params
+        .and_then(|v| v.get("activeMinutes"))
+        .and_then(|v| v.as_i64())
+        .map(|v| v.max(1) as i64);
+    let label_filter = params
+        .and_then(|v| v.get("label"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let search_filter = params
+        .and_then(|v| v.get("search"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let sessions = state.session_store.list_sessions(filter).map_err(|err| {
+        error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("session list failed: {}", err),
+            None,
+        )
+    })?;
+
+    let include_global = params
+        .and_then(|v| v.get("includeGlobal"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let include_unknown = params
+        .and_then(|v| v.get("includeUnknown"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let agent_filter = params
+        .and_then(|v| v.get("agentId"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let include_last_message = params
+        .and_then(|v| v.get("includeLastMessage"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let include_derived_titles = params
+        .and_then(|v| v.get("includeDerivedTitles"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let now = now_ms() as i64;
+    let rows = sessions
+        .iter()
+        .filter(|session| {
+            if !include_global && session.session_key == "global" {
+                return false;
+            }
+            if !include_unknown && session.session_key == "unknown" {
+                return false;
+            }
+            if let Some(ref agent_id) = agent_filter {
+                if let Some(meta_id) = session.metadata.agent_id.as_deref() {
+                    if meta_id != agent_id.as_str() {
+                        return false;
+                    }
+                } else if let Some(parsed) = parse_agent_session_key(&session.session_key) {
+                    if parsed != agent_id.as_str() {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
+            if let Some(minutes) = active_minutes {
+                let cutoff = now - minutes * 60_000;
+                if session.updated_at < cutoff {
+                    return false;
+                }
+            }
+            if let Some(ref label) = label_filter {
+                if session.metadata.name.as_deref() != Some(label.as_str()) {
+                    return false;
+                }
+            }
+            if let Some(ref search) = search_filter {
+                let mut haystack = session.session_key.clone();
+                if let Some(name) = session.metadata.name.as_ref() {
+                    haystack.push(' ');
+                    haystack.push_str(name);
+                }
+                if !haystack.to_lowercase().contains(&search.to_lowercase()) {
+                    return false;
+                }
+            }
+            true
+        })
+        .map(|session| {
+            let mut row = session_row(session);
+            if include_last_message {
+                if let Ok(messages) = state.session_store.get_history(&session.id, Some(1), None) {
+                    if let Some(last) = messages.last() {
+                        if let Some(obj) = row.as_object_mut() {
+                            obj.insert(
+                                "lastMessagePreview".to_string(),
+                                Value::String(truncate_preview(&last.content, 200)),
+                            );
+                        }
+                    }
+                }
+            }
+            if include_derived_titles {
+                if let Ok(messages) = state.session_store.get_history(&session.id, None, None) {
+                    let title = messages
+                        .iter()
+                        .find(|msg| matches!(msg.role, sessions::MessageRole::User))
+                        .map(|msg| truncate_preview(&msg.content, 60));
+                    if let Some(title) = title {
+                        if let Some(obj) = row.as_object_mut() {
+                            obj.insert("derivedTitle".to_string(), Value::String(title));
+                        }
+                    }
+                }
+            }
+            row
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "ts": now_ms(),
+        "path": state.session_store.base_path().display().to_string(),
+        "count": rows.len(),
+        "defaults": {
+            "modelProvider": null,
+            "model": null,
+            "contextTokens": null
+        },
+        "sessions": rows
+    }))
+}
+
+fn handle_sessions_preview(
+    state: &WsServerState,
+    params: Option<&Value>,
+) -> Result<Value, ErrorShape> {
+    let keys = params
+        .and_then(|v| v.get("keys"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .take(64)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let limit = params
+        .and_then(|v| v.get("limit"))
+        .and_then(|v| v.as_i64())
+        .map(|v| v.max(1) as usize)
+        .unwrap_or(12);
+    let max_chars = params
+        .and_then(|v| v.get("maxChars"))
+        .and_then(|v| v.as_i64())
+        .map(|v| v.max(20) as usize)
+        .unwrap_or(240);
+
+    let previews = keys
+        .into_iter()
+        .map(|key| match state.session_store.get_session_by_key(&key) {
+            Ok(session) => match state
+                .session_store
+                .get_history(&session.id, Some(limit), None)
+            {
+                Ok(messages) => {
+                    if messages.is_empty() {
+                        json!({ "key": key, "status": "empty", "items": [] })
+                    } else {
+                        let items = messages
+                            .into_iter()
+                            .map(|msg| {
+                                let mut text = msg.content;
+                                if text.len() > max_chars {
+                                    text.truncate(max_chars);
+                                }
+                                json!({
+                                    "role": role_to_string(msg.role),
+                                    "text": text
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        json!({ "key": key, "status": "ok", "items": items })
+                    }
+                }
+                Err(_) => json!({ "key": key, "status": "error", "items": [] }),
+            },
+            Err(sessions::SessionStoreError::NotFound(_)) => {
+                json!({ "key": key, "status": "missing", "items": [] })
+            }
+            Err(_) => json!({ "key": key, "status": "error", "items": [] }),
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "ts": now_ms(),
+        "previews": previews
+    }))
+}
+
+/// Extract session key from params (supports both "key" and "sessionKey" fields)
+fn extract_session_key(params: Option<&Value>) -> Option<String> {
+    params
+        .and_then(|v| v.get("key").or_else(|| v.get("sessionKey")))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+fn read_string_param(params: Option<&Value>, key: &str) -> Option<String> {
+    params
+        .and_then(|v| v.get(key))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+fn clamp_i64(value: i64, min: i64, max: i64) -> i64 {
+    value.max(min).min(max)
+}
+
+fn parse_session_status(raw: &str) -> Option<sessions::SessionStatus> {
+    match raw {
+        "active" => Some(sessions::SessionStatus::Active),
+        "paused" => Some(sessions::SessionStatus::Paused),
+        "archived" => Some(sessions::SessionStatus::Archived),
+        "compacting" => Some(sessions::SessionStatus::Compacting),
+        _ => None,
+    }
+}
+
+#[derive(Debug)]
+struct LogSlice {
+    cursor: u64,
+    size: u64,
+    lines: Vec<String>,
+    truncated: bool,
+    reset: bool,
+}
+
+fn resolve_log_file_path() -> PathBuf {
+    if let Ok(path) = env::var("CLAWDBOT_LOG_FILE") {
+        if !path.trim().is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+    resolve_state_dir().join("logs").join("clawdbot.log")
+}
+
+fn resolve_log_file(path: &PathBuf) -> PathBuf {
+    if path.exists() {
+        return path.clone();
+    }
+    static ROLLING_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^clawdbot-\d{4}-\d{2}-\d{2}\.log$").unwrap());
+    let file_name = path.file_name().and_then(|v| v.to_str()).unwrap_or("");
+    if !ROLLING_RE.is_match(file_name) {
+        return path.clone();
+    }
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return path.clone(),
+    };
+    let mut newest: Option<(PathBuf, std::time::SystemTime)> = None;
+    for entry in entries.flatten() {
+        let candidate = entry.path();
+        let candidate_name = candidate.file_name().and_then(|v| v.to_str()).unwrap_or("");
+        if !ROLLING_RE.is_match(candidate_name) {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            if let Ok(modified) = meta.modified() {
+                let is_newer = newest
+                    .as_ref()
+                    .map(|(_, ts)| modified > *ts)
+                    .unwrap_or(true);
+                if is_newer {
+                    newest = Some((candidate.clone(), modified));
+                }
+            }
+        }
+    }
+    newest.map(|(path, _)| path).unwrap_or_else(|| path.clone())
+}
+
+fn read_log_slice(
+    file: &PathBuf,
+    cursor: Option<u64>,
+    limit: usize,
+    max_bytes: usize,
+) -> Result<LogSlice, ErrorShape> {
+    let meta = match fs::metadata(file) {
+        Ok(meta) => meta,
+        Err(_) => {
+            return Ok(LogSlice {
+                cursor: 0,
+                size: 0,
+                lines: Vec::new(),
+                truncated: false,
+                reset: false,
+            })
+        }
+    };
+    let size = meta.len();
+    let mut reset = false;
+    let mut truncated = false;
+    let mut start: u64;
+
+    if let Some(cursor) = cursor {
+        if cursor > size {
+            reset = true;
+            start = size.saturating_sub(max_bytes as u64);
+            truncated = start > 0;
+        } else {
+            start = cursor;
+            if size.saturating_sub(start) > max_bytes as u64 {
+                reset = true;
+                truncated = true;
+                start = size.saturating_sub(max_bytes as u64);
+            }
+        }
+    } else {
+        start = size.saturating_sub(max_bytes as u64);
+        truncated = start > 0;
+    }
+
+    if size == 0 || size <= start {
+        return Ok(LogSlice {
+            cursor: size,
+            size,
+            lines: Vec::new(),
+            truncated,
+            reset,
+        });
+    }
+
+    let mut file_handle = fs::File::open(file).map_err(|err| {
+        error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("log read failed: {}", err),
+            None,
+        )
+    })?;
+    let mut prefix = String::new();
+    if start > 0 {
+        file_handle.seek(SeekFrom::Start(start - 1)).ok();
+        let mut buf = [0u8; 1];
+        if let Ok(read) = file_handle.read(&mut buf) {
+            if read > 0 {
+                prefix = String::from_utf8_lossy(&buf[..read]).to_string();
+            }
+        }
+    }
+    file_handle.seek(SeekFrom::Start(start)).ok();
+    let mut buffer = vec![0u8; (size - start) as usize];
+    let read = file_handle.read(&mut buffer).unwrap_or(0);
+    buffer.truncate(read);
+    let text = String::from_utf8_lossy(&buffer).to_string();
+    let mut lines: Vec<String> = text.split('\n').map(|s| s.to_string()).collect();
+    if start > 0 && prefix != "\n" && !lines.is_empty() {
+        lines.remove(0);
+    }
+    if lines.last().map(|s| s.is_empty()).unwrap_or(false) {
+        lines.pop();
+    }
+    if lines.len() > limit {
+        lines = lines.split_off(lines.len() - limit);
+    }
+
+    Ok(LogSlice {
+        cursor: size,
+        size,
+        lines,
+        truncated,
+        reset,
+    })
+}
+
+fn ensure_object(value: &mut Value) -> &mut serde_json::Map<String, Value> {
+    if !value.is_object() {
+        *value = Value::Object(serde_json::Map::new());
+    }
+    value.as_object_mut().expect("value is object")
+}
+
+fn role_to_string(role: sessions::MessageRole) -> &'static str {
+    match role {
+        sessions::MessageRole::User => "user",
+        sessions::MessageRole::Assistant => "assistant",
+        sessions::MessageRole::System => "system",
+        sessions::MessageRole::Tool => "tool",
+    }
+}
+
+fn resolve_workspace_dir(cfg: &Value) -> PathBuf {
+    if let Ok(dir) = env::var("CLAWDBOT_WORKSPACE_DIR") {
+        if !dir.trim().is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    if let Some(workspace) = cfg
+        .get("agents")
+        .and_then(|v| v.get("defaults"))
+        .and_then(|v| v.get("workspace"))
+        .and_then(|v| v.as_str())
+    {
+        if !workspace.trim().is_empty() {
+            return PathBuf::from(workspace);
+        }
+    }
+    if let Some(list) = cfg
+        .get("agents")
+        .and_then(|v| v.get("list"))
+        .and_then(|v| v.as_array())
+    {
+        for entry in list {
+            if entry
+                .get("default")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                if let Some(workspace) = entry.get("workspace").and_then(|v| v.as_str()) {
+                    if !workspace.trim().is_empty() {
+                        return PathBuf::from(workspace);
+                    }
+                }
+            }
+        }
+        if let Some(first) = list.first() {
+            if let Some(workspace) = first.get("workspace").and_then(|v| v.as_str()) {
+                if !workspace.trim().is_empty() {
+                    return PathBuf::from(workspace);
+                }
+            }
+        }
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn session_row(session: &sessions::Session) -> Value {
+    json!({
+        "key": session.session_key,
+        "kind": classify_session_key(&session.session_key, &session.metadata),
+        "label": session.metadata.name,
+        "displayName": session.metadata.description,
+        "channel": session.metadata.channel,
+        "chatId": session.metadata.chat_id,
+        "userId": session.metadata.user_id,
+        "updatedAt": session.updated_at,
+        "sessionId": session.id,
+        "messageCount": session.message_count,
+        "thinkingLevel": session.metadata.thinking_level,
+        "model": session.metadata.model
+    })
+}
+
+fn session_entry(session: &sessions::Session) -> Value {
+    json!({
+        "sessionId": session.id,
+        "updatedAt": session.updated_at,
+        "label": session.metadata.name,
+        "thinkingLevel": session.metadata.thinking_level,
+        "model": session.metadata.model,
+        "channel": session.metadata.channel,
+        "chatId": session.metadata.chat_id,
+        "agentId": session.metadata.agent_id,
+        "userId": session.metadata.user_id,
+        "status": session.status.to_string()
+    })
+}
+
+fn classify_session_key(key: &str, metadata: &sessions::SessionMetadata) -> &'static str {
+    if key == "global" {
+        return "global";
+    }
+    if key == "unknown" {
+        return "unknown";
+    }
+    if key.contains(":group:") || key.contains(":channel:") {
+        return "group";
+    }
+    if let Some(chat_id) = metadata.chat_id.as_deref() {
+        if chat_id.contains(":group:") || chat_id.contains(":channel:") {
+            return "group";
+        }
+    }
+    "direct"
+}
+
+fn parse_agent_session_key(key: &str) -> Option<&str> {
+    if key == "global" || key == "unknown" {
+        return None;
+    }
+    let mut parts = key.splitn(3, ':');
+    let agent = parts.next()?;
+    let channel = parts.next()?;
+    let chat = parts.next()?;
+    if agent.is_empty() || channel.is_empty() || chat.is_empty() {
+        return None;
+    }
+    Some(agent)
+}
+
+fn truncate_preview(text: &str, max_len: usize) -> String {
+    if text.len() <= max_len {
+        return text.to_string();
+    }
+    let mut out = text[..max_len].to_string();
+    out.push('…');
+    out
+}
+
+fn build_session_metadata(params: Option<&Value>) -> sessions::SessionMetadata {
+    let mut meta = sessions::SessionMetadata::default();
+    if let Some(label) = read_string_param(params, "label") {
+        meta.name = Some(label);
+    }
+    if let Some(description) = read_string_param(params, "description") {
+        meta.description = Some(description);
+    }
+    if let Some(agent_id) = read_string_param(params, "agentId") {
+        meta.agent_id = Some(agent_id);
+    }
+    if let Some(channel) = read_string_param(params, "channel") {
+        meta.channel = Some(channel);
+    }
+    if let Some(user_id) = read_string_param(params, "userId") {
+        meta.user_id = Some(user_id);
+    }
+    if let Some(model) = read_string_param(params, "model") {
+        meta.model = Some(model);
+    }
+    if let Some(thinking_level) = read_string_param(params, "thinkingLevel") {
+        meta.thinking_level = Some(thinking_level);
+    }
+    if let Some(tags) = params
+        .and_then(|v| v.get("tags"))
+        .and_then(|v| v.as_array())
+    {
+        meta.tags = tags
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+    if let Some(extra) = params.and_then(|v| v.get("extra")) {
+        if !extra.is_null() {
+            meta.extra = Some(extra.clone());
+        }
+    }
+    meta
+}
+
+fn has_metadata_updates(meta: &sessions::SessionMetadata) -> bool {
+    meta.name.is_some()
+        || meta.description.is_some()
+        || meta.agent_id.is_some()
+        || meta.channel.is_some()
+        || meta.user_id.is_some()
+        || meta.model.is_some()
+        || meta.thinking_level.is_some()
+        || !meta.tags.is_empty()
+        || meta.extra.is_some()
+}
+
+fn handle_sessions_patch(
+    state: &WsServerState,
+    params: Option<&Value>,
+) -> Result<Value, ErrorShape> {
+    let key = extract_session_key(params)
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "key is required", None))?;
+    let updates = build_session_metadata(params);
+    let has_updates = has_metadata_updates(&updates);
+
+    let session = match state.session_store.get_session_by_key(&key) {
+        Ok(existing) => {
+            if has_updates {
+                state
+                    .session_store
+                    .patch_session(&existing.id, updates)
+                    .map_err(|err| {
+                        error_shape(
+                            ERROR_UNAVAILABLE,
+                            &format!("session patch failed: {}", err),
+                            None,
+                        )
+                    })?
+            } else {
+                existing
+            }
+        }
+        Err(sessions::SessionStoreError::NotFound(_)) => {
+            let metadata = if has_updates {
+                updates
+            } else {
+                sessions::SessionMetadata::default()
+            };
+            state
+                .session_store
+                .get_or_create_session(&key, metadata)
+                .map_err(|err| {
+                    error_shape(
+                        ERROR_UNAVAILABLE,
+                        &format!("session create failed: {}", err),
+                        None,
+                    )
+                })?
+        }
+        Err(err) => {
+            return Err(error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("session load failed: {}", err),
+                None,
+            ))
+        }
+    };
+
+    Ok(json!({
+        "ok": true,
+        "path": state.session_store.base_path().display().to_string(),
+        "key": session.session_key,
+        "entry": session_entry(&session)
+    }))
+}
+
+fn handle_sessions_reset(
+    state: &WsServerState,
+    params: Option<&Value>,
+) -> Result<Value, ErrorShape> {
+    let key = extract_session_key(params)
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "key is required", None))?;
+    let session = state
+        .session_store
+        .get_or_create_session(&key, sessions::SessionMetadata::default())
+        .map_err(|err| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("session create failed: {}", err),
+                None,
+            )
+        })?;
+    let reset = state
+        .session_store
+        .reset_session(&session.id)
+        .map_err(|err| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("session reset failed: {}", err),
+                None,
+            )
+        })?;
+    Ok(json!({ "ok": true, "key": reset.session_key, "entry": session_entry(&reset) }))
+}
+
+fn handle_sessions_delete(
+    state: &WsServerState,
+    params: Option<&Value>,
+) -> Result<Value, ErrorShape> {
+    let key = extract_session_key(params)
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "key is required", None))?;
+    let session = match state.session_store.get_session_by_key(&key) {
+        Ok(session) => Some(session),
+        Err(sessions::SessionStoreError::NotFound(_)) => None,
+        Err(err) => {
+            return Err(error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("session load failed: {}", err),
+                None,
+            ))
+        }
+    };
+
+    let deleted = if let Some(session) = session {
+        state
+            .session_store
+            .delete_session(&session.id)
+            .map_err(|err| {
+                error_shape(
+                    ERROR_UNAVAILABLE,
+                    &format!("session delete failed: {}", err),
+                    None,
+                )
+            })?;
+        true
+    } else {
+        false
+    };
+
+    Ok(json!({ "ok": true, "key": key, "deleted": deleted }))
+}
+
+fn handle_sessions_compact(
+    state: &WsServerState,
+    params: Option<&Value>,
+) -> Result<Value, ErrorShape> {
+    let key = extract_session_key(params)
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "key is required", None))?;
+    let keep_recent = params
+        .and_then(|v| v.get("maxLines"))
+        .and_then(|v| v.as_i64())
+        .map(|v| v.max(1) as usize)
+        .unwrap_or(400);
+
+    let session = match state.session_store.get_session_by_key(&key) {
+        Ok(session) => session,
+        Err(sessions::SessionStoreError::NotFound(_)) => {
+            return Ok(json!({
+                "ok": true,
+                "key": key,
+                "compacted": false,
+                "reason": "not_found"
+            }))
+        }
+        Err(err) => {
+            return Err(error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("session load failed: {}", err),
+                None,
+            ))
+        }
+    };
+
+    let history_len = state
+        .session_store
+        .get_history(&session.id, None, None)
+        .map_err(|err| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("session history failed: {}", err),
+                None,
+            )
+        })?
+        .len();
+
+    if history_len <= keep_recent {
+        return Ok(json!({
+            "ok": true,
+            "key": key,
+            "compacted": false,
+            "kept": history_len
+        }));
+    }
+
+    let compacted = state
+        .session_store
+        .compact_session(
+            &session.id,
+            keep_recent,
+            |messages: &[sessions::ChatMessage]| format!("Compacted {} messages.", messages.len()),
+        )
+        .map_err(|err| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("session compact failed: {}", err),
+                None,
+            )
+        })?;
+
+    Ok(json!({
+        "ok": true,
+        "key": session.session_key,
+        "compacted": compacted.messages_compacted > 0,
+        "kept": keep_recent
+    }))
+}
+
+fn handle_channels_status(state: &WsServerState) -> Result<Value, ErrorShape> {
+    let snapshot = state.channel_registry.snapshot();
+    let connected = snapshot
+        .channels
+        .iter()
+        .filter(|c| c.status == channels::ChannelStatus::Connected)
+        .count();
+    Ok(json!({
+        "total": snapshot.channels.len(),
+        "connected": connected,
+        "channels": snapshot.channels,
+        "ts": snapshot.timestamp
+    }))
+}
+
+fn handle_channels_logout(
+    params: Option<&Value>,
+    state: &WsServerState,
+) -> Result<Value, ErrorShape> {
+    let channel = params
+        .and_then(|v| v.get("channel").or_else(|| v.get("channelId")))
+        .and_then(|v| v.as_str())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "channel is required", None))?;
+    if !state.channel_registry.logout(channel) {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "unknown channel",
+            Some(json!({ "channel": channel })),
+        ));
+    }
     Ok(json!({
         "ok": true,
         "channel": channel
     }))
 }
 
-fn handle_agent(params: Option<&Value>, _conn: &ConnectionContext) -> Result<Value, ErrorShape> {
+fn handle_agent(
+    params: Option<&Value>,
+    state: &WsServerState,
+    _conn: &ConnectionContext,
+) -> Result<Value, ErrorShape> {
     let message = params
         .and_then(|v| v.get("message"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "message is required", None))?;
+    if message.trim().is_empty() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "message is required",
+            None,
+        ));
+    }
     let idempotency_key = params
         .and_then(|v| v.get("idempotencyKey"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "idempotencyKey is required", None))?;
+    let session_key = params
+        .and_then(|v| v.get("sessionKey"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("default");
+
+    let metadata = build_session_metadata(params);
+    let session = state
+        .session_store
+        .get_or_create_session(session_key, metadata)
+        .map_err(|err| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("session create failed: {}", err),
+                None,
+            )
+        })?;
+    state
+        .session_store
+        .append_message(sessions::ChatMessage::user(session.id.clone(), message))
+        .map_err(|err| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("session write failed: {}", err),
+                None,
+            )
+        })?;
 
     // In full implementation, this would queue an agent run
     Ok(json!({
         "runId": idempotency_key,
         "status": "started",
-        "message": message
+        "message": message,
+        "sessionKey": session.session_key
     }))
 }
 
@@ -1872,54 +2966,154 @@ fn handle_agent_wait(params: Option<&Value>) -> Result<Value, ErrorShape> {
     }))
 }
 
-fn handle_chat_history(params: Option<&Value>) -> Result<Value, ErrorShape> {
-    let session_key = params
-        .and_then(|v| v.get("sessionKey"))
+fn handle_chat_history(state: &WsServerState, params: Option<&Value>) -> Result<Value, ErrorShape> {
+    let session_id = params
+        .and_then(|v| v.get("sessionId"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "sessionKey is required", None))?;
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    let session_key = extract_session_key(params);
+    let limit = params
+        .and_then(|v| v.get("limit"))
+        .and_then(|v| v.as_i64())
+        .map(|v| v.max(1) as usize)
+        .unwrap_or(200)
+        .min(1000);
+
+    let session = if let Some(session_id) = session_id {
+        state
+            .session_store
+            .get_session(session_id)
+            .map_err(|err| error_shape(ERROR_INVALID_REQUEST, &err.to_string(), None))?
+    } else {
+        let key = session_key
+            .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "sessionKey is required", None))?;
+        state
+            .session_store
+            .get_session_by_key(&key)
+            .map_err(|err| error_shape(ERROR_INVALID_REQUEST, &err.to_string(), None))?
+    };
+
+    let messages = state
+        .session_store
+        .get_history(&session.id, Some(limit), None)
+        .map_err(|err| error_shape(ERROR_UNAVAILABLE, &err.to_string(), None))?
+        .into_iter()
+        .map(|m| {
+            json!({
+                "id": m.id,
+                "role": role_to_string(m.role),
+                "content": m.content,
+                "ts": m.created_at
+            })
+        })
+        .collect::<Vec<_>>();
+
     Ok(json!({
-        "sessionKey": session_key,
-        "sessionId": null,
-        "messages": [],
-        "thinkingLevel": "off"
+        "sessionKey": session.session_key,
+        "sessionId": session.id,
+        "messages": messages,
+        "thinkingLevel": session
+            .metadata
+            .thinking_level
+            .clone()
+            .unwrap_or_else(|| "off".to_string())
     }))
 }
 
 fn handle_chat_send(
+    state: &WsServerState,
     params: Option<&Value>,
     _conn: &ConnectionContext,
 ) -> Result<Value, ErrorShape> {
-    let session_key = params
-        .and_then(|v| v.get("sessionKey"))
+    let session_id = params
+        .and_then(|v| v.get("sessionId"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "sessionKey is required", None))?;
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    let session_key = extract_session_key(params);
     let message = params
         .and_then(|v| v.get("message"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "message is required", None))?;
+    if message.trim().is_empty() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "message is required",
+            None,
+        ));
+    }
     let idempotency_key = params
         .and_then(|v| v.get("idempotencyKey"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "idempotencyKey is required", None))?;
 
+    let session = if let Some(session_id) = session_id {
+        state
+            .session_store
+            .get_session(session_id)
+            .map_err(|err| error_shape(ERROR_INVALID_REQUEST, &err.to_string(), None))?
+    } else {
+        let key = session_key
+            .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "sessionKey is required", None))?;
+        state
+            .session_store
+            .get_or_create_session(&key, sessions::SessionMetadata::default())
+            .map_err(|err| {
+                error_shape(
+                    ERROR_UNAVAILABLE,
+                    &format!("session create failed: {}", err),
+                    None,
+                )
+            })?
+    };
+
+    state
+        .session_store
+        .append_message(sessions::ChatMessage::user(session.id.clone(), message))
+        .map_err(|err| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("session write failed: {}", err),
+                None,
+            )
+        })?;
+
     Ok(json!({
         "runId": idempotency_key,
-        "status": "started",
-        "sessionKey": session_key,
-        "message": message
+        "status": "queued",
+        "sessionKey": session.session_key
     }))
 }
 
-fn handle_chat_abort(params: Option<&Value>) -> Result<Value, ErrorShape> {
-    let session_key = params
-        .and_then(|v| v.get("sessionKey"))
+fn handle_chat_abort(state: &WsServerState, params: Option<&Value>) -> Result<Value, ErrorShape> {
+    let session_id = params
+        .and_then(|v| v.get("sessionId"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "sessionKey is required", None))?;
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    let session_key = extract_session_key(params);
+    let run_id = params
+        .and_then(|v| v.get("runId"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let session = if let Some(session_id) = session_id {
+        state.session_store.get_session(session_id).ok()
+    } else if let Some(key) = session_key.as_deref() {
+        state.session_store.get_session_by_key(key).ok()
+    } else {
+        None
+    };
     Ok(json!({
         "ok": true,
-        "aborted": true,
-        "sessionKey": session_key,
-        "runIds": []
+        "aborted": false,
+        "sessionKey": session
+            .as_ref()
+            .map(|s| s.session_key.clone())
+            .or(session_key),
+        "runIds": run_id.map(|id| vec![id]).unwrap_or_default()
     }))
 }
 
@@ -2035,53 +3229,243 @@ fn handle_talk_mode(params: Option<&Value>) -> Result<Value, ErrorShape> {
 }
 
 fn handle_models_list() -> Result<Value, ErrorShape> {
-    Ok(json!({
-        "models": []
-    }))
+    let cfg = config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
+    let mut models = Vec::new();
+    if let Some(map) = cfg
+        .get("agents")
+        .and_then(|v| v.get("defaults"))
+        .and_then(|v| v.get("models"))
+        .and_then(|v| v.as_object())
+    {
+        for (id, entry) in map {
+            let alias = entry
+                .get("alias")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let label = entry
+                .get("label")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            models.push(json!({
+                "id": id,
+                "alias": alias,
+                "label": label
+            }));
+        }
+    }
+    Ok(json!({ "models": models }))
 }
 
 fn handle_agents_list() -> Result<Value, ErrorShape> {
-    Ok(json!({
-        "agents": [{
+    let cfg = config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
+    let mut agents = Vec::new();
+    let mut default_id: Option<String> = None;
+    let mut main_key: Option<String> = None;
+    let mut scope: Option<String> = None;
+    if let Some(session_obj) = cfg.get("session").and_then(|v| v.as_object()) {
+        if let Some(main_key_value) = session_obj.get("mainKey").and_then(|v| v.as_str()) {
+            if !main_key_value.trim().is_empty() {
+                main_key = Some(main_key_value.trim().to_string());
+            }
+        }
+        if let Some(scope_value) = session_obj.get("scope").and_then(|v| v.as_str()) {
+            if !scope_value.trim().is_empty() {
+                scope = Some(scope_value.trim().to_string());
+            }
+        }
+    }
+    if let Some(list) = cfg
+        .get("agents")
+        .and_then(|v| v.get("list"))
+        .and_then(|v| v.as_array())
+    {
+        for entry in list {
+            if let Some(id) = entry.get("id").and_then(|v| v.as_str()) {
+                if entry
+                    .get("default")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    default_id = Some(id.to_string());
+                }
+                let name = entry
+                    .get("identity")
+                    .and_then(|v| v.get("name"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                agents.push(json!({
+                    "id": id,
+                    "name": name,
+                    "identity": entry.get("identity").cloned().unwrap_or(Value::Null)
+                }));
+            }
+        }
+    }
+    if agents.is_empty() {
+        agents.push(json!({
             "id": "default",
             "name": "Clawdbot"
-        }]
+        }));
+    }
+    if default_id.is_none() {
+        if let Some(first) = agents.first() {
+            if let Some(id) = first.get("id").and_then(|v| v.as_str()) {
+                default_id = Some(id.to_string());
+            }
+        }
+    }
+    Ok(json!({
+        "defaultId": default_id.unwrap_or_else(|| "default".to_string()),
+        "mainKey": main_key.unwrap_or_else(|| "main".to_string()),
+        "scope": scope.unwrap_or_else(|| "per-sender".to_string()),
+        "agents": agents
     }))
 }
 
 fn handle_skills_status() -> Result<Value, ErrorShape> {
+    let cfg = config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
+    let workspace_dir = resolve_workspace_dir(&cfg);
+    let managed_skills_dir = workspace_dir.join("skills");
     Ok(json!({
-        "skills": [],
-        "installed": []
+        "workspaceDir": workspace_dir.to_string_lossy(),
+        "managedSkillsDir": managed_skills_dir.to_string_lossy(),
+        "skills": []
     }))
 }
 
 fn handle_skills_bins() -> Result<Value, ErrorShape> {
-    Ok(json!({
-        "bins": []
-    }))
+    Ok(json!({ "bins": [] }))
 }
 
 fn handle_skills_install(params: Option<&Value>) -> Result<Value, ErrorShape> {
-    let skill_id = params
-        .and_then(|v| v.get("skillId"))
+    let name = params
+        .and_then(|v| v.get("name"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "skillId is required", None))?;
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "name is required", None))?;
+    let install_id = params
+        .and_then(|v| v.get("installId"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "installId is required", None))?;
+    let timeout_ms = params
+        .and_then(|v| v.get("timeoutMs"))
+        .and_then(|v| v.as_i64())
+        .map(|v| v.max(1000) as u64);
+
+    let mut config_value = read_config_snapshot().config;
+    let root = ensure_object(&mut config_value);
+    let skills = root.entry("skills").or_insert_with(|| json!({}));
+    let skills_obj = ensure_object(skills);
+    let entries = skills_obj.entry("entries").or_insert_with(|| json!({}));
+    let entries_obj = ensure_object(entries);
+    let entry = entries_obj
+        .entry(name.to_string())
+        .or_insert_with(|| json!({}));
+    let entry_obj = ensure_object(entry);
+    entry_obj.insert("enabled".to_string(), Value::Bool(true));
+    entry_obj.insert("name".to_string(), Value::String(name.to_string()));
+    entry_obj.insert(
+        "installId".to_string(),
+        Value::String(install_id.to_string()),
+    );
+    entry_obj.insert("requestedAt".to_string(), Value::Number(now_ms().into()));
+
+    let issues = map_validation_issues(config::validate_config(&config_value));
+    if !issues.is_empty() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "invalid config",
+            Some(json!({ "issues": issues })),
+        ));
+    }
+    write_config_file(&config::get_config_path(), &config_value)?;
+
     Ok(json!({
         "ok": true,
-        "skillId": skill_id,
-        "installed": true
+        "name": name,
+        "installId": install_id,
+        "timeoutMs": timeout_ms,
+        "queued": true
     }))
 }
 
 fn handle_skills_update(params: Option<&Value>) -> Result<Value, ErrorShape> {
-    let skill_id = params
-        .and_then(|v| v.get("skillId"))
+    let skill_key = params
+        .and_then(|v| v.get("skillKey"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "skillId is required", None))?;
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "skillKey is required", None))?;
+    let enabled = params
+        .and_then(|v| v.get("enabled"))
+        .and_then(|v| v.as_bool());
+    let api_key = params
+        .and_then(|v| v.get("apiKey"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string());
+    let env_map = params
+        .and_then(|v| v.get("env"))
+        .and_then(|v| v.as_object())
+        .cloned();
+
+    let mut config_value = read_config_snapshot().config;
+    let root = ensure_object(&mut config_value);
+    let skills = root.entry("skills").or_insert_with(|| json!({}));
+    let skills_obj = ensure_object(skills);
+    let entries = skills_obj.entry("entries").or_insert_with(|| json!({}));
+    let entries_obj = ensure_object(entries);
+    let entry = entries_obj
+        .entry(skill_key.to_string())
+        .or_insert_with(|| json!({}));
+    let entry_obj = ensure_object(entry);
+
+    if let Some(enabled) = enabled {
+        entry_obj.insert("enabled".to_string(), Value::Bool(enabled));
+    }
+    if let Some(api_key) = api_key {
+        if api_key.trim().is_empty() {
+            entry_obj.remove("apiKey");
+        } else {
+            entry_obj.insert("apiKey".to_string(), Value::String(api_key));
+        }
+    }
+    if let Some(env_map) = env_map {
+        let env_value = entry_obj
+            .entry("env".to_string())
+            .or_insert_with(|| json!({}));
+        let env_obj = ensure_object(env_value);
+        for (key, value) in env_map {
+            let k = key.trim().to_string();
+            if k.is_empty() {
+                continue;
+            }
+            if let Some(v) = value.as_str() {
+                let trimmed = v.trim();
+                if trimmed.is_empty() {
+                    env_obj.remove(&k);
+                } else {
+                    env_obj.insert(k, Value::String(trimmed.to_string()));
+                }
+            }
+        }
+    }
+
+    let issues = map_validation_issues(config::validate_config(&config_value));
+    if !issues.is_empty() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "invalid config",
+            Some(json!({ "issues": issues })),
+        ));
+    }
+    write_config_file(&config::get_config_path(), &config_value)?;
+
     Ok(json!({
         "ok": true,
-        "skillId": skill_id,
+        "skillKey": skill_key,
         "updated": true
     }))
 }
@@ -2167,55 +3551,204 @@ fn handle_cron_runs(params: Option<&Value>) -> Result<Value, ErrorShape> {
     }))
 }
 
-fn handle_node_pair_request(params: Option<&Value>) -> Result<Value, ErrorShape> {
+fn handle_node_pair_request(
+    params: Option<&Value>,
+    state: &WsServerState,
+) -> Result<Value, ErrorShape> {
     let node_id = params
         .and_then(|v| v.get("nodeId"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "nodeId is required", None))?;
+    let public_key = params
+        .and_then(|v| v.get("publicKey"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let commands = params
+        .and_then(|v| v.get("commands"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let display_name = params
+        .and_then(|v| v.get("displayName"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let platform = params
+        .and_then(|v| v.get("platform"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let request = state
+        .node_pairing
+        .request_pairing(
+            node_id.to_string(),
+            public_key,
+            commands,
+            display_name,
+            platform,
+        )
+        .map_err(|e| match e {
+            nodes::NodePairingError::NodeAlreadyPaired => {
+                error_shape(ERROR_INVALID_REQUEST, "node already paired", None)
+            }
+            nodes::NodePairingError::TooManyPendingRequests => {
+                error_shape(ERROR_UNAVAILABLE, "too many pending pairing requests", None)
+            }
+            _ => error_shape(ERROR_UNAVAILABLE, &e.to_string(), None),
+        })?;
+
     Ok(json!({
         "ok": true,
-        "requestId": Uuid::new_v4().to_string(),
-        "nodeId": node_id,
+        "requestId": request.request_id,
+        "nodeId": request.node_id,
         "status": "pending"
     }))
 }
 
-fn handle_node_pair_list() -> Result<Value, ErrorShape> {
+fn handle_node_pair_list(state: &WsServerState) -> Result<Value, ErrorShape> {
+    let paired_nodes = state.node_pairing.list_paired_nodes();
+    let (pending_requests, _resolved) = state.node_pairing.list_requests();
+
+    let nodes: Vec<Value> = paired_nodes
+        .iter()
+        .map(|n| {
+            json!({
+                "nodeId": n.node_id,
+                "displayName": n.display_name,
+                "platform": n.platform,
+                "commands": n.commands,
+                "pairedAtMs": n.paired_at_ms,
+                "lastSeenMs": n.last_seen_ms
+            })
+        })
+        .collect();
+
+    let pending: Vec<Value> = pending_requests
+        .iter()
+        .map(|r| {
+            json!({
+                "requestId": r.request_id,
+                "nodeId": r.node_id,
+                "displayName": r.display_name,
+                "platform": r.platform,
+                "commands": r.commands,
+                "createdAtMs": r.created_at_ms
+            })
+        })
+        .collect();
+
     Ok(json!({
-        "nodes": [],
-        "pending": []
+        "nodes": nodes,
+        "pending": pending
     }))
 }
 
-fn handle_node_pair_approve(params: Option<&Value>) -> Result<Value, ErrorShape> {
+fn handle_node_pair_approve(
+    params: Option<&Value>,
+    state: &WsServerState,
+) -> Result<Value, ErrorShape> {
     let request_id = params
         .and_then(|v| v.get("requestId"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "requestId is required", None))?;
+
+    let (node, token) = state
+        .node_pairing
+        .approve_request(request_id)
+        .map_err(|e| match e {
+            nodes::NodePairingError::RequestNotFound => {
+                error_shape(ERROR_INVALID_REQUEST, "request not found", None)
+            }
+            nodes::NodePairingError::RequestAlreadyResolved => {
+                error_shape(ERROR_INVALID_REQUEST, "request already resolved", None)
+            }
+            nodes::NodePairingError::RequestExpired => {
+                error_shape(ERROR_INVALID_REQUEST, "request expired", None)
+            }
+            _ => error_shape(ERROR_UNAVAILABLE, &e.to_string(), None),
+        })?;
+
     Ok(json!({
         "ok": true,
         "requestId": request_id,
-        "approved": true
+        "approved": true,
+        "nodeId": node.node_id,
+        "token": token
     }))
 }
 
-fn handle_node_pair_reject(params: Option<&Value>) -> Result<Value, ErrorShape> {
+fn handle_node_pair_reject(
+    params: Option<&Value>,
+    state: &WsServerState,
+) -> Result<Value, ErrorShape> {
     let request_id = params
         .and_then(|v| v.get("requestId"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "requestId is required", None))?;
+    let reason = params
+        .and_then(|v| v.get("reason"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let request = state
+        .node_pairing
+        .reject_request(request_id, reason)
+        .map_err(|e| match e {
+            nodes::NodePairingError::RequestNotFound => {
+                error_shape(ERROR_INVALID_REQUEST, "request not found", None)
+            }
+            nodes::NodePairingError::RequestAlreadyResolved => {
+                error_shape(ERROR_INVALID_REQUEST, "request already resolved", None)
+            }
+            _ => error_shape(ERROR_UNAVAILABLE, &e.to_string(), None),
+        })?;
+
     Ok(json!({
         "ok": true,
         "requestId": request_id,
-        "rejected": true
+        "rejected": true,
+        "nodeId": request.node_id
     }))
 }
 
-fn handle_node_pair_verify(params: Option<&Value>) -> Result<Value, ErrorShape> {
+fn handle_node_pair_verify(
+    params: Option<&Value>,
+    state: &WsServerState,
+) -> Result<Value, ErrorShape> {
     let node_id = params
         .and_then(|v| v.get("nodeId"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "nodeId is required", None))?;
+    let token = params
+        .and_then(|v| v.get("token"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "token is required", None))?;
+
+    state
+        .node_pairing
+        .verify_token(node_id, token)
+        .map_err(|e| match e {
+            nodes::NodePairingError::NodeNotPaired => {
+                error_shape(ERROR_NOT_PAIRED, "node not paired", None)
+            }
+            nodes::NodePairingError::TokenInvalid => {
+                error_shape(ERROR_FORBIDDEN, "token invalid", None)
+            }
+            nodes::NodePairingError::TokenExpired => {
+                error_shape(ERROR_FORBIDDEN, "token expired", None)
+            }
+            nodes::NodePairingError::TokenRevoked => {
+                error_shape(ERROR_FORBIDDEN, "token revoked", None)
+            }
+            _ => error_shape(ERROR_UNAVAILABLE, &e.to_string(), None),
+        })?;
+
+    // Update last seen time
+    state.node_pairing.touch_node(node_id);
+
     Ok(json!({
         "ok": true,
         "nodeId": node_id,
@@ -2223,7 +3756,7 @@ fn handle_node_pair_verify(params: Option<&Value>) -> Result<Value, ErrorShape> 
     }))
 }
 
-fn handle_node_rename(params: Option<&Value>) -> Result<Value, ErrorShape> {
+fn handle_node_rename(params: Option<&Value>, state: &WsServerState) -> Result<Value, ErrorShape> {
     let node_id = params
         .and_then(|v| v.get("nodeId"))
         .and_then(|v| v.as_str())
@@ -2232,6 +3765,17 @@ fn handle_node_rename(params: Option<&Value>) -> Result<Value, ErrorShape> {
         .and_then(|v| v.get("name"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "name is required", None))?;
+
+    state
+        .node_pairing
+        .rename_node(node_id, name.to_string())
+        .map_err(|e| match e {
+            nodes::NodePairingError::NodeNotPaired => {
+                error_shape(ERROR_NOT_PAIRED, "node not paired", None)
+            }
+            _ => error_shape(ERROR_UNAVAILABLE, &e.to_string(), None),
+        })?;
+
     Ok(json!({
         "ok": true,
         "nodeId": node_id,
@@ -2239,20 +3783,62 @@ fn handle_node_rename(params: Option<&Value>) -> Result<Value, ErrorShape> {
     }))
 }
 
-fn handle_node_list() -> Result<Value, ErrorShape> {
+fn handle_node_list(state: &WsServerState) -> Result<Value, ErrorShape> {
+    let paired_nodes = state.node_pairing.list_paired_nodes();
+    let session_registry = state.node_registry.lock();
+
+    let nodes: Vec<Value> = paired_nodes
+        .iter()
+        .map(|n| {
+            // Check if node has an active session
+            let online = session_registry.get(&n.node_id).is_some();
+            json!({
+                "nodeId": n.node_id,
+                "displayName": n.display_name,
+                "platform": n.platform,
+                "commands": n.commands,
+                "pairedAtMs": n.paired_at_ms,
+                "lastSeenMs": n.last_seen_ms,
+                "online": online
+            })
+        })
+        .collect();
+
     Ok(json!({
-        "nodes": []
+        "nodes": nodes
     }))
 }
 
-fn handle_node_describe(params: Option<&Value>) -> Result<Value, ErrorShape> {
+fn handle_node_describe(
+    params: Option<&Value>,
+    state: &WsServerState,
+) -> Result<Value, ErrorShape> {
     let node_id = params
         .and_then(|v| v.get("nodeId"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "nodeId is required", None))?;
+
+    let node = state
+        .node_pairing
+        .get_paired_node(node_id)
+        .ok_or_else(|| error_shape(ERROR_NOT_PAIRED, "node not paired", None))?;
+
+    let session_registry = state.node_registry.lock();
+    let session = session_registry.get(node_id);
+    let online = session.is_some();
+    let active_commands: Vec<String> = session
+        .map(|s| s.commands.iter().cloned().collect())
+        .unwrap_or_default();
+
     Ok(json!({
-        "nodeId": node_id,
-        "description": null
+        "nodeId": node.node_id,
+        "displayName": node.display_name,
+        "platform": node.platform,
+        "commands": node.commands,
+        "activeCommands": active_commands,
+        "pairedAtMs": node.paired_at_ms,
+        "lastSeenMs": node.last_seen_ms,
+        "online": online
     }))
 }
 
@@ -2293,19 +3879,73 @@ fn handle_node_invoke(params: Option<&Value>, state: &WsServerState) -> Result<V
     }))
 }
 
-fn handle_node_invoke_result(params: Option<&Value>) -> Result<Value, ErrorShape> {
+fn handle_node_invoke_result(
+    params: Option<&Value>,
+    state: &WsServerState,
+    conn: &ConnectionContext,
+) -> Result<Value, ErrorShape> {
+    // This method is called by nodes to report results of invocations
+    // Verify the node is paired and the connection is authorized
+    if conn.role != "node" {
+        return Err(error_shape(
+            ERROR_FORBIDDEN,
+            "only node connections can send invoke results",
+            None,
+        ));
+    }
+
     let invoke_id = params
         .and_then(|v| v.get("invokeId"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "invokeId is required", None))?;
+    let result = params.and_then(|v| v.get("result")).cloned();
+    let error = params.and_then(|v| v.get("error")).cloned();
+    let complete = params
+        .and_then(|v| v.get("complete"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    // Get node ID from connection or device_id
+    let node_id = conn
+        .device_id
+        .as_ref()
+        .or_else(|| Some(&conn.client.id))
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "node identity required", None))?;
+
+    // Verify the node is paired
+    if !state.node_pairing.is_paired(node_id) {
+        return Err(error_shape(ERROR_NOT_PAIRED, "node not paired", None));
+    }
+
+    // Update last seen time
+    state.node_pairing.touch_node(node_id);
+
+    // In a full implementation, this would route the result back to the
+    // connection that initiated the invoke. For now, we acknowledge receipt.
     Ok(json!({
+        "ok": true,
         "invokeId": invoke_id,
-        "result": null,
-        "complete": false
+        "nodeId": node_id,
+        "complete": complete,
+        "hasResult": result.is_some(),
+        "hasError": error.is_some()
     }))
 }
 
-fn handle_node_event(params: Option<&Value>) -> Result<Value, ErrorShape> {
+fn handle_node_event(
+    params: Option<&Value>,
+    state: &WsServerState,
+    conn: &ConnectionContext,
+) -> Result<Value, ErrorShape> {
+    // This method is called by nodes to emit events
+    if conn.role != "node" {
+        return Err(error_shape(
+            ERROR_FORBIDDEN,
+            "only node connections can send events",
+            None,
+        ));
+    }
+
     let node_id = params
         .and_then(|v| v.get("nodeId"))
         .and_then(|v| v.as_str())
@@ -2314,77 +3954,116 @@ fn handle_node_event(params: Option<&Value>) -> Result<Value, ErrorShape> {
         .and_then(|v| v.get("event"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "event is required", None))?;
+    let payload = params.and_then(|v| v.get("payload")).cloned();
+
+    // Verify the node is paired
+    if !state.node_pairing.is_paired(node_id) {
+        return Err(error_shape(ERROR_NOT_PAIRED, "node not paired", None));
+    }
+
+    // Update last seen time
+    state.node_pairing.touch_node(node_id);
+
+    // In a full implementation, this would broadcast the event to subscribed
+    // operator connections. For now, we acknowledge receipt.
     Ok(json!({
         "ok": true,
         "nodeId": node_id,
-        "event": event
+        "event": event,
+        "hasPayload": payload.is_some()
     }))
 }
 
 fn handle_device_pair_list(state: &WsServerState) -> Result<Value, ErrorShape> {
-    let store = state.device_store.lock();
-    let devices: Vec<_> = store
-        .paired
-        .values()
-        .map(|d| {
+    let (pending_requests, _resolved) = state.device_registry.list_requests();
+    let paired_devices = state.device_registry.list_paired_devices();
+
+    let pending = pending_requests
+        .iter()
+        .map(|req| {
             json!({
-                "deviceId": d.device_id,
-                "roles": d.roles,
-                "scopes": d.scopes
+                "requestId": req.request_id,
+                "deviceId": req.device_id,
+                "publicKey": req.public_key,
+                "displayName": req.display_name,
+                "platform": req.platform,
+                "clientId": req.client_id,
+                "roles": req.requested_roles,
+                "scopes": req.requested_scopes,
+                "ts": req.created_at_ms
             })
         })
-        .collect();
-    Ok(json!({ "devices": devices }))
+        .collect::<Vec<_>>();
+
+    let paired = paired_devices
+        .iter()
+        .map(|device| {
+            json!({
+                "deviceId": device.device_id,
+                "publicKey": device.public_key,
+                "displayName": device.display_name,
+                "platform": device.platform,
+                "clientId": device.client_id,
+                "roles": device.roles,
+                "scopes": device.scopes,
+                "createdAtMs": device.paired_at_ms,
+                "approvedAtMs": device.paired_at_ms,
+                "lastSeenAtMs": device.last_seen_ms
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!({ "pending": pending, "paired": paired }))
 }
 
 fn handle_device_pair_approve(
     params: Option<&Value>,
     state: &WsServerState,
 ) -> Result<Value, ErrorShape> {
-    let device_id = params
-        .and_then(|v| v.get("deviceId"))
+    let request_id = params
+        .and_then(|v| v.get("requestId"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "deviceId is required", None))?;
-    let public_key = params
-        .and_then(|v| v.get("publicKey"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "publicKey is required", None))?;
-    let roles = params
-        .and_then(|v| v.get("roles"))
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let scopes = params
-        .and_then(|v| v.get("scopes"))
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "requestId is required", None))?;
 
-    let paired_at_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let request = state
+        .device_registry
+        .get_request(request_id)
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "request not found", None))?;
 
-    let mut store = state.device_store.lock();
-    store.add_paired_device(PairedDevice {
-        device_id: device_id.to_string(),
-        public_key: public_key.to_string(),
-        roles,
-        scopes,
-        paired_at_ms,
-    });
+    let (device, _token) = state
+        .device_registry
+        .approve_request(
+            request_id,
+            request.requested_roles,
+            request.requested_scopes,
+        )
+        .map_err(|e| match e {
+            devices::DevicePairingError::RequestNotFound => {
+                error_shape(ERROR_INVALID_REQUEST, "request not found", None)
+            }
+            devices::DevicePairingError::RequestAlreadyResolved => {
+                error_shape(ERROR_INVALID_REQUEST, "request already resolved", None)
+            }
+            devices::DevicePairingError::RequestExpired => {
+                error_shape(ERROR_INVALID_REQUEST, "request expired", None)
+            }
+            _ => error_shape(ERROR_UNAVAILABLE, &e.to_string(), None),
+        })?;
+
     Ok(json!({
-        "ok": true,
-        "deviceId": device_id,
-        "approved": true
+        "requestId": request_id,
+        "device": {
+            "deviceId": device.device_id,
+            "publicKey": device.public_key,
+            "displayName": device.display_name,
+            "platform": device.platform,
+            "clientId": device.client_id,
+            "roles": device.roles,
+            "scopes": device.scopes,
+            "createdAtMs": device.paired_at_ms,
+            "approvedAtMs": device.paired_at_ms,
+            "lastSeenAtMs": device.last_seen_ms
+        }
     }))
 }
 
@@ -2392,14 +4071,25 @@ fn handle_device_pair_reject(
     params: Option<&Value>,
     _state: &WsServerState,
 ) -> Result<Value, ErrorShape> {
-    let device_id = params
-        .and_then(|v| v.get("deviceId"))
+    let request_id = params
+        .and_then(|v| v.get("requestId"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "deviceId is required", None))?;
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "requestId is required", None))?;
+    let request = _state
+        .device_registry
+        .reject_request(request_id, None)
+        .map_err(|e| match e {
+            devices::DevicePairingError::RequestNotFound => {
+                error_shape(ERROR_INVALID_REQUEST, "request not found", None)
+            }
+            devices::DevicePairingError::RequestAlreadyResolved => {
+                error_shape(ERROR_INVALID_REQUEST, "request already resolved", None)
+            }
+            _ => error_shape(ERROR_UNAVAILABLE, &e.to_string(), None),
+        })?;
     Ok(json!({
-        "ok": true,
-        "deviceId": device_id,
-        "rejected": true
+        "requestId": request_id,
+        "deviceId": request.device_id
     }))
 }
 
@@ -2411,15 +4101,42 @@ fn handle_device_token_rotate(
         .and_then(|v| v.get("deviceId"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "deviceId is required", None))?;
+    let role = params
+        .and_then(|v| v.get("role"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "role is required", None))?;
+    let scopes = params
+        .and_then(|v| v.get("scopes"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
-    // Remove existing tokens for this device
-    let mut store = state.device_store.lock();
-    store.tokens.retain(|_, t| t.device_id != device_id);
+    let meta = state
+        .device_registry
+        .rotate_token(device_id, role.to_string(), scopes)
+        .map_err(|e| match e {
+            devices::DevicePairingError::DeviceNotPaired => {
+                error_shape(ERROR_INVALID_REQUEST, "unknown deviceId/role", None)
+            }
+            devices::DevicePairingError::RoleNotAllowed => {
+                error_shape(ERROR_FORBIDDEN, "role not allowed", None)
+            }
+            devices::DevicePairingError::ScopeNotAllowed => {
+                error_shape(ERROR_FORBIDDEN, "scope not allowed", None)
+            }
+            _ => error_shape(ERROR_UNAVAILABLE, &e.to_string(), None),
+        })?;
 
     Ok(json!({
-        "ok": true,
         "deviceId": device_id,
-        "rotated": true
+        "role": role,
+        "token": meta.token,
+        "scopes": meta.scopes,
+        "rotatedAtMs": meta.issued_at_ms
     }))
 }
 
@@ -2431,15 +4148,28 @@ fn handle_device_token_revoke(
         .and_then(|v| v.get("deviceId"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "deviceId is required", None))?;
+    let role = params
+        .and_then(|v| v.get("role"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "role is required", None))?;
 
-    let mut store = state.device_store.lock();
-    store.tokens.retain(|_, t| t.device_id != device_id);
-    store.paired.remove(device_id);
+    let revoked_at_ms = state
+        .device_registry
+        .revoke_token(device_id, role)
+        .map_err(|e| match e {
+            devices::DevicePairingError::DeviceNotPaired => {
+                error_shape(ERROR_INVALID_REQUEST, "unknown deviceId/role", None)
+            }
+            devices::DevicePairingError::TokenInvalid => {
+                error_shape(ERROR_INVALID_REQUEST, "unknown deviceId/role", None)
+            }
+            _ => error_shape(ERROR_UNAVAILABLE, &e.to_string(), None),
+        })?;
 
     Ok(json!({
-        "ok": true,
         "deviceId": device_id,
-        "revoked": true
+        "role": role,
+        "revokedAtMs": revoked_at_ms
     }))
 }
 
@@ -2514,9 +4244,15 @@ fn handle_exec_approval_resolve(params: Option<&Value>) -> Result<Value, ErrorSh
 }
 
 fn handle_usage_status() -> Result<Value, ErrorShape> {
+    let cfg = config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
+    let tracking = cfg
+        .get("usage")
+        .and_then(|v| v.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     Ok(json!({
         "enabled": true,
-        "tracking": true
+        "tracking": tracking
     }))
 }
 
@@ -2524,7 +4260,13 @@ fn handle_usage_cost(params: Option<&Value>) -> Result<Value, ErrorShape> {
     let session_key = params
         .and_then(|v| v.get("sessionKey"))
         .and_then(|v| v.as_str());
+    let days = params
+        .and_then(|v| v.get("days"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(30)
+        .max(1);
     Ok(json!({
+        "days": days,
         "sessionKey": session_key,
         "inputTokens": 0,
         "outputTokens": 0,
@@ -2533,13 +4275,33 @@ fn handle_usage_cost(params: Option<&Value>) -> Result<Value, ErrorShape> {
 }
 
 fn handle_logs_tail(params: Option<&Value>) -> Result<Value, ErrorShape> {
-    let lines = params
-        .and_then(|v| v.get("lines"))
+    let limit = params
+        .and_then(|v| v.get("limit"))
         .and_then(|v| v.as_i64())
-        .unwrap_or(100);
+        .map(|v| clamp_i64(v, 1, LOGS_MAX_LIMIT as i64) as usize)
+        .unwrap_or(LOGS_DEFAULT_LIMIT);
+    let max_bytes = params
+        .and_then(|v| v.get("maxBytes"))
+        .and_then(|v| v.as_i64())
+        .map(|v| clamp_i64(v, 1, LOGS_MAX_BYTES as i64) as usize)
+        .unwrap_or(LOGS_DEFAULT_MAX_BYTES);
+    let cursor = params
+        .and_then(|v| v.get("cursor"))
+        .and_then(|v| v.as_i64())
+        .filter(|v| *v >= 0)
+        .map(|v| v as u64);
+
+    let configured = resolve_log_file_path();
+    let file = resolve_log_file(&configured);
+    let result = read_log_slice(&file, cursor, limit, max_bytes)?;
+
     Ok(json!({
-        "lines": [],
-        "requested": lines
+        "file": file.to_string_lossy(),
+        "cursor": result.cursor,
+        "size": result.size,
+        "lines": result.lines,
+        "truncated": result.truncated,
+        "reset": result.reset
     }))
 }
 
@@ -2571,7 +4333,11 @@ fn handle_wake(params: Option<&Value>) -> Result<Value, ErrorShape> {
     }))
 }
 
-fn handle_send(params: Option<&Value>, _conn: &ConnectionContext) -> Result<Value, ErrorShape> {
+fn handle_send(
+    state: &WsServerState,
+    params: Option<&Value>,
+    _conn: &ConnectionContext,
+) -> Result<Value, ErrorShape> {
     let to = params
         .and_then(|v| v.get("to"))
         .and_then(|v| v.as_str())
@@ -2584,10 +4350,34 @@ fn handle_send(params: Option<&Value>, _conn: &ConnectionContext) -> Result<Valu
         .and_then(|v| v.get("idempotencyKey"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "idempotencyKey is required", None))?;
+    let channel = params
+        .and_then(|v| v.get("channel"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("default");
+
+    let mut metadata = messages::outbound::MessageMetadata::default();
+    metadata.recipient_id = Some(to.to_string());
+
+    let outbound = messages::outbound::OutboundMessage::new(
+        channel,
+        messages::outbound::MessageContent::text(message),
+    )
+    .with_metadata(metadata);
+    let ctx = messages::outbound::OutboundContext::new().with_trace_id(idempotency_key);
+
+    let queued = state
+        .message_pipeline
+        .queue(outbound.clone(), ctx)
+        .map_err(|e| error_shape(ERROR_UNAVAILABLE, &format!("queue failed: {}", e), None))?;
 
     Ok(json!({
         "ok": true,
-        "messageId": idempotency_key,
+        "runId": idempotency_key,
+        "messageId": outbound.id.0,
+        "channel": outbound.channel_id,
+        "queuePosition": queued.queue_position,
         "to": to,
         "message": message
     }))
@@ -2741,12 +4531,12 @@ fn authorize_connection(
 fn ensure_paired(
     state: &WsServerState,
     device: &DeviceIdentity,
+    connect: &ConnectParams,
     role: &str,
     scopes: &[String],
     is_local: bool,
 ) -> Result<(), ErrorShape> {
-    let mut store = state.device_store.lock();
-    if let Some(paired) = store.paired.get(&device.id) {
+    if let Some(paired) = state.device_registry.get_paired_device(&device.id) {
         if paired.public_key != device.public_key {
             return Err(error_shape(
                 ERROR_INVALID_REQUEST,
@@ -2754,33 +4544,75 @@ fn ensure_paired(
                 None,
             ));
         }
-        if !paired.roles.is_empty() && !paired.roles.contains(&role.to_string()) {
-            return Err(error_shape(ERROR_NOT_PAIRED, "pairing required", None));
+
+        let role_allowed = if paired.roles.is_empty() {
+            false
+        } else {
+            paired.roles.iter().any(|r| r == role)
+        };
+        if !role_allowed {
+            return require_pairing(state, device, connect, role, scopes, is_local);
         }
-        if !paired.scopes.is_empty() {
-            for scope in scopes {
-                if !paired.scopes.contains(scope) {
-                    return Err(error_shape(ERROR_NOT_PAIRED, "pairing required", None));
-                }
+
+        if !scopes.is_empty() {
+            if paired.scopes.is_empty() || !scopes.iter().all(|scope| paired.scopes.contains(scope))
+            {
+                return require_pairing(state, device, connect, role, scopes, is_local);
             }
         }
+
         return Ok(());
     }
+
+    require_pairing(state, device, connect, role, scopes, is_local)
+}
+
+fn require_pairing(
+    state: &WsServerState,
+    device: &DeviceIdentity,
+    connect: &ConnectParams,
+    role: &str,
+    scopes: &[String],
+    is_local: bool,
+) -> Result<(), ErrorShape> {
+    let request = state
+        .device_registry
+        .request_pairing(
+            device.id.clone(),
+            device.public_key.clone(),
+            vec![role.to_string()],
+            scopes.to_vec(),
+            connect.client.display_name.clone(),
+            Some(connect.client.platform.clone()),
+            Some(connect.client.id.clone()),
+        )
+        .map_err(|e| match e {
+            devices::DevicePairingError::PublicKeyMismatch => {
+                error_shape(ERROR_INVALID_REQUEST, "device identity mismatch", None)
+            }
+            devices::DevicePairingError::TooManyPendingRequests => {
+                error_shape(ERROR_UNAVAILABLE, "too many pending pairing requests", None)
+            }
+            _ => error_shape(ERROR_UNAVAILABLE, &e.to_string(), None),
+        })?;
+
     if is_local {
-        let paired_at_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        store.add_paired_device(PairedDevice {
-            device_id: device.id.clone(),
-            public_key: device.public_key.clone(),
-            roles: vec![role.to_string()],
-            scopes: scopes.to_vec(),
-            paired_at_ms,
-        });
+        let _ = state
+            .device_registry
+            .approve_request(
+                &request.request_id,
+                request.requested_roles,
+                request.requested_scopes,
+            )
+            .map_err(|e| error_shape(ERROR_UNAVAILABLE, &e.to_string(), None))?;
         return Ok(());
     }
-    Err(error_shape(ERROR_NOT_PAIRED, "pairing required", None))
+
+    Err(error_shape(
+        ERROR_NOT_PAIRED,
+        "pairing required",
+        Some(json!({ "details": { "requestId": request.request_id } })),
+    ))
 }
 
 fn ensure_device_token(
@@ -2788,21 +4620,17 @@ fn ensure_device_token(
     device_id: &str,
     role: &str,
     scopes: &[String],
-) -> DeviceToken {
-    let key = device_token_key(device_id, role, scopes);
-    let mut store = state.device_store.lock();
-    if let Some(existing) = store.tokens.get(&key) {
-        return existing.clone();
-    }
-    let token = DeviceToken {
-        token: Uuid::new_v4().to_string(),
-        device_id: device_id.to_string(),
-        role: role.to_string(),
-        scopes: scopes.to_vec(),
-        issued_at_ms: now_ms(),
-    };
-    store.add_token(key, token.clone());
-    token
+) -> devices::IssuedDeviceToken {
+    let result = state
+        .device_registry
+        .ensure_token(device_id, role.to_string(), scopes.to_vec())
+        .unwrap_or_else(|_| devices::IssuedDeviceToken {
+            token: Uuid::new_v4().to_string(),
+            role: role.to_string(),
+            scopes: scopes.to_vec(),
+            issued_at_ms: now_ms(),
+        });
+    result
 }
 
 fn verify_device_token(
@@ -2812,19 +4640,10 @@ fn verify_device_token(
     role: &str,
     scopes: &[String],
 ) -> bool {
-    let store = state.device_store.lock();
-    let key = device_token_key(device_id, role, scopes);
-    store
-        .tokens
-        .get(&key)
-        .map(|entry| entry.token == token)
-        .unwrap_or(false)
-}
-
-fn device_token_key(device_id: &str, role: &str, scopes: &[String]) -> String {
-    let mut scopes_sorted = scopes.to_vec();
-    scopes_sorted.sort();
-    format!("{}|{}|{}", device_id, role, scopes_sorted.join(","))
+    state
+        .device_registry
+        .verify_token(device_id, token, Some(role), scopes)
+        .is_ok()
 }
 
 fn build_device_auth_payload(params: DeviceAuthPayload) -> String {
@@ -3587,204 +5406,231 @@ mod tests {
         ));
     }
 
-    // ============== Device Store Bounds Tests ==============
+    // ============== Node Pairing Handler Tests ==============
 
     #[test]
-    fn test_device_store_paired_device_limit() {
-        let mut store = DeviceStore::default();
+    fn test_handle_node_pair_request() {
+        let state = WsServerState::new(WsServerConfig::default());
 
-        // Fill up to limit
-        for i in 0..MAX_PAIRED_DEVICES {
-            store.add_paired_device(PairedDevice {
-                device_id: format!("device-{}", i),
-                public_key: format!("key-{}", i),
-                roles: vec!["write".to_string()],
-                scopes: vec![],
-                paired_at_ms: i as u64,
-            });
-        }
-        assert_eq!(store.paired.len(), MAX_PAIRED_DEVICES);
-
-        // Add one more - should evict oldest (device-0)
-        store.add_paired_device(PairedDevice {
-            device_id: "device-new".to_string(),
-            public_key: "key-new".to_string(),
-            roles: vec!["write".to_string()],
-            scopes: vec![],
-            paired_at_ms: (MAX_PAIRED_DEVICES + 1) as u64,
+        let params = json!({
+            "nodeId": "test-node-1",
+            "displayName": "Test Node",
+            "platform": "darwin",
+            "commands": ["system.run", "camera.snap"]
         });
 
-        assert_eq!(store.paired.len(), MAX_PAIRED_DEVICES);
-        assert!(
-            !store.paired.contains_key("device-0"),
-            "Oldest device should be evicted"
-        );
-        assert!(
-            store.paired.contains_key("device-new"),
-            "New device should be added"
-        );
+        let result = handle_node_pair_request(Some(&params), &state);
+        assert!(result.is_ok());
+
+        let response = result.unwrap();
+        assert_eq!(response["nodeId"], "test-node-1");
+        assert_eq!(response["status"], "pending");
+        assert!(response["requestId"].as_str().is_some());
     }
 
     #[test]
-    fn test_device_store_token_limit() {
-        let mut store = DeviceStore::default();
+    fn test_handle_node_pair_request_requires_node_id() {
+        let state = WsServerState::new(WsServerConfig::default());
 
-        // Fill up to limit
-        for i in 0..MAX_DEVICE_TOKENS {
-            let key = format!("token-key-{}", i);
-            store.add_token(
-                key,
-                DeviceToken {
-                    token: format!("token-{}", i),
-                    device_id: format!("device-{}", i % 10),
-                    role: "write".to_string(),
-                    scopes: vec![],
-                    issued_at_ms: i as u64,
-                },
-            );
-        }
-        assert_eq!(store.tokens.len(), MAX_DEVICE_TOKENS);
+        let params = json!({
+            "displayName": "Test Node"
+        });
 
-        // Add one more - should evict oldest
-        store.add_token(
-            "token-key-new".to_string(),
-            DeviceToken {
-                token: "token-new".to_string(),
-                device_id: "device-new".to_string(),
-                role: "write".to_string(),
-                scopes: vec![],
-                issued_at_ms: (MAX_DEVICE_TOKENS + 1) as u64,
-            },
-        );
-
-        assert_eq!(store.tokens.len(), MAX_DEVICE_TOKENS);
-        assert!(
-            !store.tokens.contains_key("token-key-0"),
-            "Oldest token should be evicted"
-        );
-        assert!(
-            store.tokens.contains_key("token-key-new"),
-            "New token should be added"
-        );
+        let result = handle_node_pair_request(Some(&params), &state);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, ERROR_INVALID_REQUEST);
     }
 
     #[test]
-    fn test_device_store_update_existing_device_no_eviction() {
-        let mut store = DeviceStore::default();
+    fn test_handle_node_pair_list() {
+        let state = WsServerState::new(WsServerConfig::default());
 
-        // Add a device
-        store.add_paired_device(PairedDevice {
-            device_id: "device-1".to_string(),
-            public_key: "key-1".to_string(),
-            roles: vec!["read".to_string()],
-            scopes: vec![],
-            paired_at_ms: 100,
+        // Create a pairing request
+        let params = json!({
+            "nodeId": "test-node-1",
+            "displayName": "Test Node"
         });
-        assert_eq!(store.paired.len(), 1);
+        handle_node_pair_request(Some(&params), &state).unwrap();
 
-        // Update the same device
-        store.add_paired_device(PairedDevice {
-            device_id: "device-1".to_string(),
-            public_key: "key-1-updated".to_string(),
-            roles: vec!["write".to_string()],
-            scopes: vec![],
-            paired_at_ms: 200,
+        // List should show the pending request
+        let result = handle_node_pair_list(&state);
+        assert!(result.is_ok());
+
+        let response = result.unwrap();
+        assert_eq!(response["nodes"].as_array().unwrap().len(), 0);
+        assert_eq!(response["pending"].as_array().unwrap().len(), 1);
+        assert_eq!(response["pending"][0]["nodeId"], "test-node-1");
+    }
+
+    #[test]
+    fn test_handle_node_pair_approve_and_verify() {
+        let state = WsServerState::new(WsServerConfig::default());
+
+        // Create a pairing request
+        let request_params = json!({
+            "nodeId": "test-node-1",
+            "displayName": "Test Node"
         });
+        let request_response = handle_node_pair_request(Some(&request_params), &state).unwrap();
+        let request_id = request_response["requestId"].as_str().unwrap();
 
-        // Should still be 1 device, but updated
-        assert_eq!(store.paired.len(), 1);
+        // Approve the request
+        let approve_params = json!({ "requestId": request_id });
+        let approve_result = handle_node_pair_approve(Some(&approve_params), &state);
+        assert!(approve_result.is_ok());
+
+        let approve_response = approve_result.unwrap();
+        assert_eq!(approve_response["approved"], true);
+        assert_eq!(approve_response["nodeId"], "test-node-1");
+        let token = approve_response["token"].as_str().unwrap();
+        assert!(!token.is_empty());
+
+        // Verify the token
+        let verify_params = json!({
+            "nodeId": "test-node-1",
+            "token": token
+        });
+        let verify_result = handle_node_pair_verify(Some(&verify_params), &state);
+        assert!(verify_result.is_ok());
+        assert_eq!(verify_result.unwrap()["verified"], true);
+    }
+
+    #[test]
+    fn test_handle_node_pair_reject() {
+        let state = WsServerState::new(WsServerConfig::default());
+
+        // Create a pairing request
+        let request_params = json!({
+            "nodeId": "test-node-1"
+        });
+        let request_response = handle_node_pair_request(Some(&request_params), &state).unwrap();
+        let request_id = request_response["requestId"].as_str().unwrap();
+
+        // Reject the request
+        let reject_params = json!({
+            "requestId": request_id,
+            "reason": "Not authorized"
+        });
+        let reject_result = handle_node_pair_reject(Some(&reject_params), &state);
+        assert!(reject_result.is_ok());
+
+        let reject_response = reject_result.unwrap();
+        assert_eq!(reject_response["rejected"], true);
+        assert_eq!(reject_response["nodeId"], "test-node-1");
+
+        // Node should not be paired
+        assert!(!state.node_pairing.is_paired("test-node-1"));
+    }
+
+    #[test]
+    fn test_handle_node_pair_verify_requires_pairing() {
+        let state = WsServerState::new(WsServerConfig::default());
+
+        // Try to verify without pairing
+        let verify_params = json!({
+            "nodeId": "unpaired-node",
+            "token": "some-token"
+        });
+        let verify_result = handle_node_pair_verify(Some(&verify_params), &state);
+        assert!(verify_result.is_err());
+        assert_eq!(verify_result.unwrap_err().code, ERROR_NOT_PAIRED);
+    }
+
+    #[test]
+    fn test_handle_node_list() {
+        let state = WsServerState::new(WsServerConfig::default());
+
+        // Initially empty
+        let result = handle_node_list(&state);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap()["nodes"].as_array().unwrap().len(), 0);
+
+        // Pair a node
+        let request_params = json!({
+            "nodeId": "test-node-1",
+            "displayName": "Test Node",
+            "platform": "darwin"
+        });
+        let request_response = handle_node_pair_request(Some(&request_params), &state).unwrap();
+        let request_id = request_response["requestId"].as_str().unwrap();
+        handle_node_pair_approve(Some(&json!({ "requestId": request_id })), &state).unwrap();
+
+        // Should now have one node
+        let result = handle_node_list(&state);
+        assert!(result.is_ok());
+        let binding = result.unwrap();
+        let nodes = binding["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0]["nodeId"], "test-node-1");
+        assert_eq!(nodes[0]["displayName"], "Test Node");
+        assert_eq!(nodes[0]["platform"], "darwin");
+    }
+
+    #[test]
+    fn test_handle_node_rename() {
+        let state = WsServerState::new(WsServerConfig::default());
+
+        // Pair a node
+        let request_params = json!({
+            "nodeId": "test-node-1",
+            "displayName": "Old Name"
+        });
+        let request_response = handle_node_pair_request(Some(&request_params), &state).unwrap();
+        let request_id = request_response["requestId"].as_str().unwrap();
+        handle_node_pair_approve(Some(&json!({ "requestId": request_id })), &state).unwrap();
+
+        // Rename the node
+        let rename_params = json!({
+            "nodeId": "test-node-1",
+            "name": "New Name"
+        });
+        let result = handle_node_rename(Some(&rename_params), &state);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap()["name"], "New Name");
+
+        // Verify the name changed
+        let node = state.node_pairing.get_paired_node("test-node-1").unwrap();
+        assert_eq!(node.display_name, Some("New Name".to_string()));
+    }
+
+    #[test]
+    fn test_handle_node_describe() {
+        let state = WsServerState::new(WsServerConfig::default());
+
+        // Pair a node
+        let request_params = json!({
+            "nodeId": "test-node-1",
+            "displayName": "Test Node",
+            "platform": "darwin",
+            "commands": ["system.run"]
+        });
+        let request_response = handle_node_pair_request(Some(&request_params), &state).unwrap();
+        let request_id = request_response["requestId"].as_str().unwrap();
+        handle_node_pair_approve(Some(&json!({ "requestId": request_id })), &state).unwrap();
+
+        // Describe the node
+        let describe_params = json!({ "nodeId": "test-node-1" });
+        let result = handle_node_describe(Some(&describe_params), &state);
+        assert!(result.is_ok());
+
+        let response = result.unwrap();
+        assert_eq!(response["nodeId"], "test-node-1");
+        assert_eq!(response["displayName"], "Test Node");
+        assert_eq!(response["platform"], "darwin");
         assert_eq!(
-            store.paired.get("device-1").unwrap().public_key,
-            "key-1-updated"
+            response["commands"].as_array().unwrap(),
+            &vec![json!("system.run")]
         );
-        assert_eq!(
-            store.paired.get("device-1").unwrap().roles,
-            vec!["write".to_string()]
-        );
+        assert_eq!(response["online"], false);
     }
 
     #[test]
-    fn test_device_store_evict_device_also_removes_tokens() {
-        let mut store = DeviceStore::default();
+    fn test_handle_node_describe_requires_pairing() {
+        let state = WsServerState::new(WsServerConfig::default());
 
-        // Add a device
-        store.add_paired_device(PairedDevice {
-            device_id: "device-old".to_string(),
-            public_key: "key-old".to_string(),
-            roles: vec!["write".to_string()],
-            scopes: vec![],
-            paired_at_ms: 0, // Oldest
-        });
-
-        // Add tokens for this device
-        store.add_token(
-            "token-key-1".to_string(),
-            DeviceToken {
-                token: "token-1".to_string(),
-                device_id: "device-old".to_string(),
-                role: "write".to_string(),
-                scopes: vec![],
-                issued_at_ms: 100,
-            },
-        );
-        store.add_token(
-            "token-key-2".to_string(),
-            DeviceToken {
-                token: "token-2".to_string(),
-                device_id: "device-old".to_string(),
-                role: "admin".to_string(),
-                scopes: vec![],
-                issued_at_ms: 101,
-            },
-        );
-
-        // Add another device's token
-        store.add_token(
-            "token-key-3".to_string(),
-            DeviceToken {
-                token: "token-3".to_string(),
-                device_id: "device-other".to_string(),
-                role: "write".to_string(),
-                scopes: vec![],
-                issued_at_ms: 102,
-            },
-        );
-
-        assert_eq!(store.tokens.len(), 3);
-
-        // Fill up to limit with newer devices
-        for i in 1..MAX_PAIRED_DEVICES {
-            store.add_paired_device(PairedDevice {
-                device_id: format!("device-{}", i),
-                public_key: format!("key-{}", i),
-                roles: vec!["write".to_string()],
-                scopes: vec![],
-                paired_at_ms: i as u64 + 1, // Newer than device-old
-            });
-        }
-
-        // Add one more to trigger eviction of device-old
-        store.add_paired_device(PairedDevice {
-            device_id: "device-new".to_string(),
-            public_key: "key-new".to_string(),
-            roles: vec!["write".to_string()],
-            scopes: vec![],
-            paired_at_ms: 1000,
-        });
-
-        // device-old should be evicted along with its tokens
-        assert!(!store.paired.contains_key("device-old"));
-        assert!(
-            !store.tokens.contains_key("token-key-1"),
-            "Token for evicted device should be removed"
-        );
-        assert!(
-            !store.tokens.contains_key("token-key-2"),
-            "Token for evicted device should be removed"
-        );
-        assert!(
-            store.tokens.contains_key("token-key-3"),
-            "Token for other device should remain"
-        );
+        let describe_params = json!({ "nodeId": "unpaired-node" });
+        let result = handle_node_describe(Some(&describe_params), &state);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, ERROR_NOT_PAIRED);
     }
 }
