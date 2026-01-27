@@ -252,16 +252,33 @@ impl ConfigEnforcer {
     }
 }
 
+/// SSRF protection configuration
+#[derive(Debug, Clone, Default)]
+pub struct SsrfConfig {
+    /// Allow Tailscale IPs (100.64.0.0/10 subset used by Tailscale).
+    /// Enable this when the gateway runs on a Tailscale network and plugins
+    /// need to access other Tailscale hosts. Default: false (block CGNAT).
+    pub allow_tailscale: bool,
+}
+
 /// SSRF protection for HTTP requests
 ///
 /// Blocks requests to:
 /// - IPv4 private ranges: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
 /// - IPv4 link-local: 169.254.0.0/16
 /// - IPv4 localhost: 127.0.0.0/8
+/// - IPv4 CGNAT: 100.64.0.0/10 (unless allow_tailscale is set)
 /// - IPv6 private: fc00::/7 (unique local addresses)
 /// - IPv6 link-local: fe80::/10
 /// - IPv6 localhost: ::1
 /// - Cloud metadata endpoints (169.254.169.254, fd00:ec2::254)
+///
+/// # Tailscale Compatibility
+///
+/// Tailscale uses addresses from 100.64.0.0/10 (CGNAT range). By default,
+/// these are blocked to prevent SSRF attacks. If your deployment runs on
+/// Tailscale and plugins need to access other Tailscale hosts, set
+/// `allow_tailscale: true` in the SsrfConfig.
 ///
 /// # Security Note: DNS Rebinding Protection
 ///
@@ -278,8 +295,13 @@ impl ConfigEnforcer {
 pub struct SsrfProtection;
 
 impl SsrfProtection {
-    /// Validate a URL for SSRF protection
+    /// Validate a URL for SSRF protection with default config (blocks CGNAT/Tailscale)
     pub fn validate_url(url: &str) -> Result<(), CapabilityError> {
+        Self::validate_url_with_config(url, &SsrfConfig::default())
+    }
+
+    /// Validate a URL for SSRF protection with custom config
+    pub fn validate_url_with_config(url: &str, config: &SsrfConfig) -> Result<(), CapabilityError> {
         // Parse the URL
         let parsed = url::Url::parse(url)
             .map_err(|e| CapabilityError::InvalidUrl(format!("{}: {}", url, e)))?;
@@ -315,7 +337,7 @@ impl SsrfProtection {
 
         // Try to parse as IP address
         if let Ok(ip) = host.parse::<IpAddr>() {
-            if Self::is_private_ip(&ip) {
+            if Self::is_private_ip_with_config(&ip, config) {
                 return Err(CapabilityError::SsrfBlocked(format!(
                     "private IP address: {}",
                     ip
@@ -327,7 +349,7 @@ impl SsrfProtection {
         if host.starts_with('[') && host.ends_with(']') {
             let inner = &host[1..host.len() - 1];
             if let Ok(ip) = inner.parse::<Ipv6Addr>() {
-                if Self::is_private_ipv6(&ip) {
+                if Self::is_private_ip_with_config(&IpAddr::V6(ip), config) {
                     return Err(CapabilityError::SsrfBlocked(format!(
                         "private IP address: {}",
                         ip
@@ -339,7 +361,12 @@ impl SsrfProtection {
         Ok(())
     }
 
-    /// Validate a resolved IP address for SSRF protection.
+    /// Validate a resolved IP address for SSRF protection (default config).
+    pub fn validate_resolved_ip(ip: &IpAddr, original_host: &str) -> Result<(), CapabilityError> {
+        Self::validate_resolved_ip_with_config(ip, original_host, &SsrfConfig::default())
+    }
+
+    /// Validate a resolved IP address for SSRF protection with custom config.
     ///
     /// This MUST be called after DNS resolution, before making the actual connection.
     /// Validates that the resolved IP is not a private/internal address.
@@ -347,17 +374,23 @@ impl SsrfProtection {
     /// # Arguments
     /// * `ip` - The IP address from DNS resolution
     /// * `original_host` - The original hostname (for error messages)
+    /// * `config` - SSRF configuration (e.g., whether to allow Tailscale IPs)
     ///
     /// # Example
     /// ```ignore
     /// // After DNS resolution
+    /// let config = SsrfConfig { allow_tailscale: true };
     /// for ip in resolved_ips {
-    ///     SsrfProtection::validate_resolved_ip(&ip, hostname)?;
+    ///     SsrfProtection::validate_resolved_ip_with_config(&ip, hostname, &config)?;
     /// }
     /// // Now safe to connect using one of the validated IPs
     /// ```
-    pub fn validate_resolved_ip(ip: &IpAddr, original_host: &str) -> Result<(), CapabilityError> {
-        if Self::is_private_ip(ip) {
+    pub fn validate_resolved_ip_with_config(
+        ip: &IpAddr,
+        original_host: &str,
+        config: &SsrfConfig,
+    ) -> Result<(), CapabilityError> {
+        if Self::is_private_ip_with_config(ip, config) {
             return Err(CapabilityError::SsrfBlocked(format!(
                 "DNS {} resolved to private IP: {}",
                 original_host, ip
@@ -435,16 +468,32 @@ impl SsrfProtection {
         false
     }
 
-    /// Check if an IP address is private/internal
+    /// Check if an IP address is private/internal (default config)
     fn is_private_ip(ip: &IpAddr) -> bool {
+        Self::is_private_ip_with_config(ip, &SsrfConfig::default())
+    }
+
+    /// Check if an IP address is private/internal with custom config
+    fn is_private_ip_with_config(ip: &IpAddr, config: &SsrfConfig) -> bool {
         match ip {
-            IpAddr::V4(ipv4) => Self::is_private_ipv4(ipv4),
+            IpAddr::V4(ipv4) => Self::is_private_ipv4_with_config(ipv4, config),
             IpAddr::V6(ipv6) => Self::is_private_ipv6(ipv6),
         }
     }
 
-    /// Check if an IPv4 address is private
+    /// Check if an IPv4 address is in the Tailscale CGNAT range (100.64.0.0/10)
+    fn is_tailscale_ip(ip: &Ipv4Addr) -> bool {
+        let octets = ip.octets();
+        octets[0] == 100 && (64..=127).contains(&octets[1])
+    }
+
+    /// Check if an IPv4 address is private (default config)
     fn is_private_ipv4(ip: &Ipv4Addr) -> bool {
+        Self::is_private_ipv4_with_config(ip, &SsrfConfig::default())
+    }
+
+    /// Check if an IPv4 address is private with custom config
+    fn is_private_ipv4_with_config(ip: &Ipv4Addr, config: &SsrfConfig) -> bool {
         let octets = ip.octets();
 
         // 10.0.0.0/8 - Private Class A
@@ -477,8 +526,9 @@ impl SsrfProtection {
             return true;
         }
 
-        // 100.64.0.0/10 - Carrier-grade NAT
-        if octets[0] == 100 && (64..=127).contains(&octets[1]) {
+        // 100.64.0.0/10 - Carrier-grade NAT (also Tailscale range)
+        // Skip this check if allow_tailscale is enabled
+        if Self::is_tailscale_ip(ip) && !config.allow_tailscale {
             return true;
         }
 
@@ -945,6 +995,74 @@ mod tests {
         let public_ip2 = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
         let result = SsrfProtection::validate_resolved_ip(&public_ip2, "cloudflare.com");
         assert!(result.is_ok());
+    }
+
+    // ============== Tailscale IP Configuration Tests ==============
+
+    #[test]
+    fn test_tailscale_ip_detection() {
+        // Tailscale range: 100.64.0.0/10
+        assert!(SsrfProtection::is_tailscale_ip(&Ipv4Addr::new(100, 64, 0, 1)));
+        assert!(SsrfProtection::is_tailscale_ip(&Ipv4Addr::new(100, 100, 50, 25)));
+        assert!(SsrfProtection::is_tailscale_ip(&Ipv4Addr::new(100, 127, 255, 255)));
+
+        // Outside Tailscale range
+        assert!(!SsrfProtection::is_tailscale_ip(&Ipv4Addr::new(100, 63, 255, 255)));
+        assert!(!SsrfProtection::is_tailscale_ip(&Ipv4Addr::new(100, 128, 0, 0)));
+        assert!(!SsrfProtection::is_tailscale_ip(&Ipv4Addr::new(8, 8, 8, 8)));
+    }
+
+    #[test]
+    fn test_ssrf_blocks_tailscale_by_default() {
+        // Default config should block Tailscale IPs
+        let tailscale_ip = IpAddr::V4(Ipv4Addr::new(100, 100, 50, 25));
+        let result = SsrfProtection::validate_resolved_ip(&tailscale_ip, "tailscale-host");
+        assert!(matches!(result, Err(CapabilityError::SsrfBlocked(_))));
+
+        // URL validation should also block
+        let result = SsrfProtection::validate_url("http://100.100.50.25/api");
+        assert!(matches!(result, Err(CapabilityError::SsrfBlocked(_))));
+    }
+
+    #[test]
+    fn test_ssrf_allows_tailscale_when_configured() {
+        let config = SsrfConfig { allow_tailscale: true };
+
+        // Tailscale IP should be allowed with config
+        let tailscale_ip = IpAddr::V4(Ipv4Addr::new(100, 100, 50, 25));
+        let result = SsrfProtection::validate_resolved_ip_with_config(
+            &tailscale_ip,
+            "tailscale-host",
+            &config,
+        );
+        assert!(result.is_ok());
+
+        // URL validation should also allow
+        let result = SsrfProtection::validate_url_with_config("http://100.100.50.25/api", &config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_ssrf_still_blocks_other_private_when_tailscale_allowed() {
+        let config = SsrfConfig { allow_tailscale: true };
+
+        // Other private ranges should still be blocked
+        let private_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+        let result = SsrfProtection::validate_resolved_ip_with_config(
+            &private_ip,
+            "internal-host",
+            &config,
+        );
+        assert!(matches!(result, Err(CapabilityError::SsrfBlocked(_))));
+
+        // Loopback should still be blocked
+        let localhost = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let result = SsrfProtection::validate_resolved_ip_with_config(
+            &localhost,
+            "localhost",
+            &config,
+        );
+        assert!(matches!(result, Err(CapabilityError::SsrfBlocked(_))));
     }
 
     // TODO: Add integration test for DNS rebinding when http_fetch is implemented.

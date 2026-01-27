@@ -366,10 +366,78 @@ pub async fn build_ws_config_from_files() -> Result<WsServerConfig, WsConfigErro
     })
 }
 
+/// Maximum number of paired devices to prevent unbounded memory growth
+const MAX_PAIRED_DEVICES: usize = 100;
+
+/// Maximum number of active tokens (across all devices)
+const MAX_DEVICE_TOKENS: usize = 500;
+
 #[derive(Debug, Default)]
 struct DeviceStore {
     paired: HashMap<String, PairedDevice>,
     tokens: HashMap<String, DeviceToken>,
+}
+
+impl DeviceStore {
+    /// Add a paired device, evicting oldest if at capacity
+    fn add_paired_device(&mut self, device: PairedDevice) {
+        // If already exists (update), just replace
+        if self.paired.contains_key(&device.device_id) {
+            self.paired.insert(device.device_id.clone(), device);
+            return;
+        }
+
+        // Evict oldest if at capacity
+        if self.paired.len() >= MAX_PAIRED_DEVICES {
+            if let Some(oldest_id) = self.find_oldest_paired_device() {
+                self.paired.remove(&oldest_id);
+                // Also remove tokens for evicted device
+                self.tokens.retain(|_, t| t.device_id != oldest_id);
+            }
+        }
+
+        self.paired.insert(device.device_id.clone(), device);
+    }
+
+    /// Add a device token with the given key, evicting oldest if at capacity
+    fn add_token(&mut self, key: String, token: DeviceToken) {
+        // If already exists, replace
+        if self.tokens.contains_key(&key) {
+            self.tokens.insert(key, token);
+            return;
+        }
+
+        // Evict oldest if at capacity
+        if self.tokens.len() >= MAX_DEVICE_TOKENS {
+            if let Some(oldest_key) = self.find_oldest_token_key() {
+                self.tokens.remove(&oldest_key);
+            }
+        }
+
+        self.tokens.insert(key, token);
+    }
+
+    /// Find the oldest paired device (by paired_at_ms)
+    fn find_oldest_paired_device(&self) -> Option<String> {
+        self.paired
+            .values()
+            .min_by_key(|d| d.paired_at_ms)
+            .map(|d| d.device_id.clone())
+    }
+
+    /// Find the key of the oldest token (by issued_at_ms)
+    fn find_oldest_token_key(&self) -> Option<String> {
+        self.tokens
+            .iter()
+            .min_by_key(|(_, t)| t.issued_at_ms)
+            .map(|(k, _)| k.clone())
+    }
+
+    /// Get current counts for diagnostics
+    #[allow(dead_code)]
+    fn stats(&self) -> (usize, usize) {
+        (self.paired.len(), self.tokens.len())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -378,6 +446,7 @@ struct PairedDevice {
     public_key: String,
     roles: Vec<String>,
     scopes: Vec<String>,
+    paired_at_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1883,16 +1952,19 @@ fn handle_device_pair_approve(params: Option<&Value>, state: &WsServerState) -> 
         })
         .unwrap_or_default();
 
+    let paired_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
     let mut store = state.device_store.lock();
-    store.paired.insert(
-        device_id.to_string(),
-        PairedDevice {
-            device_id: device_id.to_string(),
-            public_key: public_key.to_string(),
-            roles,
-            scopes,
-        },
-    );
+    store.add_paired_device(PairedDevice {
+        device_id: device_id.to_string(),
+        public_key: public_key.to_string(),
+        roles,
+        scopes,
+        paired_at_ms,
+    });
     Ok(json!({
         "ok": true,
         "deviceId": device_id,
@@ -2285,15 +2357,17 @@ fn ensure_paired(
         return Ok(());
     }
     if is_local {
-        store.paired.insert(
-            device.id.clone(),
-            PairedDevice {
-                device_id: device.id.clone(),
-                public_key: device.public_key.clone(),
-                roles: vec![role.to_string()],
-                scopes: scopes.to_vec(),
-            },
-        );
+        let paired_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        store.add_paired_device(PairedDevice {
+            device_id: device.id.clone(),
+            public_key: device.public_key.clone(),
+            roles: vec![role.to_string()],
+            scopes: scopes.to_vec(),
+            paired_at_ms,
+        });
         return Ok(());
     }
     Err(error_shape(ERROR_NOT_PAIRED, "pairing required", None))
@@ -2317,7 +2391,7 @@ fn ensure_device_token(
         scopes: scopes.to_vec(),
         issued_at_ms: now_ms(),
     };
-    store.tokens.insert(key, token.clone());
+    store.add_token(key, token.clone());
     token
 }
 
@@ -2977,5 +3051,164 @@ mod tests {
         assert!(err.message.contains("config.set"));
         assert!(err.message.contains("write"));
         assert!(err.message.contains("read"));
+    }
+
+    // ============== Device Store Bounds Tests ==============
+
+    #[test]
+    fn test_device_store_paired_device_limit() {
+        let mut store = DeviceStore::default();
+
+        // Fill up to limit
+        for i in 0..MAX_PAIRED_DEVICES {
+            store.add_paired_device(PairedDevice {
+                device_id: format!("device-{}", i),
+                public_key: format!("key-{}", i),
+                roles: vec!["write".to_string()],
+                scopes: vec![],
+                paired_at_ms: i as u64,
+            });
+        }
+        assert_eq!(store.paired.len(), MAX_PAIRED_DEVICES);
+
+        // Add one more - should evict oldest (device-0)
+        store.add_paired_device(PairedDevice {
+            device_id: "device-new".to_string(),
+            public_key: "key-new".to_string(),
+            roles: vec!["write".to_string()],
+            scopes: vec![],
+            paired_at_ms: (MAX_PAIRED_DEVICES + 1) as u64,
+        });
+
+        assert_eq!(store.paired.len(), MAX_PAIRED_DEVICES);
+        assert!(!store.paired.contains_key("device-0"), "Oldest device should be evicted");
+        assert!(store.paired.contains_key("device-new"), "New device should be added");
+    }
+
+    #[test]
+    fn test_device_store_token_limit() {
+        let mut store = DeviceStore::default();
+
+        // Fill up to limit
+        for i in 0..MAX_DEVICE_TOKENS {
+            let key = format!("token-key-{}", i);
+            store.add_token(key, DeviceToken {
+                token: format!("token-{}", i),
+                device_id: format!("device-{}", i % 10),
+                role: "write".to_string(),
+                scopes: vec![],
+                issued_at_ms: i as u64,
+            });
+        }
+        assert_eq!(store.tokens.len(), MAX_DEVICE_TOKENS);
+
+        // Add one more - should evict oldest
+        store.add_token("token-key-new".to_string(), DeviceToken {
+            token: "token-new".to_string(),
+            device_id: "device-new".to_string(),
+            role: "write".to_string(),
+            scopes: vec![],
+            issued_at_ms: (MAX_DEVICE_TOKENS + 1) as u64,
+        });
+
+        assert_eq!(store.tokens.len(), MAX_DEVICE_TOKENS);
+        assert!(!store.tokens.contains_key("token-key-0"), "Oldest token should be evicted");
+        assert!(store.tokens.contains_key("token-key-new"), "New token should be added");
+    }
+
+    #[test]
+    fn test_device_store_update_existing_device_no_eviction() {
+        let mut store = DeviceStore::default();
+
+        // Add a device
+        store.add_paired_device(PairedDevice {
+            device_id: "device-1".to_string(),
+            public_key: "key-1".to_string(),
+            roles: vec!["read".to_string()],
+            scopes: vec![],
+            paired_at_ms: 100,
+        });
+        assert_eq!(store.paired.len(), 1);
+
+        // Update the same device
+        store.add_paired_device(PairedDevice {
+            device_id: "device-1".to_string(),
+            public_key: "key-1-updated".to_string(),
+            roles: vec!["write".to_string()],
+            scopes: vec![],
+            paired_at_ms: 200,
+        });
+
+        // Should still be 1 device, but updated
+        assert_eq!(store.paired.len(), 1);
+        assert_eq!(store.paired.get("device-1").unwrap().public_key, "key-1-updated");
+        assert_eq!(store.paired.get("device-1").unwrap().roles, vec!["write".to_string()]);
+    }
+
+    #[test]
+    fn test_device_store_evict_device_also_removes_tokens() {
+        let mut store = DeviceStore::default();
+
+        // Add a device
+        store.add_paired_device(PairedDevice {
+            device_id: "device-old".to_string(),
+            public_key: "key-old".to_string(),
+            roles: vec!["write".to_string()],
+            scopes: vec![],
+            paired_at_ms: 0, // Oldest
+        });
+
+        // Add tokens for this device
+        store.add_token("token-key-1".to_string(), DeviceToken {
+            token: "token-1".to_string(),
+            device_id: "device-old".to_string(),
+            role: "write".to_string(),
+            scopes: vec![],
+            issued_at_ms: 100,
+        });
+        store.add_token("token-key-2".to_string(), DeviceToken {
+            token: "token-2".to_string(),
+            device_id: "device-old".to_string(),
+            role: "admin".to_string(),
+            scopes: vec![],
+            issued_at_ms: 101,
+        });
+
+        // Add another device's token
+        store.add_token("token-key-3".to_string(), DeviceToken {
+            token: "token-3".to_string(),
+            device_id: "device-other".to_string(),
+            role: "write".to_string(),
+            scopes: vec![],
+            issued_at_ms: 102,
+        });
+
+        assert_eq!(store.tokens.len(), 3);
+
+        // Fill up to limit with newer devices
+        for i in 1..MAX_PAIRED_DEVICES {
+            store.add_paired_device(PairedDevice {
+                device_id: format!("device-{}", i),
+                public_key: format!("key-{}", i),
+                roles: vec!["write".to_string()],
+                scopes: vec![],
+                paired_at_ms: i as u64 + 1, // Newer than device-old
+            });
+        }
+
+        // Add one more to trigger eviction of device-old
+        store.add_paired_device(PairedDevice {
+            device_id: "device-new".to_string(),
+            public_key: "key-new".to_string(),
+            roles: vec!["write".to_string()],
+            scopes: vec![],
+            paired_at_ms: 1000,
+        });
+
+        // device-old should be evicted along with its tokens
+        assert!(!store.paired.contains_key("device-old"));
+        assert!(!store.tokens.contains_key("token-key-1"), "Token for evicted device should be removed");
+        assert!(!store.tokens.contains_key("token-key-2"), "Token for evicted device should be removed");
+        assert!(store.tokens.contains_key("token-key-3"), "Token for other device should remain");
     }
 }

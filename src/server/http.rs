@@ -412,7 +412,7 @@ async fn tools_invoke_handler(
     // For now, return not found for all tools except a mock "time" tool
     if tool_name == "time" {
         let result = json!({
-            "timestamp": chrono_now_mock(),
+            "timestamp": utc_now_iso8601(),
             "timezone": "UTC"
         });
         return (
@@ -441,10 +441,9 @@ async fn tools_invoke_handler(
         .into_response()
 }
 
-/// Mock timestamp function (replace with actual chrono implementation)
-fn chrono_now_mock() -> String {
-    // In real implementation, use chrono::Utc::now()
-    "2024-01-01T00:00:00Z".to_string()
+/// Get current UTC timestamp in ISO 8601 format
+fn utc_now_iso8601() -> String {
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 /// Check gateway authentication
