@@ -1,0 +1,29 @@
+[package]
+name = "rusty-clawd"
+version = "0.1.0"
+edition = "2021"
+description = "Rust rewrite of clawdbot gateway"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+tokio-tungstenite = "0.21"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+keyring = "2"
+tower = "0.4"
+tower-http = "0.5"
+wasmtime = "18"
+wit-bindgen = "0.22"
+
+[dev-dependencies]
+insta = { version = "1", features = ["json"] }
+tokio-test = "0.4"
+futures-util = "0.3"
+
+[[bin]]
+name = "rusty-clawd"
+path = "src/main.rs"

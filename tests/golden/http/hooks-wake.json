@@ -1,0 +1,251 @@
+{
+  "$schema": "golden-trace-v1",
+  "description": "HTTP /hooks/wake endpoint - triggers a wake event to wake Pi from sleep",
+  "source_files": [
+    "src/gateway/server-http.ts",
+    "src/gateway/hooks.ts"
+  ],
+  "endpoint": "/hooks/wake",
+  "method": "POST",
+  "authentication": {
+    "required": true,
+    "methods": [
+      "Authorization: Bearer <token>",
+      "X-Clawdbot-Token: <token>",
+      "?token=<token> (deprecated)"
+    ]
+  },
+  "request_schema": {
+    "type": "object",
+    "required": ["text"],
+    "properties": {
+      "text": {
+        "type": "string",
+        "description": "Message text to wake with (will be trimmed, must be non-empty after trim)"
+      },
+      "mode": {
+        "type": "string",
+        "enum": ["now", "next-heartbeat"],
+        "default": "now",
+        "description": "When to trigger wake - immediately or on next heartbeat cycle"
+      }
+    }
+  },
+  "response_schema": {
+    "success": {
+      "status": 200,
+      "body": {
+        "type": "object",
+        "required": ["ok", "mode"],
+        "properties": {
+          "ok": { "type": "boolean", "const": true },
+          "mode": { "type": "string", "enum": ["now", "next-heartbeat"] }
+        }
+      }
+    },
+    "error_validation": {
+      "status": 400,
+      "body": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean", "const": false },
+          "error": { "type": "string" }
+        }
+      }
+    },
+    "error_payload_too_large": {
+      "status": 413,
+      "body": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean", "const": false },
+          "error": { "type": "string", "const": "payload too large" }
+        }
+      }
+    }
+  },
+  "scenarios": [
+    {
+      "name": "wake_success_default_mode",
+      "description": "Successful wake with default mode (now)",
+      "request": {
+        "method": "POST",
+        "path": "/hooks/wake",
+        "headers": { "Authorization": "Bearer {{hooks_token}}" },
+        "body": { "text": "Hello from webhook" }
+      },
+      "response": {
+        "status": 200,
+        "body_schema": {
+          "type": "object",
+          "required": ["ok", "mode"],
+          "properties": {
+            "ok": { "const": true },
+            "mode": { "const": "now" }
+          }
+        }
+      }
+    },
+    {
+      "name": "wake_success_next_heartbeat",
+      "description": "Successful wake scheduled for next heartbeat",
+      "request": {
+        "method": "POST",
+        "path": "/hooks/wake",
+        "headers": { "Authorization": "Bearer {{hooks_token}}" },
+        "body": { "text": "Ping", "mode": "next-heartbeat" }
+      },
+      "response": {
+        "status": 200,
+        "body_schema": {
+          "properties": {
+            "ok": { "const": true },
+            "mode": { "const": "next-heartbeat" }
+          }
+        }
+      }
+    },
+    {
+      "name": "wake_success_text_trimmed",
+      "description": "Text is trimmed before validation",
+      "request": {
+        "method": "POST",
+        "path": "/hooks/wake",
+        "headers": { "Authorization": "Bearer {{hooks_token}}" },
+        "body": { "text": "  hello world  " }
+      },
+      "response": {
+        "status": 200,
+        "notes": ["text value received by dispatcher will be 'hello world'"]
+      }
+    },
+    {
+      "name": "wake_error_missing_text",
+      "description": "Missing text field returns validation error",
+      "request": {
+        "method": "POST",
+        "path": "/hooks/wake",
+        "headers": { "Authorization": "Bearer {{hooks_token}}" },
+        "body": {}
+      },
+      "response": {
+        "status": 400,
+        "body_schema": {
+          "properties": {
+            "ok": { "const": false },
+            "error": { "const": "text required" }
+          }
+        }
+      }
+    },
+    {
+      "name": "wake_error_blank_text",
+      "description": "Blank/whitespace-only text returns validation error",
+      "request": {
+        "method": "POST",
+        "path": "/hooks/wake",
+        "headers": { "Authorization": "Bearer {{hooks_token}}" },
+        "body": { "text": "   " }
+      },
+      "response": {
+        "status": 400,
+        "body_schema": {
+          "properties": {
+            "ok": { "const": false },
+            "error": { "const": "text required" }
+          }
+        }
+      }
+    },
+    {
+      "name": "wake_error_method_not_allowed",
+      "description": "Only POST method is allowed",
+      "request": { "method": "GET", "path": "/hooks/wake" },
+      "response": {
+        "status": 405,
+        "headers": { "Allow": "POST" },
+        "body": "Method Not Allowed"
+      }
+    },
+    {
+      "name": "wake_error_payload_too_large",
+      "description": "Payload exceeding maxBodyBytes (default 256KB) is rejected",
+      "request": {
+        "method": "POST",
+        "path": "/hooks/wake",
+        "headers": { "Authorization": "Bearer {{hooks_token}}" },
+        "body_note": "Payload exceeding 256KB (hooks.maxBodyBytes configurable)"
+      },
+      "response": {
+        "status": 413,
+        "body_schema": {
+          "properties": {
+            "ok": { "const": false },
+            "error": { "const": "payload too large" }
+          }
+        }
+      }
+    },
+    {
+      "name": "wake_error_invalid_json",
+      "description": "Malformed JSON body returns parse error",
+      "request": {
+        "method": "POST",
+        "path": "/hooks/wake",
+        "headers": {
+          "Authorization": "Bearer {{hooks_token}}",
+          "Content-Type": "application/json"
+        },
+        "body_raw": "{ invalid json }"
+      },
+      "response": {
+        "status": 400,
+        "body_schema": {
+          "properties": {
+            "ok": { "const": false },
+            "error": { "type": "string", "pattern": "SyntaxError" }
+          }
+        }
+      }
+    },
+    {
+      "name": "wake_empty_body",
+      "description": "Empty body is treated as empty object",
+      "request": {
+        "method": "POST",
+        "path": "/hooks/wake",
+        "headers": { "Authorization": "Bearer {{hooks_token}}" },
+        "body_raw": ""
+      },
+      "response": {
+        "status": 400,
+        "body_schema": {
+          "properties": {
+            "ok": { "const": false },
+            "error": { "const": "text required" }
+          }
+        }
+      }
+    },
+    {
+      "name": "wake_invalid_mode_treated_as_now",
+      "description": "Invalid mode value defaults to 'now'",
+      "request": {
+        "method": "POST",
+        "path": "/hooks/wake",
+        "headers": { "Authorization": "Bearer {{hooks_token}}" },
+        "body": { "text": "test", "mode": "invalid" }
+      },
+      "response": {
+        "status": 200,
+        "body_schema": {
+          "properties": {
+            "ok": { "const": true },
+            "mode": { "const": "now" }
+          }
+        }
+      },
+      "notes": ["Only 'next-heartbeat' is specially handled; all other values become 'now'"]
+    }
+  ]
+}
