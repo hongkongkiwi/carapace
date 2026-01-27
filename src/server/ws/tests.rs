@@ -850,7 +850,10 @@ fn test_handle_node_pair_request_with_extended_fields() {
     assert_eq!(request["modelIdentifier"], "iPhone14,2");
     assert_eq!(request["caps"], json!(["audio", "camera", "location"]));
     assert_eq!(request["commands"], json!(["system.run", "camera.snap"]));
-    assert_eq!(request["permissions"], json!({ "camera": true, "location": false }));
+    assert_eq!(
+        request["permissions"],
+        json!({ "camera": true, "location": false })
+    );
     assert_eq!(request["remoteIp"], "192.168.1.100");
     assert_eq!(request["silent"], true);
     assert_eq!(request["isRepair"], false);
@@ -1027,7 +1030,8 @@ fn test_handle_node_pair_verify_includes_extended_fields() {
     });
     let request_response = handle_node_pair_request(Some(&request_params), &state).unwrap();
     let request_id = request_response["request"]["requestId"].as_str().unwrap();
-    let approve_response = handle_node_pair_approve(Some(&json!({ "requestId": request_id })), &state).unwrap();
+    let approve_response =
+        handle_node_pair_approve(Some(&json!({ "requestId": request_id })), &state).unwrap();
     let token = approve_response["node"]["token"].as_str().unwrap();
 
     // Verify should include extended fields in the node response

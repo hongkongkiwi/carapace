@@ -182,15 +182,13 @@ pub(super) fn handle_voicewake_set(
     let raw_triggers: Vec<String> = triggers_array
         .iter()
         .map(|v| {
-            v.as_str()
-                .map(|s| s.to_string())
-                .ok_or_else(|| {
-                    error_shape(
-                        ERROR_INVALID_REQUEST,
-                        "triggers must be an array of strings",
-                        None,
-                    )
-                })
+            v.as_str().map(|s| s.to_string()).ok_or_else(|| {
+                error_shape(
+                    ERROR_INVALID_REQUEST,
+                    "triggers must be an array of strings",
+                    None,
+                )
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
 

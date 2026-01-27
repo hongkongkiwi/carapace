@@ -197,14 +197,12 @@ fn get_method_required_role(method: &str) -> &'static str {
         | "chat.send" | "chat.abort" | "tts.enable" | "tts.disable" | "tts.convert"
         | "tts.setProvider" | "tts.setVoice" | "tts.configure" | "tts.speak" | "tts.stop"
         | "voicewake.set" | "voicewake.enable" | "voicewake.disable" | "voicewake.test"
-        | "wizard.start" | "wizard.next" | "wizard.back" | "wizard.cancel"
-        | "talk.mode" | "talk.start" | "talk.stop" | "talk.configure"
-        | "skills.install" | "skills.update"
+        | "wizard.start" | "wizard.next" | "wizard.back" | "wizard.cancel" | "talk.mode"
+        | "talk.start" | "talk.stop" | "talk.configure" | "skills.install" | "skills.update"
         | "update.run" | "update.check" | "update.setChannel" | "update.configure"
-        | "update.install" | "update.dismiss"
-        | "usage.enable" | "usage.disable" | "usage.reset"
-        | "cron.add" | "cron.update" | "cron.remove" | "cron.run" | "node.invoke"
-        | "set-heartbeats" | "wake" | "send" => "write",
+        | "update.install" | "update.dismiss" | "usage.enable" | "usage.disable"
+        | "usage.reset" | "cron.add" | "cron.update" | "cron.remove" | "cron.run"
+        | "node.invoke" | "set-heartbeats" | "wake" | "send" => "write",
 
         // system-presence is read-only (lists system presence)
         "system-presence" => "read",
