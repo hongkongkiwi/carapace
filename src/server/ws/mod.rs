@@ -1,0 +1,1966 @@
+//! WebSocket server implementation
+//!
+//! Implements the gateway WebSocket protocol (handshake + framing + auth).
+
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, State};
+use axum::http::HeaderMap;
+use axum::response::IntoResponse;
+use base64::Engine as _;
+use ed25519_dalek::{Signature, VerifyingKey};
+use futures_util::{SinkExt, StreamExt};
+use parking_lot::Mutex;
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
+use std::env;
+use std::fs;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::LazyLock;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::{mpsc, oneshot};
+use tracing::warn;
+use uuid::Uuid;
+
+use crate::{auth, channels, config, credentials, devices, messages, nodes, sessions};
+
+mod handlers;
+mod tests;
+
+use handlers::*;
+
+const PROTOCOL_VERSION: u32 = 3;
+const MAX_PAYLOAD_BYTES: usize = 512 * 1024;
+const MAX_BUFFERED_BYTES: usize = (1024 * 1024 * 3) / 2;
+const TICK_INTERVAL_MS: u64 = 30_000;
+const HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
+const SIGNATURE_SKEW_MS: i64 = 600_000;
+const LOGS_DEFAULT_LIMIT: usize = 500;
+const LOGS_DEFAULT_MAX_BYTES: usize = 250_000;
+const LOGS_MAX_LIMIT: usize = 5_000;
+const LOGS_MAX_BYTES: usize = 1_000_000;
+
+const ERROR_INVALID_REQUEST: &str = "INVALID_REQUEST";
+const ERROR_NOT_PAIRED: &str = "NOT_PAIRED";
+const ERROR_UNAVAILABLE: &str = "UNAVAILABLE";
+const ERROR_FORBIDDEN: &str = "FORBIDDEN";
+
+const ALLOWED_CLIENT_IDS: [&str; 12] = [
+    "webchat-ui",
+    "clawdbot-control-ui",
+    "webchat",
+    "cli",
+    "gateway-client",
+    "clawdbot-macos",
+    "clawdbot-ios",
+    "clawdbot-android",
+    "node-host",
+    "test",
+    "fingerprint",
+    "clawdbot-probe",
+];
+
+const ALLOWED_CLIENT_MODES: [&str; 7] =
+    ["webchat", "cli", "ui", "backend", "node", "probe", "test"];
+
+const GATEWAY_METHODS: [&str; 79] = [
+    "health",
+    "status",
+    "logs.tail",
+    "channels.status",
+    "channels.logout",
+    "config.get",
+    "config.set",
+    "config.apply",
+    "config.patch",
+    "config.schema",
+    "agent",
+    "agent.identity.get",
+    "agent.wait",
+    "chat.send",
+    "chat.history",
+    "chat.abort",
+    "sessions.list",
+    "sessions.preview",
+    "sessions.patch",
+    "sessions.reset",
+    "sessions.delete",
+    "sessions.compact",
+    "tts.status",
+    "tts.providers",
+    "tts.enable",
+    "tts.disable",
+    "tts.convert",
+    "tts.setProvider",
+    "voicewake.get",
+    "voicewake.set",
+    "wizard.start",
+    "wizard.next",
+    "wizard.cancel",
+    "wizard.status",
+    "talk.mode",
+    "models.list",
+    "agents.list",
+    "skills.status",
+    "skills.bins",
+    "skills.install",
+    "skills.update",
+    "update.run",
+    "cron.status",
+    "cron.list",
+    "cron.add",
+    "cron.update",
+    "cron.remove",
+    "cron.run",
+    "cron.runs",
+    "node.pair.request",
+    "node.pair.list",
+    "node.pair.approve",
+    "node.pair.reject",
+    "node.pair.verify",
+    "node.rename",
+    "node.list",
+    "node.describe",
+    "node.invoke",
+    "node.invoke.result",
+    "node.event",
+    "device.pair.list",
+    "device.pair.approve",
+    "device.pair.reject",
+    "device.token.rotate",
+    "device.token.revoke",
+    "exec.approvals.get",
+    "exec.approvals.set",
+    "exec.approvals.node.get",
+    "exec.approvals.node.set",
+    "exec.approval.request",
+    "exec.approval.resolve",
+    "usage.status",
+    "usage.cost",
+    "last-heartbeat",
+    "set-heartbeats",
+    "wake",
+    "send",
+    "system-presence",
+    "system-event",
+];
+
+const GATEWAY_EVENTS: [&str; 18] = [
+    "connect.challenge",
+    "agent",
+    "chat",
+    "presence",
+    "tick",
+    "talk.mode",
+    "shutdown",
+    "health",
+    "heartbeat",
+    "cron",
+    "node.pair.requested",
+    "node.pair.resolved",
+    "node.invoke.request",
+    "device.pair.requested",
+    "device.pair.resolved",
+    "voicewake.changed",
+    "exec.approval.requested",
+    "exec.approval.resolved",
+];
+
+#[derive(Clone, Debug)]
+pub struct WsAuthConfig {
+    pub resolved: auth::ResolvedGatewayAuth,
+}
+
+impl Default for WsAuthConfig {
+    fn default() -> Self {
+        Self {
+            resolved: auth::ResolvedGatewayAuth::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct WsServerConfig {
+    pub auth: WsAuthConfig,
+    pub policy: WsPolicy,
+    pub trusted_proxies: Vec<String>,
+    pub control_ui_allow_insecure_auth: bool,
+    pub control_ui_disable_device_auth: bool,
+    pub node_allow_commands: Vec<String>,
+    pub node_deny_commands: Vec<String>,
+}
+
+impl Default for WsServerConfig {
+    fn default() -> Self {
+        Self {
+            auth: WsAuthConfig::default(),
+            policy: WsPolicy::default(),
+            trusted_proxies: Vec::new(),
+            control_ui_allow_insecure_auth: false,
+            control_ui_disable_device_auth: false,
+            node_allow_commands: Vec::new(),
+            node_deny_commands: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct WsPolicy {
+    pub max_payload: usize,
+    pub max_buffered_bytes: usize,
+    pub tick_interval_ms: u64,
+}
+
+impl Default for WsPolicy {
+    fn default() -> Self {
+        Self {
+            max_payload: MAX_PAYLOAD_BYTES,
+            max_buffered_bytes: MAX_BUFFERED_BYTES,
+            tick_interval_ms: TICK_INTERVAL_MS,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct WsServerState {
+    config: WsServerConfig,
+    start_time: Instant,
+    device_registry: Arc<devices::DevicePairingRegistry>,
+    node_registry: Mutex<NodeRegistry>,
+    node_pairing: Arc<nodes::NodePairingRegistry>,
+    connections: Mutex<HashMap<String, ConnectionHandle>>,
+    channel_registry: Arc<channels::ChannelRegistry>,
+    message_pipeline: Arc<messages::outbound::MessagePipeline>,
+    session_store: Arc<sessions::SessionStore>,
+    event_seq: Mutex<u64>,
+}
+
+impl WsServerState {
+    pub fn new(config: WsServerConfig) -> Self {
+        Self {
+            config,
+            start_time: Instant::now(),
+            device_registry: Arc::new(devices::DevicePairingRegistry::in_memory()),
+            node_registry: Mutex::new(NodeRegistry::default()),
+            node_pairing: Arc::new(nodes::NodePairingRegistry::in_memory()),
+            connections: Mutex::new(HashMap::new()),
+            channel_registry: channels::create_registry(),
+            message_pipeline: messages::outbound::create_pipeline(),
+            session_store: Arc::new(sessions::SessionStore::with_base_path(
+                resolve_state_dir().join("sessions"),
+            )),
+            event_seq: Mutex::new(0),
+        }
+    }
+
+    pub fn new_persistent(
+        config: WsServerConfig,
+        state_dir: PathBuf,
+    ) -> Result<Self, WsConfigError> {
+        let node_pairing = nodes::create_registry(state_dir.clone())?;
+        let device_registry = devices::create_registry(state_dir.clone())?;
+        Ok(Self {
+            config,
+            start_time: Instant::now(),
+            device_registry,
+            node_registry: Mutex::new(NodeRegistry::default()),
+            node_pairing,
+            connections: Mutex::new(HashMap::new()),
+            channel_registry: channels::create_registry(),
+            message_pipeline: messages::outbound::create_pipeline(),
+            session_store: Arc::new(sessions::SessionStore::with_base_path(
+                state_dir.join("sessions"),
+            )),
+            event_seq: Mutex::new(0),
+        })
+    }
+
+    pub fn with_node_pairing(mut self, registry: Arc<nodes::NodePairingRegistry>) -> Self {
+        self.node_pairing = registry;
+        self
+    }
+
+    pub fn with_device_registry(mut self, registry: Arc<devices::DevicePairingRegistry>) -> Self {
+        self.device_registry = registry;
+        self
+    }
+
+    fn next_event_seq(&self) -> u64 {
+        let mut guard = self.event_seq.lock();
+        *guard += 1;
+        *guard
+    }
+
+    fn register_connection(&self, conn: &ConnectionContext, tx: mpsc::UnboundedSender<Message>) {
+        let mut conns = self.connections.lock();
+        conns.insert(
+            conn.conn_id.clone(),
+            ConnectionHandle {
+                role: conn.role.clone(),
+                scopes: conn.scopes.clone(),
+                tx,
+            },
+        );
+    }
+
+    fn unregister_connection(&self, conn_id: &str) {
+        let mut conns = self.connections.lock();
+        conns.remove(conn_id);
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum WsConfigError {
+    #[error(transparent)]
+    Config(#[from] config::ConfigError),
+    #[error(transparent)]
+    Credentials(#[from] credentials::CredentialError),
+    #[error(transparent)]
+    Nodes(#[from] nodes::NodePairingError),
+    #[error(transparent)]
+    Devices(#[from] devices::DevicePairingError),
+}
+
+pub async fn build_ws_state_from_config() -> Result<Arc<WsServerState>, WsConfigError> {
+    let config = build_ws_config_from_files().await?;
+    let state_dir = resolve_state_dir();
+    Ok(Arc::new(WsServerState::new_persistent(config, state_dir)?))
+}
+
+pub async fn build_ws_config_from_files() -> Result<WsServerConfig, WsConfigError> {
+    let cfg = config::load_config()?;
+    let gateway = cfg.get("gateway").and_then(|v| v.as_object());
+    let auth_obj = gateway
+        .and_then(|g| g.get("auth"))
+        .and_then(|v| v.as_object());
+    let tailscale_obj = gateway
+        .and_then(|g| g.get("tailscale"))
+        .and_then(|v| v.as_object());
+    let control_ui_obj = gateway
+        .and_then(|g| g.get("controlUi"))
+        .and_then(|v| v.as_object());
+    let nodes_obj = gateway
+        .and_then(|g| g.get("nodes"))
+        .and_then(|v| v.as_object());
+
+    let mode = auth_obj
+        .and_then(|o| o.get("mode"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+
+    let token_cfg = auth_obj
+        .and_then(|o| o.get("token"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let password_cfg = auth_obj
+        .and_then(|o| o.get("password"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let allow_tailscale_cfg = auth_obj
+        .and_then(|o| o.get("allowTailscale"))
+        .and_then(|v| v.as_bool());
+
+    let tailscale_mode = tailscale_obj
+        .and_then(|o| o.get("mode"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("off");
+
+    let env_token = env::var("CLAWDBOT_GATEWAY_TOKEN").ok();
+    let env_password = env::var("CLAWDBOT_GATEWAY_PASSWORD").ok();
+
+    let state_dir = resolve_state_dir();
+    let creds = match credentials::read_gateway_auth(state_dir).await {
+        Ok(creds) => creds,
+        Err(err) => {
+            warn!("failed to read gateway credentials: {}", err);
+            credentials::GatewayAuthSecrets::default()
+        }
+    };
+    let token = env_token.or(token_cfg).or(creds.token);
+    let password = env_password.or(password_cfg).or(creds.password);
+
+    let resolved_mode = match mode {
+        "password" => auth::AuthMode::Password,
+        "token" => auth::AuthMode::Token,
+        _ => {
+            if password.is_some() {
+                auth::AuthMode::Password
+            } else {
+                auth::AuthMode::Token
+            }
+        }
+    };
+
+    let allow_tailscale = allow_tailscale_cfg.unwrap_or_else(|| {
+        tailscale_mode == "serve" && !matches!(resolved_mode, auth::AuthMode::Password)
+    });
+
+    let trusted_proxies = gateway
+        .and_then(|g| g.get("trustedProxies"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let control_ui_allow_insecure_auth = control_ui_obj
+        .and_then(|o| o.get("allowInsecureAuth"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let control_ui_disable_device_auth = control_ui_obj
+        .and_then(|o| o.get("dangerouslyDisableDeviceAuth"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let node_allow_commands = nodes_obj
+        .and_then(|o| o.get("allowCommands"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let node_deny_commands = nodes_obj
+        .and_then(|o| o.get("denyCommands"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Ok(WsServerConfig {
+        auth: WsAuthConfig {
+            resolved: auth::ResolvedGatewayAuth {
+                mode: resolved_mode,
+                token,
+                password,
+                allow_tailscale,
+            },
+        },
+        policy: WsPolicy::default(),
+        trusted_proxies,
+        control_ui_allow_insecure_auth,
+        control_ui_disable_device_auth,
+        node_allow_commands,
+        node_deny_commands,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct NodeSession {
+    node_id: String,
+    conn_id: String,
+    display_name: Option<String>,
+    platform: Option<String>,
+    version: Option<String>,
+    device_family: Option<String>,
+    model_identifier: Option<String>,
+    remote_ip: Option<String>,
+    caps: Vec<String>,
+    commands: HashSet<String>,
+    permissions: Option<HashMap<String, bool>>,
+    path_env: Option<String>,
+    connected_at_ms: u64,
+}
+
+#[derive(Debug)]
+struct PendingInvoke {
+    node_id: String,
+    command: String,
+    responder: oneshot::Sender<NodeInvokeResult>,
+}
+
+#[derive(Debug, Clone)]
+struct NodeInvokeError {
+    code: Option<String>,
+    message: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct NodeInvokeResult {
+    ok: bool,
+    payload: Option<Value>,
+    payload_json: Option<String>,
+    error: Option<NodeInvokeError>,
+}
+
+#[derive(Debug, Default)]
+struct NodeRegistry {
+    nodes_by_id: HashMap<String, NodeSession>,
+    nodes_by_conn: HashMap<String, String>,
+    pending_invokes: HashMap<String, PendingInvoke>,
+}
+
+impl NodeRegistry {
+    fn register(&mut self, session: NodeSession) {
+        let conn_id = session.conn_id.clone();
+        let node_id = session.node_id.clone();
+        if let Some(existing) = self.nodes_by_conn.remove(&conn_id) {
+            self.nodes_by_id.remove(&existing);
+        }
+        if let Some(existing_conn) = self.nodes_by_conn.iter().find_map(|(conn, id)| {
+            if id == &node_id {
+                Some(conn.clone())
+            } else {
+                None
+            }
+        }) {
+            self.nodes_by_conn.remove(&existing_conn);
+        }
+        self.nodes_by_id.insert(node_id.clone(), session);
+        self.nodes_by_conn.insert(conn_id, node_id);
+    }
+
+    fn unregister(&mut self, conn_id: &str) -> Option<String> {
+        let node_id = self.nodes_by_conn.remove(conn_id)?;
+        self.nodes_by_id.remove(&node_id);
+        let pending: Vec<String> = self
+            .pending_invokes
+            .iter()
+            .filter_map(|(invoke_id, pending)| {
+                if pending.node_id == node_id {
+                    Some(invoke_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for invoke_id in pending {
+            if let Some(pending) = self.pending_invokes.remove(&invoke_id) {
+                let _ = pending.responder.send(NodeInvokeResult {
+                    ok: false,
+                    payload: None,
+                    payload_json: None,
+                    error: Some(NodeInvokeError {
+                        code: Some("NOT_CONNECTED".to_string()),
+                        message: Some("node disconnected".to_string()),
+                    }),
+                });
+            }
+        }
+        Some(node_id)
+    }
+
+    fn get(&self, node_id: &str) -> Option<&NodeSession> {
+        self.nodes_by_id.get(node_id)
+    }
+
+    fn list_connected(&self) -> Vec<NodeSession> {
+        self.nodes_by_id.values().cloned().collect()
+    }
+
+    fn conn_id_for_node(&self, node_id: &str) -> Option<String> {
+        self.nodes_by_id
+            .get(node_id)
+            .map(|session| session.conn_id.clone())
+    }
+
+    fn insert_pending_invoke(&mut self, invoke_id: String, pending: PendingInvoke) {
+        self.pending_invokes.insert(invoke_id, pending);
+    }
+
+    fn remove_pending_invoke(&mut self, invoke_id: &str) -> Option<PendingInvoke> {
+        self.pending_invokes.remove(invoke_id)
+    }
+
+    fn resolve_invoke(&mut self, invoke_id: &str, node_id: &str, result: NodeInvokeResult) -> bool {
+        let Some(pending) = self.pending_invokes.get(invoke_id) else {
+            return false;
+        };
+        if pending.node_id != node_id {
+            return false;
+        }
+        let Some(pending) = self.pending_invokes.remove(invoke_id) else {
+            return false;
+        };
+        let _ = pending.responder.send(result);
+        true
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectParams {
+    min_protocol: u32,
+    max_protocol: u32,
+    client: ClientInfo,
+    #[serde(default)]
+    caps: Option<Vec<String>>,
+    #[serde(default)]
+    commands: Option<Vec<String>>,
+    #[serde(default)]
+    permissions: Option<HashMap<String, bool>>,
+    #[serde(default)]
+    path_env: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    scopes: Option<Vec<String>>,
+    #[serde(default)]
+    device: Option<DeviceIdentity>,
+    #[serde(default)]
+    auth: Option<AuthParams>,
+    #[serde(default)]
+    locale: Option<String>,
+    #[serde(default)]
+    user_agent: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ClientInfo {
+    id: String,
+    version: String,
+    platform: String,
+    mode: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    device_family: Option<String>,
+    #[serde(default)]
+    model_identifier: Option<String>,
+    #[serde(default)]
+    instance_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DeviceIdentity {
+    id: String,
+    public_key: String,
+    signature: String,
+    signed_at: i64,
+    #[serde(default)]
+    nonce: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AuthParams {
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct ErrorShape {
+    code: &'static str,
+    message: String,
+    retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponseFrame<'a> {
+    #[serde(rename = "type")]
+    frame_type: &'a str,
+    id: &'a str,
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<ErrorShape>,
+}
+
+#[derive(Debug, Serialize)]
+struct EventFrame<'a> {
+    #[serde(rename = "type")]
+    frame_type: &'a str,
+    event: &'a str,
+    payload: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "stateVersion")]
+    state_version: Option<StateVersion>,
+}
+
+#[derive(Debug, Serialize)]
+struct StateVersion {
+    presence: u64,
+    health: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct HelloOkPayload {
+    #[serde(rename = "type")]
+    payload_type: &'static str,
+    protocol: u32,
+    server: ServerInfo,
+    features: Features,
+    snapshot: Snapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    canvas_host_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth: Option<DeviceTokenInfo>,
+    policy: PolicyInfo,
+}
+
+#[derive(Debug, Serialize)]
+struct ServerInfo {
+    version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commit: Option<String>,
+    host: String,
+    conn_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct Features {
+    methods: Vec<String>,
+    events: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct Snapshot {
+    presence: Vec<Value>,
+    health: Value,
+    #[serde(rename = "stateVersion")]
+    state_version: StateVersion,
+    #[serde(rename = "uptimeMs")]
+    uptime_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_defaults: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct PolicyInfo {
+    #[serde(rename = "maxPayload")]
+    max_payload: usize,
+    #[serde(rename = "maxBufferedBytes")]
+    max_buffered_bytes: usize,
+    #[serde(rename = "tickIntervalMs")]
+    tick_interval_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct DeviceTokenInfo {
+    #[serde(rename = "deviceToken")]
+    device_token: String,
+    role: String,
+    scopes: Vec<String>,
+    #[serde(rename = "issuedAtMs")]
+    issued_at_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ConnectionContext {
+    conn_id: String,
+    role: String,
+    scopes: Vec<String>,
+    client: ClientInfo,
+    device_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ConnectionHandle {
+    role: String,
+    scopes: Vec<String>,
+    tx: mpsc::UnboundedSender<Message>,
+}
+
+pub async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<WsServerState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_socket(socket, state, addr, headers))
+}
+
+async fn handle_socket(
+    socket: WebSocket,
+    state: Arc<WsServerState>,
+    remote_addr: SocketAddr,
+    headers: HeaderMap,
+) {
+    let (mut sender, mut receiver) = socket.split();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+
+    let send_task = tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if sender.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let nonce = Uuid::new_v4().to_string();
+    let challenge = EventFrame {
+        frame_type: "event",
+        event: "connect.challenge",
+        payload: json!({ "nonce": nonce, "ts": now_ms() }),
+        seq: None,
+        state_version: None,
+    };
+    let _ = send_json(&tx, &challenge);
+
+    let text = match recv_text_with_timeout(&mut receiver, HANDSHAKE_TIMEOUT_MS).await {
+        Ok(Some(text)) => text,
+        Ok(None) => return,
+        Err(reason) => {
+            if reason == "handshake timeout" {
+                let _ = send_close(&tx, 1000, "");
+            } else {
+                let _ = send_close(&tx, 1008, reason);
+            }
+            return;
+        }
+    };
+
+    if text.as_bytes().len() > MAX_PAYLOAD_BYTES {
+        let _ = send_close(&tx, 1008, "payload too large");
+        return;
+    }
+
+    let parsed = match serde_json::from_str::<Value>(&text) {
+        Ok(val) => val,
+        Err(_) => {
+            let _ = send_close(&tx, 1008, "invalid request frame");
+            return;
+        }
+    };
+
+    let ParsedRequest {
+        id: req_id,
+        method,
+        params,
+    } = match parse_request_frame(&parsed) {
+        Ok(req) => req,
+        Err(err) => {
+            let close_reason = err.error.message.clone();
+            if let Some(id) = err.id {
+                let _ = send_response(&tx, &id, false, None, Some(err.error));
+            }
+            let _ = send_close(&tx, 1008, &close_reason);
+            return;
+        }
+    };
+
+    if method != "connect" {
+        let err = error_shape(
+            ERROR_INVALID_REQUEST,
+            "invalid handshake: first request must be connect",
+            None,
+        );
+        let _ = send_response(&tx, &req_id, false, None, Some(err));
+        let _ = send_close(
+            &tx,
+            1008,
+            "invalid handshake: first request must be connect",
+        );
+        return;
+    }
+
+    let mut connect_params = match params {
+        Some(value) => match serde_json::from_value::<ConnectParams>(value) {
+            Ok(val) => val,
+            Err(_) => {
+                let err = error_shape(ERROR_INVALID_REQUEST, "invalid connect params", None);
+                let _ = send_response(&tx, &req_id, false, None, Some(err));
+                let _ = send_close(&tx, 1008, "invalid connect params");
+                return;
+            }
+        },
+        None => {
+            let err = error_shape(ERROR_INVALID_REQUEST, "invalid connect params", None);
+            let _ = send_response(&tx, &req_id, false, None, Some(err));
+            let _ = send_close(&tx, 1008, "invalid connect params");
+            return;
+        }
+    };
+
+    if connect_params.min_protocol == 0 || connect_params.max_protocol == 0 {
+        let err = error_shape(ERROR_INVALID_REQUEST, "invalid connect params", None);
+        let _ = send_response(&tx, &req_id, false, None, Some(err));
+        let _ = send_close(&tx, 1008, "invalid connect params");
+        return;
+    }
+
+    if !ALLOWED_CLIENT_IDS.contains(&connect_params.client.id.as_str())
+        || !ALLOWED_CLIENT_MODES.contains(&connect_params.client.mode.as_str())
+        || connect_params.client.version.trim().is_empty()
+        || connect_params.client.platform.trim().is_empty()
+    {
+        let err = error_shape(ERROR_INVALID_REQUEST, "invalid connect params", None);
+        let _ = send_response(&tx, &req_id, false, None, Some(err));
+        let _ = send_close(&tx, 1008, "invalid connect params");
+        return;
+    }
+
+    if connect_params.max_protocol < PROTOCOL_VERSION
+        || connect_params.min_protocol > PROTOCOL_VERSION
+    {
+        let err = error_shape(
+            ERROR_INVALID_REQUEST,
+            "protocol mismatch",
+            Some(json!({ "expectedProtocol": PROTOCOL_VERSION })),
+        );
+        let _ = send_response(&tx, &req_id, false, None, Some(err));
+        let _ = send_close(&tx, 1002, "protocol mismatch");
+        return;
+    }
+
+    let is_local =
+        auth::is_local_direct_request(remote_addr, &headers, &state.config.trusted_proxies);
+    let role = connect_params
+        .role
+        .clone()
+        .unwrap_or_else(|| "operator".to_string());
+    if role != "operator" && role != "node" {
+        let err = error_shape(ERROR_INVALID_REQUEST, "invalid role", None);
+        let _ = send_response(&tx, &req_id, false, None, Some(err));
+        let _ = send_close(&tx, 1008, "invalid role");
+        return;
+    }
+    let requested_scopes = connect_params.scopes.clone().unwrap_or_default();
+    let scopes = if requested_scopes.is_empty() && role == "operator" {
+        vec!["operator.admin".to_string()]
+    } else {
+        requested_scopes
+    };
+    connect_params.role = Some(role.clone());
+    connect_params.scopes = Some(scopes.clone());
+
+    let has_token_auth = connect_params
+        .auth
+        .as_ref()
+        .and_then(|a| a.token.as_ref())
+        .is_some();
+    let has_password_auth = connect_params
+        .auth
+        .as_ref()
+        .and_then(|a| a.password.as_ref())
+        .is_some();
+    let is_control_ui = connect_params.client.id == "clawdbot-control-ui";
+    let allow_control_ui_bypass = is_control_ui
+        && (state.config.control_ui_allow_insecure_auth
+            || state.config.control_ui_disable_device_auth);
+    let device_required = !(is_control_ui && state.config.control_ui_disable_device_auth);
+    if connect_params.device.is_none() && device_required {
+        let can_skip_device = if allow_control_ui_bypass {
+            has_token_auth || has_password_auth
+        } else {
+            is_local && has_token_auth
+        };
+        if !can_skip_device {
+            let err = error_shape(ERROR_NOT_PAIRED, "device identity required", None);
+            let _ = send_response(&tx, &req_id, false, None, Some(err));
+            let _ = send_close(&tx, 1008, "device identity required");
+            return;
+        }
+    }
+
+    let device_opt = if is_control_ui && state.config.control_ui_disable_device_auth {
+        None
+    } else {
+        connect_params.device.as_ref()
+    };
+
+    let device_id = match device_opt {
+        Some(device) => {
+            if let Err(err) = validate_device_identity(device, &connect_params, &nonce, is_local) {
+                let err_clone = err.clone();
+                let _ = send_response(&tx, &req_id, false, None, Some(err));
+                let _ = send_close(&tx, 1008, err_clone.message.as_str());
+                return;
+            }
+            Some(device.id.clone())
+        }
+        None => None,
+    };
+
+    if let Err(err) = authorize_connection(
+        &state,
+        &connect_params,
+        &headers,
+        remote_addr,
+        device_id.as_deref(),
+        &role,
+        &scopes,
+    ) {
+        let _ = send_response(&tx, &req_id, false, None, Some(err.clone()));
+        let _ = send_close(&tx, 1008, err.message.as_str());
+        return;
+    }
+
+    if let Some(device) = device_opt {
+        if let Err(err) = ensure_paired(
+            &state,
+            device,
+            &connect_params,
+            &role,
+            &scopes,
+            is_local,
+            remote_addr,
+        ) {
+            let _ = send_response(&tx, &req_id, false, None, Some(err.clone()));
+            let _ = send_close(&tx, 1008, err.message.as_str());
+            return;
+        }
+    }
+
+    let conn_id = Uuid::new_v4().to_string();
+    let issued_token = device_id
+        .as_ref()
+        .map(|id| ensure_device_token(&state, id, &role, &scopes));
+
+    if role == "node" {
+        let allowlist = resolve_node_command_allowlist(
+            &state.config.node_allow_commands,
+            &state.config.node_deny_commands,
+            Some(connect_params.client.platform.as_str()),
+            connect_params.client.device_family.as_deref(),
+        );
+        let declared = connect_params.commands.clone().unwrap_or_default();
+        let filtered = declared
+            .into_iter()
+            .map(|cmd| cmd.trim().to_string())
+            .filter(|cmd| !cmd.is_empty() && allowlist.contains(cmd))
+            .collect::<Vec<_>>();
+        connect_params.commands = Some(filtered);
+    }
+
+    if role == "node" {
+        let node_id = device_id
+            .clone()
+            .unwrap_or_else(|| connect_params.client.id.clone());
+        let commands = connect_params
+            .commands
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<HashSet<String>>();
+        let remote_ip = if is_local {
+            None
+        } else {
+            Some(remote_addr.ip().to_string())
+        };
+        state.node_registry.lock().register(NodeSession {
+            node_id,
+            conn_id: conn_id.clone(),
+            display_name: connect_params.client.display_name.clone(),
+            platform: Some(connect_params.client.platform.clone()),
+            version: Some(connect_params.client.version.clone()),
+            device_family: connect_params.client.device_family.clone(),
+            model_identifier: connect_params.client.model_identifier.clone(),
+            remote_ip,
+            caps: connect_params.caps.clone().unwrap_or_default(),
+            commands,
+            permissions: connect_params.permissions.clone(),
+            path_env: connect_params.path_env.clone(),
+            connected_at_ms: now_ms(),
+        });
+    }
+
+    let hello = HelloOkPayload {
+        payload_type: "hello-ok",
+        protocol: PROTOCOL_VERSION,
+        server: ServerInfo {
+            version: server_version(),
+            commit: server_commit(),
+            host: server_hostname(),
+            conn_id: conn_id.clone(),
+        },
+        features: Features {
+            methods: GATEWAY_METHODS.iter().map(|s| s.to_string()).collect(),
+            events: GATEWAY_EVENTS.iter().map(|s| s.to_string()).collect(),
+        },
+        snapshot: Snapshot {
+            presence: Vec::new(),
+            health: json!({}),
+            state_version: StateVersion {
+                presence: 0,
+                health: 0,
+            },
+            uptime_ms: state.start_time.elapsed().as_millis() as u64,
+            config_path: None,
+            state_dir: None,
+            session_defaults: None,
+        },
+        canvas_host_url: None,
+        auth: issued_token.map(|token| DeviceTokenInfo {
+            device_token: token.token,
+            role: token.role,
+            scopes: token.scopes,
+            issued_at_ms: token.issued_at_ms,
+        }),
+        policy: PolicyInfo {
+            max_payload: state.config.policy.max_payload,
+            max_buffered_bytes: state.config.policy.max_buffered_bytes,
+            tick_interval_ms: state.config.policy.tick_interval_ms,
+        },
+    };
+
+    let _ = send_response(&tx, &req_id, true, Some(json!(hello)), None);
+
+    let conn = ConnectionContext {
+        conn_id: conn_id.clone(),
+        role,
+        scopes,
+        client: connect_params.client.clone(),
+        device_id,
+    };
+
+    state.register_connection(&conn, tx.clone());
+
+    let tick_tx = tx.clone();
+    let tick_state = state.clone();
+    let tick_task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(TICK_INTERVAL_MS));
+        loop {
+            ticker.tick().await;
+            let event = EventFrame {
+                frame_type: "event",
+                event: "tick",
+                payload: json!({ "ts": now_ms() }),
+                seq: Some(tick_state.next_event_seq()),
+                state_version: None,
+            };
+            if send_json(&tick_tx, &event).is_err() {
+                break;
+            }
+        }
+    });
+
+    while let Some(next) = receiver.next().await {
+        let msg = match next {
+            Ok(msg) => msg,
+            Err(_) => break,
+        };
+        let text = match message_to_text(msg) {
+            Ok(InboundText::Text(text)) => text,
+            Ok(InboundText::Control) => continue,
+            Ok(InboundText::Close) => break,
+            Err(reason) => {
+                let _ = send_close(&tx, 1008, reason);
+                break;
+            }
+        };
+        if text.as_bytes().len() > MAX_PAYLOAD_BYTES {
+            let _ = send_close(&tx, 1008, "payload too large");
+            break;
+        }
+        let parsed = match serde_json::from_str::<Value>(&text) {
+            Ok(val) => val,
+            Err(_) => {
+                let _ = send_close(&tx, 1008, "invalid request frame");
+                break;
+            }
+        };
+        let ParsedRequest {
+            id: req_id,
+            method,
+            params,
+        } = match parse_request_frame(&parsed) {
+            Ok(req) => req,
+            Err(err) => {
+                if let Some(id) = err.id {
+                    let _ = send_response(&tx, &id, false, None, Some(err.error));
+                } else {
+                    let _ = send_close(&tx, 1008, "invalid request frame");
+                }
+                continue;
+            }
+        };
+        if method == "connect" {
+            let err = error_shape(ERROR_INVALID_REQUEST, "connect already completed", None);
+            let _ = send_response(&tx, &req_id, false, None, Some(err));
+            continue;
+        }
+        let method_known = GATEWAY_METHODS.contains(&method.as_str());
+        let result = dispatch_method(&method, params.as_ref(), &state, &conn).await;
+        match result {
+            Ok(payload) => {
+                let _ = send_response(&tx, &req_id, true, Some(payload), None);
+            }
+            Err(err) => {
+                if method_known {
+                    let _ = send_response(&tx, &req_id, false, None, Some(err));
+                } else {
+                    let _ = send_response(
+                        &tx,
+                        &req_id,
+                        false,
+                        None,
+                        Some(error_shape(
+                            ERROR_INVALID_REQUEST,
+                            "unknown method",
+                            Some(json!({ "method": method })),
+                        )),
+                    );
+                }
+            }
+        }
+    }
+
+    tick_task.abort();
+    drop(tx);
+    let _ = send_task.await;
+
+    state.unregister_connection(&conn.conn_id);
+    state.node_registry.lock().unregister(&conn.conn_id);
+}
+
+struct ParsedRequest {
+    id: String,
+    method: String,
+    params: Option<Value>,
+}
+
+struct FrameError {
+    id: Option<String>,
+    error: ErrorShape,
+}
+
+fn parse_request_frame(value: &Value) -> Result<ParsedRequest, FrameError> {
+    let obj = value.as_object().ok_or_else(|| FrameError {
+        id: None,
+        error: error_shape(ERROR_INVALID_REQUEST, "invalid request frame", None),
+    })?;
+    let frame_type = obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| FrameError {
+            id: None,
+            error: error_shape(ERROR_INVALID_REQUEST, "invalid request frame", None),
+        })?;
+    if frame_type != "req" {
+        return Err(FrameError {
+            id: None,
+            error: error_shape(ERROR_INVALID_REQUEST, "invalid request frame", None),
+        });
+    }
+    let id = obj
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let method = obj
+        .get("method")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let Some(id) = id else {
+        return Err(FrameError {
+            id: None,
+            error: error_shape(ERROR_INVALID_REQUEST, "invalid request frame", None),
+        });
+    };
+    if id.trim().is_empty() {
+        return Err(FrameError {
+            id: None,
+            error: error_shape(ERROR_INVALID_REQUEST, "invalid request frame", None),
+        });
+    }
+    let Some(method) = method else {
+        return Err(FrameError {
+            id: Some(id),
+            error: error_shape(ERROR_INVALID_REQUEST, "invalid request frame", None),
+        });
+    };
+    if method.trim().is_empty() {
+        return Err(FrameError {
+            id: Some(id),
+            error: error_shape(ERROR_INVALID_REQUEST, "invalid request frame", None),
+        });
+    }
+    let params = obj.get("params").cloned();
+    Ok(ParsedRequest { id, method, params })
+}
+
+fn get_value_at_path(root: &Value, path: &str) -> Option<Value> {
+    let mut current = root;
+    for part in path.split('.') {
+        let obj = current.as_object()?;
+        current = obj.get(part)?;
+    }
+    Some(current.clone())
+}
+
+fn validate_device_identity(
+    device: &DeviceIdentity,
+    connect: &ConnectParams,
+    nonce: &str,
+    is_local: bool,
+) -> Result<(), ErrorShape> {
+    let derived_id = derive_device_id_from_public_key(&device.public_key)
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "device public key invalid", None))?;
+    if derived_id != device.id {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "device identity mismatch",
+            None,
+        ));
+    }
+    let signed_at = device.signed_at;
+    let now = now_ms() as i64;
+    if (now - signed_at).abs() > SIGNATURE_SKEW_MS {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "device signature expired",
+            None,
+        ));
+    }
+    let nonce_required = !is_local;
+    let provided_nonce = device.nonce.clone().unwrap_or_default();
+    if nonce_required && provided_nonce.is_empty() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "device nonce required",
+            None,
+        ));
+    }
+    if !provided_nonce.is_empty() && provided_nonce != nonce {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "device nonce mismatch",
+            None,
+        ));
+    }
+    let payload = build_device_auth_payload(DeviceAuthPayload {
+        device_id: device.id.clone(),
+        client_id: connect.client.id.clone(),
+        client_mode: connect.client.mode.clone(),
+        role: connect
+            .role
+            .clone()
+            .unwrap_or_else(|| "operator".to_string()),
+        scopes: connect.scopes.clone().unwrap_or_default(),
+        signed_at_ms: signed_at,
+        token: connect.auth.as_ref().and_then(|a| a.token.clone()),
+        nonce: if provided_nonce.is_empty() {
+            None
+        } else {
+            Some(provided_nonce.clone())
+        },
+    });
+    if !verify_device_signature(&device.public_key, &payload, &device.signature) {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "device signature invalid",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn authorize_connection(
+    state: &WsServerState,
+    connect: &ConnectParams,
+    headers: &HeaderMap,
+    remote_addr: SocketAddr,
+    device_id: Option<&str>,
+    role: &str,
+    scopes: &[String],
+) -> Result<(), ErrorShape> {
+    let auth = &state.config.auth.resolved;
+    let connect_auth = connect.auth.as_ref();
+
+    let auth_result = auth::authorize_gateway_connect(
+        auth,
+        connect_auth.and_then(|a| a.token.as_deref()),
+        connect_auth.and_then(|a| a.password.as_deref()),
+        headers,
+        remote_addr,
+        &state.config.trusted_proxies,
+    );
+
+    if auth_result.ok {
+        if matches!(auth_result.method, Some(auth::GatewayAuthMethod::Tailscale)) {
+            tracing::debug!(
+                user = %auth_result.user.as_deref().unwrap_or("unknown"),
+                ip = %remote_addr.ip(),
+                "tailscale auth accepted"
+            );
+        }
+        return Ok(());
+    }
+
+    if let Some(device_id) = device_id {
+        if let Some(token) = connect_auth.and_then(|a| a.token.clone()) {
+            if verify_device_token(state, device_id, &token, role, scopes) {
+                return Ok(());
+            }
+        }
+    }
+
+    let reason = auth_result
+        .reason
+        .unwrap_or(auth::GatewayAuthFailure::Unauthorized)
+        .message();
+
+    Err(error_shape(ERROR_INVALID_REQUEST, reason, None))
+}
+
+fn ensure_paired(
+    state: &WsServerState,
+    device: &DeviceIdentity,
+    connect: &ConnectParams,
+    role: &str,
+    scopes: &[String],
+    is_local: bool,
+    remote_addr: SocketAddr,
+) -> Result<(), ErrorShape> {
+    if let Some(paired) = state.device_registry.get_paired_device(&device.id) {
+        if paired.public_key != device.public_key {
+            return Err(error_shape(
+                ERROR_INVALID_REQUEST,
+                "device identity mismatch",
+                None,
+            ));
+        }
+
+        let role_allowed = if paired.roles.is_empty() {
+            false
+        } else {
+            paired.roles.iter().any(|r| r == role)
+        };
+        if !role_allowed {
+            return require_pairing(state, device, connect, role, scopes, is_local, remote_addr);
+        }
+
+        if !scopes.is_empty() {
+            if paired.scopes.is_empty() || !scopes.iter().all(|scope| paired.scopes.contains(scope))
+            {
+                return require_pairing(
+                    state,
+                    device,
+                    connect,
+                    role,
+                    scopes,
+                    is_local,
+                    remote_addr,
+                );
+            }
+        }
+
+        let remote_ip = if is_local {
+            None
+        } else {
+            Some(remote_addr.ip().to_string())
+        };
+        if let Err(err) = state.device_registry.update_metadata(
+            &device.id,
+            devices::DeviceMetadataPatch {
+                display_name: connect.client.display_name.clone(),
+                platform: Some(connect.client.platform.clone()),
+                client_id: Some(connect.client.id.clone()),
+                client_mode: Some(connect.client.mode.clone()),
+                remote_ip,
+                role: Some(role.to_string()),
+                scopes: Some(scopes.to_vec()),
+            },
+        ) {
+            warn!(error = %err, device_id = %device.id, "failed to update device metadata");
+        }
+
+        return Ok(());
+    }
+
+    require_pairing(state, device, connect, role, scopes, is_local, remote_addr)
+}
+
+fn require_pairing(
+    state: &WsServerState,
+    device: &DeviceIdentity,
+    connect: &ConnectParams,
+    role: &str,
+    scopes: &[String],
+    is_local: bool,
+    remote_addr: SocketAddr,
+) -> Result<(), ErrorShape> {
+    let remote_ip = if is_local {
+        None
+    } else {
+        Some(remote_addr.ip().to_string())
+    };
+    let outcome = state
+        .device_registry
+        .request_pairing_with_status(
+            device.id.clone(),
+            device.public_key.clone(),
+            vec![role.to_string()],
+            scopes.to_vec(),
+            connect.client.display_name.clone(),
+            Some(connect.client.platform.clone()),
+            Some(connect.client.id.clone()),
+            Some(connect.client.mode.clone()),
+            remote_ip,
+            Some(is_local),
+        )
+        .map_err(|e| match e {
+            devices::DevicePairingError::PublicKeyMismatch => {
+                error_shape(ERROR_INVALID_REQUEST, "device identity mismatch", None)
+            }
+            devices::DevicePairingError::TooManyPendingRequests => {
+                error_shape(ERROR_UNAVAILABLE, "too many pending pairing requests", None)
+            }
+            _ => error_shape(ERROR_UNAVAILABLE, &e.to_string(), None),
+        })?;
+
+    let request = outcome.request;
+    let silent = request.silent.unwrap_or(false);
+    if outcome.created && !silent {
+        broadcast_event(
+            state,
+            "device.pair.requested",
+            json!({
+                "requestId": request.request_id,
+                "deviceId": request.device_id,
+                "publicKey": request.public_key,
+                "displayName": request.display_name,
+                "platform": request.platform,
+                "clientId": request.client_id,
+                "clientMode": request.client_mode,
+                "role": request.role,
+                "roles": request.requested_roles,
+                "scopes": request.requested_scopes,
+                "remoteIp": request.remote_ip,
+                "silent": request.silent,
+                "isRepair": request.is_repair,
+                "ts": request.created_at_ms
+            }),
+        );
+    }
+
+    if is_local {
+        let _ = state
+            .device_registry
+            .approve_request(
+                &request.request_id,
+                request.requested_roles,
+                request.requested_scopes,
+            )
+            .map_err(|e| error_shape(ERROR_UNAVAILABLE, &e.to_string(), None))?;
+
+        broadcast_event(
+            state,
+            "device.pair.resolved",
+            json!({
+                "requestId": request.request_id,
+                "deviceId": request.device_id,
+                "decision": "approved",
+                "ts": now_ms()
+            }),
+        );
+        return Ok(());
+    }
+
+    Err(error_shape(
+        ERROR_NOT_PAIRED,
+        "pairing required",
+        Some(json!({ "details": { "requestId": request.request_id } })),
+    ))
+}
+
+fn ensure_device_token(
+    state: &WsServerState,
+    device_id: &str,
+    role: &str,
+    scopes: &[String],
+) -> devices::IssuedDeviceToken {
+    let result = state
+        .device_registry
+        .ensure_token(device_id, role.to_string(), scopes.to_vec())
+        .unwrap_or_else(|_| devices::IssuedDeviceToken {
+            token: Uuid::new_v4().to_string(),
+            role: role.to_string(),
+            scopes: scopes.to_vec(),
+            issued_at_ms: now_ms(),
+        });
+    result
+}
+
+fn verify_device_token(
+    state: &WsServerState,
+    device_id: &str,
+    token: &str,
+    role: &str,
+    scopes: &[String],
+) -> bool {
+    state
+        .device_registry
+        .verify_token(device_id, token, Some(role), scopes)
+        .is_ok()
+}
+
+fn build_device_auth_payload(params: DeviceAuthPayload) -> String {
+    let version = if params.nonce.is_some() { "v2" } else { "v1" };
+    let scopes = params.scopes.join(",");
+    let token = params.token.unwrap_or_default();
+    let mut base = vec![
+        version.to_string(),
+        params.device_id,
+        params.client_id,
+        params.client_mode,
+        params.role,
+        scopes,
+        params.signed_at_ms.to_string(),
+        token,
+    ];
+    if let Some(nonce) = params.nonce {
+        base.push(nonce);
+    }
+    base.join("|")
+}
+
+#[derive(Debug)]
+struct DeviceAuthPayload {
+    device_id: String,
+    client_id: String,
+    client_mode: String,
+    role: String,
+    scopes: Vec<String>,
+    signed_at_ms: i64,
+    token: Option<String>,
+    nonce: Option<String>,
+}
+
+fn verify_device_signature(public_key: &str, payload: &str, signature: &str) -> bool {
+    let pubkey_raw = match base64url_decode(public_key) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    let sig_raw = match base64url_decode(signature) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    let Ok(pubkey_bytes) = <[u8; 32]>::try_from(pubkey_raw.as_slice()) else {
+        return false;
+    };
+    let Ok(sig_bytes) = <[u8; 64]>::try_from(sig_raw.as_slice()) else {
+        return false;
+    };
+    let Ok(pubkey) = VerifyingKey::from_bytes(&pubkey_bytes) else {
+        return false;
+    };
+    let sig = Signature::from_bytes(&sig_bytes);
+    pubkey.verify_strict(payload.as_bytes(), &sig).is_ok()
+}
+
+fn derive_device_id_from_public_key(public_key: &str) -> Option<String> {
+    let raw = base64url_decode(public_key).ok()?;
+    let digest = Sha256::digest(&raw);
+    Some(hex::encode(digest))
+}
+
+fn base64url_decode(input: &str) -> Result<Vec<u8>, ()> {
+    if let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(input.as_bytes()) {
+        return Ok(bytes);
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(input.as_bytes())
+        .map_err(|_| ())
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_millis() as u64
+}
+
+fn server_version() -> String {
+    std::env::var("CLAWDBOT_VERSION")
+        .or_else(|_| std::env::var("npm_package_version"))
+        .unwrap_or_else(|_| "dev".to_string())
+}
+
+fn server_commit() -> Option<String> {
+    std::env::var("GIT_COMMIT").ok()
+}
+
+fn server_hostname() -> String {
+    std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string())
+}
+
+enum InboundText {
+    Text(String),
+    Control,
+    Close,
+}
+
+fn message_to_text(msg: Message) -> Result<InboundText, &'static str> {
+    match msg {
+        Message::Text(text) => Ok(InboundText::Text(text)),
+        Message::Binary(_) => Err("binary messages not supported"),
+        Message::Close(_) => Ok(InboundText::Close),
+        Message::Ping(_) | Message::Pong(_) => Ok(InboundText::Control),
+    }
+}
+
+fn error_shape(code: &'static str, message: &str, details: Option<Value>) -> ErrorShape {
+    ErrorShape {
+        code,
+        message: message.to_string(),
+        retryable: code == ERROR_UNAVAILABLE,
+        details,
+    }
+}
+
+fn send_json<T: Serialize>(tx: &mpsc::UnboundedSender<Message>, payload: &T) -> Result<(), ()> {
+    let text = serde_json::to_string(payload).map_err(|_| ())?;
+    tx.send(Message::Text(text)).map_err(|_| ())
+}
+
+fn send_event_to_connection(
+    state: &WsServerState,
+    conn_id: &str,
+    event: &str,
+    payload: Value,
+) -> bool {
+    let frame = EventFrame {
+        frame_type: "event",
+        event,
+        payload,
+        seq: Some(state.next_event_seq()),
+        state_version: None,
+    };
+    let mut conns = state.connections.lock();
+    let Some(conn) = conns.get(conn_id) else {
+        return false;
+    };
+    if send_json(&conn.tx, &frame).is_err() {
+        conns.remove(conn_id);
+        return false;
+    }
+    true
+}
+
+fn event_required_scope(event: &str) -> Option<&'static str> {
+    match event {
+        "device.pair.requested"
+        | "device.pair.resolved"
+        | "node.pair.requested"
+        | "node.pair.resolved" => Some("operator.pairing"),
+        "exec.approval.requested" | "exec.approval.resolved" => Some("operator.approvals"),
+        _ => None,
+    }
+}
+
+fn broadcast_event(state: &WsServerState, event: &str, payload: Value) {
+    let frame = EventFrame {
+        frame_type: "event",
+        event,
+        payload,
+        seq: Some(state.next_event_seq()),
+        state_version: None,
+    };
+    let required_scope = event_required_scope(event);
+    let mut conns = state.connections.lock();
+    let mut dead = Vec::new();
+    for (conn_id, conn) in conns.iter() {
+        if conn.role == "node" {
+            continue;
+        }
+        if let Some(required_scope) = required_scope {
+            if conn.role != "admin" && !scope_satisfies(&conn.scopes, required_scope) {
+                continue;
+            }
+        }
+        if send_json(&conn.tx, &frame).is_err() {
+            dead.push(conn_id.clone());
+        }
+    }
+    for conn_id in dead {
+        conns.remove(&conn_id);
+    }
+}
+
+fn send_response(
+    tx: &mpsc::UnboundedSender<Message>,
+    id: &str,
+    ok: bool,
+    payload: Option<Value>,
+    error: Option<ErrorShape>,
+) -> Result<(), ()> {
+    let frame = ResponseFrame {
+        frame_type: "res",
+        id,
+        ok,
+        payload,
+        error,
+    };
+    send_json(tx, &frame)
+}
+
+fn send_close(tx: &mpsc::UnboundedSender<Message>, code: u16, reason: &str) -> Result<(), ()> {
+    // Truncate close reason to 123 bytes to fit WebSocket limit
+    let truncated_reason: String = reason.chars().take(123).collect();
+    let frame = CloseFrame {
+        code: code.into(),
+        reason: truncated_reason.into(),
+    };
+    tx.send(Message::Close(Some(frame))).map_err(|_| ())
+}
+
+async fn recv_text_with_timeout(
+    receiver: &mut futures_util::stream::SplitStream<WebSocket>,
+    timeout_ms: u64,
+) -> Result<Option<String>, &'static str> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("handshake timeout");
+        }
+        let msg = match tokio::time::timeout(remaining, receiver.next()).await {
+            Ok(Some(Ok(msg))) => msg,
+            Ok(Some(Err(_))) => return Err("socket error"),
+            Ok(None) => return Ok(None),
+            Err(_) => return Err("handshake timeout"),
+        };
+        match message_to_text(msg)? {
+            InboundText::Text(text) => return Ok(Some(text)),
+            InboundText::Control => continue,
+            InboundText::Close => return Ok(None),
+        }
+    }
+}
+
+const CANVAS_COMMANDS: [&str; 8] = [
+    "canvas.present",
+    "canvas.hide",
+    "canvas.navigate",
+    "canvas.eval",
+    "canvas.snapshot",
+    "canvas.a2ui.push",
+    "canvas.a2ui.pushJSONL",
+    "canvas.a2ui.reset",
+];
+const CAMERA_COMMANDS: [&str; 3] = ["camera.list", "camera.snap", "camera.clip"];
+const SCREEN_COMMANDS: [&str; 1] = ["screen.record"];
+const LOCATION_COMMANDS: [&str; 1] = ["location.get"];
+const SMS_COMMANDS: [&str; 1] = ["sms.send"];
+const SYSTEM_COMMANDS: [&str; 6] = [
+    "system.run",
+    "system.which",
+    "system.notify",
+    "system.execApprovals.get",
+    "system.execApprovals.set",
+    "browser.proxy",
+];
+
+fn normalize_platform_id(platform: Option<&str>, device_family: Option<&str>) -> &'static str {
+    let raw = platform.unwrap_or_default().trim().to_lowercase();
+    if raw.starts_with("ios") {
+        return "ios";
+    }
+    if raw.starts_with("android") {
+        return "android";
+    }
+    if raw.starts_with("mac") || raw.starts_with("darwin") {
+        return "macos";
+    }
+    if raw.starts_with("win") {
+        return "windows";
+    }
+    if raw.starts_with("linux") {
+        return "linux";
+    }
+    let family = device_family.unwrap_or_default().trim().to_lowercase();
+    if family.contains("iphone") || family.contains("ipad") || family.contains("ios") {
+        return "ios";
+    }
+    if family.contains("android") {
+        return "android";
+    }
+    if family.contains("mac") {
+        return "macos";
+    }
+    if family.contains("windows") {
+        return "windows";
+    }
+    if family.contains("linux") {
+        return "linux";
+    }
+    "unknown"
+}
+
+fn default_node_commands(platform_id: &str) -> Vec<&'static str> {
+    let mut commands = Vec::new();
+    match platform_id {
+        "ios" => {
+            commands.extend_from_slice(&CANVAS_COMMANDS);
+            commands.extend_from_slice(&CAMERA_COMMANDS);
+            commands.extend_from_slice(&SCREEN_COMMANDS);
+            commands.extend_from_slice(&LOCATION_COMMANDS);
+        }
+        "android" => {
+            commands.extend_from_slice(&CANVAS_COMMANDS);
+            commands.extend_from_slice(&CAMERA_COMMANDS);
+            commands.extend_from_slice(&SCREEN_COMMANDS);
+            commands.extend_from_slice(&LOCATION_COMMANDS);
+            commands.extend_from_slice(&SMS_COMMANDS);
+        }
+        "macos" => {
+            commands.extend_from_slice(&CANVAS_COMMANDS);
+            commands.extend_from_slice(&CAMERA_COMMANDS);
+            commands.extend_from_slice(&SCREEN_COMMANDS);
+            commands.extend_from_slice(&LOCATION_COMMANDS);
+            commands.extend_from_slice(&SYSTEM_COMMANDS);
+        }
+        "linux" | "windows" => {
+            commands.extend_from_slice(&SYSTEM_COMMANDS);
+        }
+        _ => {
+            commands.extend_from_slice(&CANVAS_COMMANDS);
+            commands.extend_from_slice(&CAMERA_COMMANDS);
+            commands.extend_from_slice(&SCREEN_COMMANDS);
+            commands.extend_from_slice(&LOCATION_COMMANDS);
+            commands.extend_from_slice(&SMS_COMMANDS);
+            commands.extend_from_slice(&SYSTEM_COMMANDS);
+        }
+    }
+    commands
+}
+
+fn resolve_node_command_allowlist(
+    allow: &[String],
+    deny: &[String],
+    platform: Option<&str>,
+    device_family: Option<&str>,
+) -> HashSet<String> {
+    let platform_id = normalize_platform_id(platform, device_family);
+    let mut allowlist: HashSet<String> = default_node_commands(platform_id)
+        .into_iter()
+        .map(|cmd| cmd.to_string())
+        .collect();
+    for cmd in allow {
+        let trimmed = cmd.trim();
+        if !trimmed.is_empty() {
+            allowlist.insert(trimmed.to_string());
+        }
+    }
+    for cmd in deny {
+        let trimmed = cmd.trim();
+        if !trimmed.is_empty() {
+            allowlist.remove(trimmed);
+        }
+    }
+    allowlist
+}
+
+fn resolve_state_dir() -> PathBuf {
+    if let Ok(dir) = env::var("CLAWDBOT_STATE_DIR") {
+        return PathBuf::from(dir);
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".clawdbot")
+}

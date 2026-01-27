@@ -1,0 +1,366 @@
+//! Config handlers.
+
+use serde::Serialize;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::io::Write;
+use std::path::PathBuf;
+
+use super::super::*;
+
+#[derive(Debug, Serialize)]
+struct ConfigIssue {
+    path: String,
+    message: String,
+}
+
+#[derive(Debug)]
+struct ConfigSnapshot {
+    path: String,
+    exists: bool,
+    raw: Option<String>,
+    parsed: Value,
+    valid: bool,
+    config: Value,
+    hash: Option<String>,
+    issues: Vec<ConfigIssue>,
+}
+
+pub(super) fn map_validation_issues(issues: Vec<config::ValidationIssue>) -> Vec<ConfigIssue> {
+    issues
+        .into_iter()
+        .map(|issue| ConfigIssue {
+            path: issue.path,
+            message: issue.message,
+        })
+        .collect()
+}
+
+fn sha256_hex(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    format!("{:x}", digest)
+}
+
+pub(super) fn read_config_snapshot() -> ConfigSnapshot {
+    let path = config::get_config_path();
+    let path_str = path.display().to_string();
+    if !path.exists() {
+        return ConfigSnapshot {
+            path: path_str,
+            exists: false,
+            raw: None,
+            parsed: Value::Object(serde_json::Map::new()),
+            valid: true,
+            config: Value::Object(serde_json::Map::new()),
+            hash: None,
+            issues: Vec::new(),
+        };
+    }
+
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) => {
+            return ConfigSnapshot {
+                path: path_str,
+                exists: true,
+                raw: None,
+                parsed: Value::Object(serde_json::Map::new()),
+                valid: false,
+                config: Value::Object(serde_json::Map::new()),
+                hash: None,
+                issues: vec![ConfigIssue {
+                    path: "".to_string(),
+                    message: format!("read failed: {}", err),
+                }],
+            }
+        }
+    };
+
+    let hash = Some(sha256_hex(&raw));
+    let parsed = json5::from_str::<Value>(&raw).unwrap_or(Value::Null);
+
+    let (config_value, mut issues, valid) = match config::load_config_uncached(&path) {
+        Ok(cfg) => {
+            let issues = map_validation_issues(config::validate_config(&cfg));
+            let valid = issues.is_empty();
+            (cfg, issues, valid)
+        }
+        Err(err) => {
+            let mut issues = Vec::new();
+            issues.push(ConfigIssue {
+                path: "".to_string(),
+                message: err.to_string(),
+            });
+            (parsed.clone(), issues, false)
+        }
+    };
+
+    if !valid && issues.is_empty() {
+        issues.push(ConfigIssue {
+            path: "".to_string(),
+            message: "invalid config".to_string(),
+        });
+    }
+
+    ConfigSnapshot {
+        path: path_str,
+        exists: true,
+        raw: Some(raw),
+        parsed,
+        valid,
+        config: config_value,
+        hash,
+        issues,
+    }
+}
+
+fn require_config_base_hash(
+    params: Option<&Value>,
+    snapshot: &ConfigSnapshot,
+) -> Result<(), ErrorShape> {
+    if !snapshot.exists {
+        return Ok(());
+    }
+    let base_hash = params
+        .and_then(|v| v.get("baseHash"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    let expected = snapshot.hash.as_deref();
+    if expected.is_none() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "config base hash unavailable; re-run config.get and retry",
+            None,
+        ));
+    }
+    let Some(base_hash) = base_hash else {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "config base hash required; re-run config.get and retry",
+            None,
+        ));
+    };
+    if Some(base_hash) != expected {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "config changed since last load; re-run config.get and retry",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn write_config_file(path: &PathBuf, config_value: &Value) -> Result<(), ErrorShape> {
+    if let Some(parent) = path.parent() {
+        if let Err(err) = fs::create_dir_all(parent) {
+            return Err(error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("failed to create config dir: {}", err),
+                None,
+            ));
+        }
+    }
+
+    let content = serde_json::to_string_pretty(config_value)
+        .map_err(|err| error_shape(ERROR_UNAVAILABLE, &err.to_string(), None))?;
+    let tmp_path = path.with_extension("json.tmp");
+    {
+        let mut file = fs::File::create(&tmp_path).map_err(|err| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("failed to write config: {}", err),
+                None,
+            )
+        })?;
+        file.write_all(content.as_bytes()).map_err(|err| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("failed to write config: {}", err),
+                None,
+            )
+        })?;
+        file.write_all(b"\n").map_err(|err| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("failed to write config: {}", err),
+                None,
+            )
+        })?;
+    }
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        return Err(error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("failed to replace config: {}", err),
+            None,
+        ));
+    }
+
+    config::clear_cache();
+    Ok(())
+}
+
+fn merge_patch(base: Value, patch: Value) -> Value {
+    match (base, patch) {
+        (_, Value::Null) => Value::Null,
+        (Value::Object(mut base_map), Value::Object(patch_map)) => {
+            for (key, patch_value) in patch_map {
+                if patch_value.is_null() {
+                    base_map.remove(&key);
+                } else {
+                    let base_value = base_map.remove(&key).unwrap_or(Value::Null);
+                    let merged = merge_patch(base_value, patch_value);
+                    base_map.insert(key, merged);
+                }
+            }
+            Value::Object(base_map)
+        }
+        (_, patch_value) => patch_value,
+    }
+}
+
+pub(super) fn handle_config_get(params: Option<&Value>) -> Result<Value, ErrorShape> {
+    let snapshot = read_config_snapshot();
+    let key = params
+        .and_then(|v| v.get("key"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+
+    if let Some(key) = key {
+        let value = get_value_at_path(&snapshot.config, key).unwrap_or(Value::Null);
+        return Ok(json!({
+            "key": key,
+            "value": value
+        }));
+    }
+
+    Ok(json!({
+        "path": snapshot.path,
+        "exists": snapshot.exists,
+        "raw": snapshot.raw,
+        "parsed": snapshot.parsed,
+        "valid": snapshot.valid,
+        "config": snapshot.config,
+        "hash": snapshot.hash,
+        "issues": snapshot.issues,
+        "warnings": [],
+        "legacyIssues": []
+    }))
+}
+
+pub(super) fn handle_config_set(params: Option<&Value>) -> Result<Value, ErrorShape> {
+    let snapshot = read_config_snapshot();
+    require_config_base_hash(params, &snapshot)?;
+
+    let raw = params
+        .and_then(|v| v.get("raw"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "raw is required", None))?;
+    let parsed = json5::from_str::<Value>(raw)
+        .map_err(|err| error_shape(ERROR_INVALID_REQUEST, &err.to_string(), None))?;
+    if !parsed.is_object() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "config.set raw must be an object",
+            None,
+        ));
+    }
+    let issues = map_validation_issues(config::validate_config(&parsed));
+    if !issues.is_empty() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "invalid config",
+            Some(json!({ "issues": issues })),
+        ));
+    }
+    write_config_file(&config::get_config_path(), &parsed)?;
+    Ok(json!({
+        "ok": true,
+        "path": config::get_config_path().display().to_string(),
+        "config": parsed
+    }))
+}
+
+pub(super) fn handle_config_apply(params: Option<&Value>) -> Result<Value, ErrorShape> {
+    let snapshot = read_config_snapshot();
+    require_config_base_hash(params, &snapshot)?;
+
+    let raw = params
+        .and_then(|v| v.get("raw"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "raw is required", None))?;
+    let parsed = json5::from_str::<Value>(raw)
+        .map_err(|err| error_shape(ERROR_INVALID_REQUEST, &err.to_string(), None))?;
+    if !parsed.is_object() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "config.apply raw must be an object",
+            None,
+        ));
+    }
+    let issues = map_validation_issues(config::validate_config(&parsed));
+    if !issues.is_empty() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "invalid config",
+            Some(json!({ "issues": issues })),
+        ));
+    }
+    write_config_file(&config::get_config_path(), &parsed)?;
+    Ok(json!({
+        "ok": true,
+        "path": config::get_config_path().display().to_string(),
+        "config": parsed
+    }))
+}
+
+pub(super) fn handle_config_patch(params: Option<&Value>) -> Result<Value, ErrorShape> {
+    let snapshot = read_config_snapshot();
+    require_config_base_hash(params, &snapshot)?;
+
+    let raw = params
+        .and_then(|v| v.get("raw"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "raw is required", None))?;
+    let patch_value = json5::from_str::<Value>(raw)
+        .map_err(|err| error_shape(ERROR_INVALID_REQUEST, &err.to_string(), None))?;
+    if !patch_value.is_object() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "config.patch raw must be an object",
+            None,
+        ));
+    }
+
+    let merged = merge_patch(snapshot.config.clone(), patch_value);
+    let issues = map_validation_issues(config::validate_config(&merged));
+    if !issues.is_empty() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "invalid config",
+            Some(json!({ "issues": issues })),
+        ));
+    }
+
+    write_config_file(&config::get_config_path(), &merged)?;
+    Ok(json!({
+        "ok": true,
+        "path": config::get_config_path().display().to_string(),
+        "config": merged
+    }))
+}
+
+pub(super) fn handle_config_schema() -> Result<Value, ErrorShape> {
+    // Return JSON schema for config
+    Ok(json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+            "gateway": { "type": "object" },
+            "agent": { "type": "object" },
+            "channels": { "type": "object" }
+        }
+    }))
+}
