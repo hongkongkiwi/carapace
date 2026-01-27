@@ -643,7 +643,8 @@ impl SessionStore {
             session.metadata.extra = updates.extra;
         }
 
-        session.updated_at = now_millis();
+        let now = now_millis();
+        session.updated_at = now.max(session.updated_at.saturating_add(1));
 
         // Persist
         self.write_session_meta(&session)?;
@@ -1037,30 +1038,34 @@ impl SessionStore {
 
     /// Increment message count for a session
     fn increment_message_count(&self, session_id: &str) -> Result<(), SessionStoreError> {
-        let mut sessions = self.sessions.write();
-
-        if let Some(cached) = sessions.get_mut(session_id) {
-            cached.session.message_count += 1;
-            cached.session.updated_at = now_millis();
-            cached.session.last_activity_at = Some(now_millis());
-            cached.dirty = true;
-        } else {
-            drop(sessions);
-
-            // Load session if not cached
-            let mut session = self.load_session(session_id)?;
-            session.message_count += 1;
-            session.updated_at = now_millis();
-            session.last_activity_at = Some(now_millis());
-
+        // Update message count in a scoped block to ensure write lock is released
+        // before attempting to acquire read lock for periodic flush
+        {
             let mut sessions = self.sessions.write();
-            sessions.insert(
-                session_id.to_string(),
-                CachedSession {
-                    session,
-                    dirty: true,
-                },
-            );
+
+            if let Some(cached) = sessions.get_mut(session_id) {
+                cached.session.message_count += 1;
+                cached.session.updated_at = now_millis();
+                cached.session.last_activity_at = Some(now_millis());
+                cached.dirty = true;
+            } else {
+                drop(sessions);
+
+                // Load session if not cached
+                let mut session = self.load_session(session_id)?;
+                session.message_count += 1;
+                session.updated_at = now_millis();
+                session.last_activity_at = Some(now_millis());
+
+                let mut sessions = self.sessions.write();
+                sessions.insert(
+                    session_id.to_string(),
+                    CachedSession {
+                        session,
+                        dirty: true,
+                    },
+                );
+            }
         }
 
         // Periodic flush (every 10 messages)

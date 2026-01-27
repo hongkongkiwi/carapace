@@ -1,0 +1,808 @@
+use super::handlers::*;
+use super::*;
+
+#[test]
+fn test_error_shape() {
+    let err = error_shape(ERROR_INVALID_REQUEST, "test error", None);
+    assert_eq!(err.code, "INVALID_REQUEST");
+    assert_eq!(err.message, "test error");
+    assert!(!err.retryable);
+
+    let err2 = error_shape(ERROR_UNAVAILABLE, "temp error", Some(json!({"foo": "bar"})));
+    assert_eq!(err2.code, "UNAVAILABLE");
+    assert!(err2.retryable);
+    assert!(err2.details.is_some());
+}
+
+#[test]
+fn test_get_value_at_path() {
+    let root = json!({
+        "gateway": {
+            "port": 8080,
+            "auth": {
+                "mode": "token"
+            }
+        }
+    });
+
+    assert_eq!(get_value_at_path(&root, "gateway.port"), Some(json!(8080)));
+    assert_eq!(
+        get_value_at_path(&root, "gateway.auth.mode"),
+        Some(json!("token"))
+    );
+    assert_eq!(get_value_at_path(&root, "gateway.missing"), None);
+    assert_eq!(get_value_at_path(&root, "unknown"), None);
+}
+
+#[tokio::test]
+async fn test_handle_node_invoke_enforces_allowlist() {
+    let state = Arc::new(WsServerState::new(WsServerConfig::default()));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let node_conn = ConnectionContext {
+        conn_id: "conn-1".to_string(),
+        role: "node".to_string(),
+        scopes: vec![],
+        client: ClientInfo {
+            id: "node-1".to_string(),
+            version: "1.0".to_string(),
+            platform: "test".to_string(),
+            mode: "test".to_string(),
+            display_name: None,
+            device_family: None,
+            model_identifier: None,
+            instance_id: None,
+        },
+        device_id: Some("node-1".to_string()),
+    };
+    state.register_connection(&node_conn, tx);
+    let mut registry = state.node_registry.lock();
+    registry.register(NodeSession {
+        node_id: "node-1".to_string(),
+        conn_id: "conn-1".to_string(),
+        display_name: None,
+        platform: Some("test".to_string()),
+        version: Some("1.0".to_string()),
+        device_family: None,
+        model_identifier: None,
+        remote_ip: None,
+        caps: vec![],
+        commands: HashSet::from(["system.run".to_string()]),
+        permissions: None,
+        path_env: None,
+        connected_at_ms: now_ms(),
+    });
+    drop(registry);
+
+    let outcome = state
+        .node_pairing
+        .request_pairing_with_status(
+            "node-1".to_string(),
+            None,
+            vec!["system.run".to_string()],
+            None,
+            None,
+        )
+        .unwrap();
+    let _ = state
+        .node_pairing
+        .approve_request(&outcome.request.request_id)
+        .unwrap();
+
+    let node_state = Arc::clone(&state);
+    let node_conn = node_conn.clone();
+    let responder = tokio::spawn(async move {
+        if let Some(Message::Text(text)) = rx.recv().await {
+            let value: Value = serde_json::from_str(&text).unwrap();
+            let invoke_id = value
+                .get("payload")
+                .and_then(|v| v.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .to_string();
+            let params = json!({
+                "id": invoke_id,
+                "nodeId": "node-1",
+                "ok": true,
+                "payload": { "ok": true }
+            });
+            let _ = handle_node_invoke_result(Some(&params), node_state.as_ref(), &node_conn);
+        }
+    });
+
+    let ok_params = json!({
+        "nodeId": "node-1",
+        "command": "system.run",
+        "idempotencyKey": "req-1"
+    });
+    assert!(handle_node_invoke(Some(&ok_params), state.as_ref())
+        .await
+        .is_ok());
+    let _ = responder.await;
+
+    let bad_params = json!({
+        "nodeId": "node-1",
+        "command": "sms.send",
+        "idempotencyKey": "req-2"
+    });
+    let err = handle_node_invoke(Some(&bad_params), state.as_ref())
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ERROR_FORBIDDEN);
+}
+
+#[test]
+fn test_normalize_platform_id() {
+    assert_eq!(normalize_platform_id(Some("Darwin"), None), "macos");
+    assert_eq!(normalize_platform_id(None, Some("iPhone13,3")), "ios");
+    assert_eq!(normalize_platform_id(Some("android"), None), "android");
+    assert_eq!(normalize_platform_id(None, None), "unknown");
+}
+
+#[test]
+fn test_resolve_node_command_allowlist() {
+    let allow = vec!["custom.command".to_string()];
+    let deny = vec!["canvas.present".to_string()];
+    let allowlist = resolve_node_command_allowlist(&allow, &deny, Some("darwin"), None);
+    assert!(allowlist.contains("system.run"));
+    assert!(!allowlist.contains("sms.send"));
+    assert!(allowlist.contains("custom.command"));
+    assert!(!allowlist.contains("canvas.present"));
+}
+
+// ============== Method Authorization Tests ==============
+
+fn make_conn(role: &str) -> ConnectionContext {
+    make_conn_with_scopes(role, vec![])
+}
+
+fn make_conn_with_scopes(role: &str, scopes: Vec<String>) -> ConnectionContext {
+    ConnectionContext {
+        conn_id: "test-conn".to_string(),
+        role: role.to_string(),
+        scopes,
+        client: ClientInfo {
+            id: "test-client".to_string(),
+            version: "1.0".to_string(),
+            platform: "test".to_string(),
+            mode: "test".to_string(),
+            display_name: None,
+            device_family: None,
+            model_identifier: None,
+            instance_id: None,
+        },
+        device_id: None,
+    }
+}
+
+fn make_conn_with_id(role: &str, scopes: Vec<String>, conn_id: &str) -> ConnectionContext {
+    ConnectionContext {
+        conn_id: conn_id.to_string(),
+        role: role.to_string(),
+        scopes,
+        client: ClientInfo {
+            id: "test-client".to_string(),
+            version: "1.0".to_string(),
+            platform: "test".to_string(),
+            mode: "test".to_string(),
+            display_name: None,
+            device_family: None,
+            model_identifier: None,
+            instance_id: None,
+        },
+        device_id: None,
+    }
+}
+
+#[test]
+fn test_broadcast_event_scope_guard() {
+    let state = WsServerState::new(WsServerConfig::default());
+    let (tx_denied, mut rx_denied) = mpsc::unbounded_channel();
+    let (tx_allowed, mut rx_allowed) = mpsc::unbounded_channel();
+    let denied = make_conn_with_id("operator", vec![], "conn-denied");
+    let allowed = make_conn_with_id(
+        "operator",
+        vec!["operator.pairing".to_string()],
+        "conn-allowed",
+    );
+
+    state.register_connection(&denied, tx_denied);
+    state.register_connection(&allowed, tx_allowed);
+
+    broadcast_event(
+        &state,
+        "device.pair.requested",
+        json!({ "requestId": "req-1" }),
+    );
+
+    assert!(rx_allowed.try_recv().is_ok());
+    assert!(rx_denied.try_recv().is_err());
+}
+
+#[test]
+fn test_role_satisfies() {
+    // Any role satisfies read
+    assert!(role_satisfies("read", "read"));
+    assert!(role_satisfies("write", "read"));
+    assert!(role_satisfies("admin", "read"));
+    assert!(role_satisfies("operator", "read"));
+
+    // Only write, admin, operator satisfy write
+    assert!(!role_satisfies("read", "write"));
+    assert!(role_satisfies("write", "write"));
+    assert!(role_satisfies("admin", "write"));
+    assert!(role_satisfies("operator", "write"));
+
+    // Only admin satisfies admin
+    assert!(!role_satisfies("read", "admin"));
+    assert!(!role_satisfies("write", "admin"));
+    assert!(role_satisfies("admin", "admin"));
+}
+
+#[test]
+fn test_method_authorization_read_methods() {
+    // Read-only methods should be allowed by any role
+    let read_methods = [
+        "health",
+        "status",
+        "config.get",
+        "sessions.list",
+        "channels.status",
+    ];
+
+    for method in read_methods {
+        for role in ["read", "write", "admin"] {
+            let conn = make_conn(role);
+            let result = check_method_authorization(method, &conn);
+            assert!(
+                result.is_ok(),
+                "Method '{}' should be allowed for role '{}'",
+                method,
+                role
+            );
+        }
+    }
+}
+
+#[test]
+fn test_method_authorization_write_methods() {
+    // Write methods should not be allowed by read role
+    let write_methods = ["config.set", "agent", "chat.send", "cron.add"];
+
+    for method in write_methods {
+        let read_conn = make_conn("read");
+        let result = check_method_authorization(method, &read_conn);
+        assert!(
+            result.is_err(),
+            "Method '{}' should NOT be allowed for role 'read'",
+            method
+        );
+
+        // But allowed for write and admin
+        for role in ["write", "admin"] {
+            let conn = make_conn(role);
+            let result = check_method_authorization(method, &conn);
+            assert!(
+                result.is_ok(),
+                "Method '{}' should be allowed for role '{}'",
+                method,
+                role
+            );
+        }
+    }
+}
+
+#[test]
+fn test_method_authorization_admin_methods() {
+    // Admin methods should only be allowed by admin role
+    let admin_methods = [
+        "device.pair.approve",
+        "device.token.rotate",
+        "exec.approvals.set",
+        "node.pair.approve",
+    ];
+
+    for method in admin_methods {
+        // Not allowed for read or write
+        for role in ["read", "write"] {
+            let conn = make_conn(role);
+            let result = check_method_authorization(method, &conn);
+            assert!(
+                result.is_err(),
+                "Method '{}' should NOT be allowed for role '{}'",
+                method,
+                role
+            );
+        }
+
+        // Allowed for admin
+        let admin_conn = make_conn("admin");
+        let result = check_method_authorization(method, &admin_conn);
+        assert!(
+            result.is_ok(),
+            "Method '{}' should be allowed for role 'admin'",
+            method
+        );
+    }
+}
+
+#[test]
+fn test_method_authorization_unknown_method_requires_admin() {
+    // Unknown methods should require admin (fail secure)
+    let conn = make_conn("write");
+    let result = check_method_authorization("unknown.method.xyz", &conn);
+    assert!(result.is_err(), "Unknown method should require admin role");
+
+    let admin_conn = make_conn("admin");
+    let result = check_method_authorization("unknown.method.xyz", &admin_conn);
+    assert!(result.is_ok(), "Unknown method should be allowed for admin");
+}
+
+#[test]
+fn test_method_authorization_error_contains_details() {
+    let conn = make_conn("read");
+    let result = check_method_authorization("config.set", &conn);
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.code, "FORBIDDEN");
+    assert!(err.message.contains("config.set"));
+    assert!(err.message.contains("write"));
+    assert!(err.message.contains("read"));
+}
+
+// ============== Node Role Allowlist Tests ==============
+
+#[test]
+fn test_node_role_only_allows_specific_methods() {
+    let conn = make_conn("node");
+
+    // Allowed methods for node role
+    for method in NODE_ONLY_METHODS {
+        let result = check_method_authorization(method, &conn);
+        assert!(
+            result.is_ok(),
+            "Method '{}' should be allowed for node role",
+            method
+        );
+    }
+
+    // Read methods should NOT be allowed for node role
+    let blocked_methods = ["health", "status", "config.get", "sessions.list"];
+    for method in blocked_methods {
+        let result = check_method_authorization(method, &conn);
+        assert!(
+            result.is_err(),
+            "Method '{}' should NOT be allowed for node role",
+            method
+        );
+    }
+}
+
+// ============== Operator Scope Tests ==============
+
+#[test]
+fn test_operator_without_scopes_cannot_write() {
+    // Operator with no scopes should not be able to call write methods
+    let conn = make_conn_with_scopes("operator", vec![]);
+
+    let result = check_method_authorization("config.set", &conn);
+    assert!(
+        result.is_err(),
+        "Operator without scopes should not be able to write"
+    );
+}
+
+#[test]
+fn test_operator_with_write_scope_can_write() {
+    let conn = make_conn_with_scopes("operator", vec!["operator.write".to_string()]);
+
+    // config.set requires operator.admin (it's in OPERATOR_ADMIN_REQUIRED_METHODS)
+    let result = check_method_authorization("config.set", &conn);
+    assert!(
+        result.is_err(),
+        "config.set requires operator.admin, not just write scope"
+    );
+
+    // sessions.patch also requires operator.admin
+    let result = check_method_authorization("sessions.patch", &conn);
+    assert!(
+        result.is_err(),
+        "sessions.patch requires operator.admin, not just write scope"
+    );
+
+    // agent/chat are write-level methods that DO work with operator.write
+    let result = check_method_authorization("agent", &conn);
+    assert!(
+        result.is_ok(),
+        "agent is a write-level method that works with operator.write"
+    );
+
+    let result = check_method_authorization("chat.send", &conn);
+    assert!(
+        result.is_ok(),
+        "chat.send is a write-level method that works with operator.write"
+    );
+}
+
+#[test]
+fn test_operator_with_read_scope_can_read() {
+    let conn = make_conn_with_scopes("operator", vec!["operator.read".to_string()]);
+
+    // Read methods should work
+    let result = check_method_authorization("health", &conn);
+    assert!(
+        result.is_ok(),
+        "Operator with read scope should be able to read"
+    );
+
+    // Write methods should not work
+    let result = check_method_authorization("config.set", &conn);
+    assert!(
+        result.is_err(),
+        "Operator with only read scope should not be able to write"
+    );
+}
+
+#[test]
+fn test_operator_needs_pairing_scope_for_pairing() {
+    // Per Node.js gateway: operator.pairing allows pairing methods WITHOUT needing operator.admin
+    // This enables granular access control where operators can be granted just pairing rights
+
+    // Operator with admin scope - can pair (admin covers all)
+    let conn = make_conn_with_scopes("operator", vec!["operator.admin".to_string()]);
+    let result = check_method_authorization("device.pair.approve", &conn);
+    assert!(
+        result.is_ok(),
+        "Operator with admin scope should be able to pair"
+    );
+
+    // Operator with only write scope - cannot pair (needs pairing or admin)
+    let conn_write = make_conn_with_scopes("operator", vec!["operator.write".to_string()]);
+    let result = check_method_authorization("device.pair.approve", &conn_write);
+    assert!(
+        result.is_err(),
+        "Operator with only write scope should not be able to pair"
+    );
+
+    // Operator with just pairing scope - CAN pair (per Node.js gateway)
+    let conn_pairing = make_conn_with_scopes("operator", vec!["operator.pairing".to_string()]);
+    let result = check_method_authorization("device.pair.approve", &conn_pairing);
+    assert!(
+        result.is_ok(),
+        "Operator with pairing scope should be able to pair (Node.js parity)"
+    );
+
+    // Operator with read scope only - cannot pair
+    let conn_read = make_conn_with_scopes("operator", vec!["operator.read".to_string()]);
+    let result = check_method_authorization("device.pair.approve", &conn_read);
+    assert!(
+        result.is_err(),
+        "Operator with only read scope should not be able to pair"
+    );
+}
+
+#[test]
+fn test_operator_needs_approvals_scope_for_exec_approvals() {
+    // Per Node.js gateway: operator.approvals allows exec approval methods WITHOUT needing operator.admin
+
+    let conn = make_conn_with_scopes("operator", vec!["operator.write".to_string()]);
+    let result = check_method_authorization("exec.approvals.set", &conn);
+    assert!(
+        result.is_err(),
+        "Operator without approvals scope should not set approvals"
+    );
+
+    // Admin scope covers all
+    let conn_admin = make_conn_with_scopes("operator", vec!["operator.admin".to_string()]);
+    let result = check_method_authorization("exec.approvals.set", &conn_admin);
+    assert!(
+        result.is_ok(),
+        "Operator with admin scope should set approvals"
+    );
+
+    // Approvals scope alone allows exec approval methods (per Node.js gateway)
+    let conn_approvals = make_conn_with_scopes("operator", vec!["operator.approvals".to_string()]);
+    let result = check_method_authorization("exec.approvals.set", &conn_approvals);
+    assert!(
+        result.is_ok(),
+        "Operator with approvals scope should set approvals (Node.js parity)"
+    );
+}
+
+#[test]
+fn test_operator_wildcard_scope() {
+    let conn = make_conn_with_scopes("operator", vec!["operator.*".to_string()]);
+
+    // Wildcard should cover all operations (covers operator.admin, operator.pairing, etc.)
+    assert!(
+        check_method_authorization("config.set", &conn).is_ok(),
+        "wildcard covers operator.admin for config.set"
+    );
+    assert!(
+        check_method_authorization("device.pair.approve", &conn).is_ok(),
+        "wildcard covers operator.pairing"
+    );
+    assert!(
+        check_method_authorization("exec.approvals.set", &conn).is_ok(),
+        "wildcard covers operator.approvals"
+    );
+    assert!(
+        check_method_authorization("agent", &conn).is_ok(),
+        "wildcard covers operator.write"
+    );
+    assert!(
+        check_method_authorization("health", &conn).is_ok(),
+        "wildcard covers operator.read"
+    );
+}
+
+#[test]
+fn test_scope_satisfies() {
+    // Exact match
+    assert!(scope_satisfies(
+        &vec!["operator.write".to_string()],
+        "operator.write"
+    ));
+    assert!(!scope_satisfies(
+        &vec!["operator.read".to_string()],
+        "operator.write"
+    ));
+
+    // Wildcard
+    assert!(scope_satisfies(
+        &vec!["operator.*".to_string()],
+        "operator.pairing"
+    ));
+    assert!(scope_satisfies(
+        &vec!["operator.*".to_string()],
+        "operator.admin"
+    ));
+
+    // Admin covers all
+    assert!(scope_satisfies(
+        &vec!["operator.admin".to_string()],
+        "operator.pairing"
+    ));
+    assert!(scope_satisfies(
+        &vec!["operator.admin".to_string()],
+        "operator.approvals"
+    ));
+
+    // Write covers read
+    assert!(scope_satisfies(
+        &vec!["operator.write".to_string()],
+        "operator.read"
+    ));
+}
+
+// ============== Node Pairing Handler Tests ==============
+
+#[test]
+fn test_handle_node_pair_request() {
+    let state = WsServerState::new(WsServerConfig::default());
+
+    let params = json!({
+        "nodeId": "test-node-1",
+        "displayName": "Test Node",
+        "platform": "darwin",
+        "commands": ["system.run", "camera.snap"]
+    });
+
+    let result = handle_node_pair_request(Some(&params), &state);
+    assert!(result.is_ok());
+
+    let response = result.unwrap();
+    assert_eq!(response["status"], "pending");
+    assert_eq!(response["created"], true);
+    assert_eq!(response["request"]["nodeId"], "test-node-1");
+    assert!(response["request"]["requestId"].as_str().is_some());
+}
+
+#[test]
+fn test_handle_node_pair_request_requires_node_id() {
+    let state = WsServerState::new(WsServerConfig::default());
+
+    let params = json!({
+        "displayName": "Test Node"
+    });
+
+    let result = handle_node_pair_request(Some(&params), &state);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().code, ERROR_INVALID_REQUEST);
+}
+
+#[test]
+fn test_handle_node_pair_list() {
+    let state = WsServerState::new(WsServerConfig::default());
+
+    // Create a pairing request
+    let params = json!({
+        "nodeId": "test-node-1",
+        "displayName": "Test Node"
+    });
+    handle_node_pair_request(Some(&params), &state).unwrap();
+
+    // List should show the pending request
+    let result = handle_node_pair_list(&state);
+    assert!(result.is_ok());
+
+    let response = result.unwrap();
+    assert_eq!(response["paired"].as_array().unwrap().len(), 0);
+    assert_eq!(response["pending"].as_array().unwrap().len(), 1);
+    assert_eq!(response["pending"][0]["nodeId"], "test-node-1");
+}
+
+#[test]
+fn test_handle_node_pair_approve_and_verify() {
+    let state = WsServerState::new(WsServerConfig::default());
+
+    // Create a pairing request
+    let request_params = json!({
+        "nodeId": "test-node-1",
+        "displayName": "Test Node"
+    });
+    let request_response = handle_node_pair_request(Some(&request_params), &state).unwrap();
+    let request_id = request_response["request"]["requestId"].as_str().unwrap();
+
+    // Approve the request
+    let approve_params = json!({ "requestId": request_id });
+    let approve_result = handle_node_pair_approve(Some(&approve_params), &state);
+    assert!(approve_result.is_ok());
+
+    let approve_response = approve_result.unwrap();
+    assert_eq!(approve_response["requestId"], request_id);
+    assert_eq!(approve_response["node"]["nodeId"], "test-node-1");
+    let token = approve_response["node"]["token"].as_str().unwrap();
+    assert!(!token.is_empty());
+
+    // Verify the token
+    let verify_params = json!({
+        "nodeId": "test-node-1",
+        "token": token
+    });
+    let verify_result = handle_node_pair_verify(Some(&verify_params), &state);
+    assert!(verify_result.is_ok());
+    assert_eq!(verify_result.unwrap()["ok"], true);
+}
+
+#[test]
+fn test_handle_node_pair_reject() {
+    let state = WsServerState::new(WsServerConfig::default());
+
+    // Create a pairing request
+    let request_params = json!({
+        "nodeId": "test-node-1"
+    });
+    let request_response = handle_node_pair_request(Some(&request_params), &state).unwrap();
+    let request_id = request_response["request"]["requestId"].as_str().unwrap();
+
+    // Reject the request
+    let reject_params = json!({
+        "requestId": request_id,
+        "reason": "Not authorized"
+    });
+    let reject_result = handle_node_pair_reject(Some(&reject_params), &state);
+    assert!(reject_result.is_ok());
+
+    let reject_response = reject_result.unwrap();
+    assert_eq!(reject_response["requestId"], request_id);
+    assert_eq!(reject_response["nodeId"], "test-node-1");
+
+    // Node should not be paired
+    assert!(!state.node_pairing.is_paired("test-node-1"));
+}
+
+#[test]
+fn test_handle_node_pair_verify_requires_pairing() {
+    let state = WsServerState::new(WsServerConfig::default());
+
+    // Try to verify without pairing
+    let verify_params = json!({
+        "nodeId": "unpaired-node",
+        "token": "some-token"
+    });
+    let verify_result = handle_node_pair_verify(Some(&verify_params), &state);
+    assert!(verify_result.is_ok());
+    assert_eq!(verify_result.unwrap()["ok"], false);
+}
+
+#[test]
+fn test_handle_node_list() {
+    let state = WsServerState::new(WsServerConfig::default());
+
+    // Initially empty
+    let result = handle_node_list(&state);
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap()["nodes"].as_array().unwrap().len(), 0);
+
+    // Pair a node
+    let request_params = json!({
+        "nodeId": "test-node-1",
+        "displayName": "Test Node",
+        "platform": "darwin"
+    });
+    let request_response = handle_node_pair_request(Some(&request_params), &state).unwrap();
+    let request_id = request_response["request"]["requestId"].as_str().unwrap();
+    handle_node_pair_approve(Some(&json!({ "requestId": request_id })), &state).unwrap();
+
+    // Should now have one node
+    let result = handle_node_list(&state);
+    assert!(result.is_ok());
+    let binding = result.unwrap();
+    let nodes = binding["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0]["nodeId"], "test-node-1");
+    assert_eq!(nodes[0]["displayName"], "Test Node");
+    assert_eq!(nodes[0]["platform"], "darwin");
+    assert_eq!(nodes[0]["paired"], true);
+    assert_eq!(nodes[0]["connected"], false);
+}
+
+#[test]
+fn test_handle_node_rename() {
+    let state = WsServerState::new(WsServerConfig::default());
+
+    // Pair a node
+    let request_params = json!({
+        "nodeId": "test-node-1",
+        "displayName": "Old Name"
+    });
+    let request_response = handle_node_pair_request(Some(&request_params), &state).unwrap();
+    let request_id = request_response["request"]["requestId"].as_str().unwrap();
+    handle_node_pair_approve(Some(&json!({ "requestId": request_id })), &state).unwrap();
+
+    // Rename the node
+    let rename_params = json!({
+        "nodeId": "test-node-1",
+        "name": "New Name"
+    });
+    let result = handle_node_rename(Some(&rename_params), &state);
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap()["name"], "New Name");
+
+    // Verify the name changed
+    let node = state.node_pairing.get_paired_node("test-node-1").unwrap();
+    assert_eq!(node.display_name, Some("New Name".to_string()));
+}
+
+#[test]
+fn test_handle_node_describe() {
+    let state = WsServerState::new(WsServerConfig::default());
+
+    // Pair a node
+    let request_params = json!({
+        "nodeId": "test-node-1",
+        "displayName": "Test Node",
+        "platform": "darwin",
+        "commands": ["system.run"]
+    });
+    let request_response = handle_node_pair_request(Some(&request_params), &state).unwrap();
+    let request_id = request_response["request"]["requestId"].as_str().unwrap();
+    handle_node_pair_approve(Some(&json!({ "requestId": request_id })), &state).unwrap();
+
+    // Describe the node
+    let describe_params = json!({ "nodeId": "test-node-1" });
+    let result = handle_node_describe(Some(&describe_params), &state);
+    assert!(result.is_ok());
+
+    let response = result.unwrap();
+    assert_eq!(response["nodeId"], "test-node-1");
+    assert_eq!(response["displayName"], "Test Node");
+    assert_eq!(response["platform"], "darwin");
+    assert_eq!(
+        response["commands"].as_array().unwrap(),
+        &vec![json!("system.run")]
+    );
+    assert_eq!(response["paired"], true);
+    assert_eq!(response["connected"], false);
+}
+
+#[test]
+fn test_handle_node_describe_requires_pairing() {
+    let state = WsServerState::new(WsServerConfig::default());
+
+    let describe_params = json!({ "nodeId": "unpaired-node" });
+    let result = handle_node_describe(Some(&describe_params), &state);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().code, ERROR_INVALID_REQUEST);
+}
