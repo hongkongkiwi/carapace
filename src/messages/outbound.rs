@@ -51,10 +51,11 @@ impl AsRef<str> for MessageId {
 }
 
 /// Delivery status of an outbound message
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryStatus {
     /// Message is queued for delivery
+    #[default]
     Queued,
     /// Message is being sent
     Sending,
@@ -66,12 +67,6 @@ pub enum DeliveryStatus {
     Cancelled,
     /// Message expired before delivery
     Expired,
-}
-
-impl Default for DeliveryStatus {
-    fn default() -> Self {
-        Self::Queued
-    }
 }
 
 impl std::fmt::Display for DeliveryStatus {

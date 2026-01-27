@@ -9,12 +9,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Connection status of a channel
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChannelStatus {
     /// Channel is connected and ready
     Connected,
     /// Channel is disconnected
+    #[default]
     Disconnected,
     /// Channel is in the process of connecting
     Connecting,
@@ -24,12 +25,6 @@ pub enum ChannelStatus {
     Paused,
     /// Channel logged out explicitly
     LoggedOut,
-}
-
-impl Default for ChannelStatus {
-    fn default() -> Self {
-        Self::Disconnected
-    }
 }
 
 impl std::fmt::Display for ChannelStatus {

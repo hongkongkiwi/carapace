@@ -16,9 +16,10 @@ use tracing::debug;
 pub const DEFAULT_PORT: u16 = 18789;
 
 /// Bind mode specifying how to resolve the listen address
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum BindMode {
     /// Bind to loopback only (127.0.0.1)
+    #[default]
     Loopback,
     /// Bind to detected LAN interface IP
     Lan,
@@ -30,12 +31,6 @@ pub enum BindMode {
     All,
     /// Custom IP address or hostname
     Custom(String),
-}
-
-impl Default for BindMode {
-    fn default() -> Self {
-        BindMode::Loopback
-    }
 }
 
 /// Errors that can occur during bind address resolution
