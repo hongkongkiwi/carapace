@@ -275,9 +275,15 @@ pub async fn build_ws_state_from_config() -> Result<Arc<WsServerState>, WsConfig
 pub async fn build_ws_config_from_files() -> Result<WsServerConfig, WsConfigError> {
     let cfg = config::load_config()?;
     let gateway = cfg.get("gateway").and_then(|v| v.as_object());
-    let auth_obj = gateway.and_then(|g| g.get("auth")).and_then(|v| v.as_object());
-    let tailscale_obj = gateway.and_then(|g| g.get("tailscale")).and_then(|v| v.as_object());
-    let control_ui_obj = gateway.and_then(|g| g.get("controlUi")).and_then(|v| v.as_object());
+    let auth_obj = gateway
+        .and_then(|g| g.get("auth"))
+        .and_then(|v| v.as_object());
+    let tailscale_obj = gateway
+        .and_then(|g| g.get("tailscale"))
+        .and_then(|v| v.as_object());
+    let control_ui_obj = gateway
+        .and_then(|g| g.get("controlUi"))
+        .and_then(|v| v.as_object());
 
     let mode = auth_obj
         .and_then(|o| o.get("mode"))
@@ -699,7 +705,11 @@ async fn handle_socket(
         }
     };
 
-    let ParsedRequest { id: req_id, method, params } = match parse_request_frame(&parsed) {
+    let ParsedRequest {
+        id: req_id,
+        method,
+        params,
+    } = match parse_request_frame(&parsed) {
         Ok(req) => req,
         Err(err) => {
             let close_reason = err.error.message.clone();
@@ -712,10 +722,17 @@ async fn handle_socket(
     };
 
     if method != "connect" {
-        let err =
-            error_shape(ERROR_INVALID_REQUEST, "invalid handshake: first request must be connect", None);
+        let err = error_shape(
+            ERROR_INVALID_REQUEST,
+            "invalid handshake: first request must be connect",
+            None,
+        );
         let _ = send_response(&tx, &req_id, false, None, Some(err));
-        let _ = send_close(&tx, 1008, "invalid handshake: first request must be connect");
+        let _ = send_close(
+            &tx,
+            1008,
+            "invalid handshake: first request must be connect",
+        );
         return;
     }
 
@@ -755,7 +772,9 @@ async fn handle_socket(
         return;
     }
 
-    if connect_params.max_protocol < PROTOCOL_VERSION || connect_params.min_protocol > PROTOCOL_VERSION {
+    if connect_params.max_protocol < PROTOCOL_VERSION
+        || connect_params.min_protocol > PROTOCOL_VERSION
+    {
         let err = error_shape(
             ERROR_INVALID_REQUEST,
             "protocol mismatch",
@@ -766,8 +785,7 @@ async fn handle_socket(
         return;
     }
 
-    let is_local =
-        is_local_direct_request(remote_addr, &headers, &state.config.trusted_proxies);
+    let is_local = is_local_direct_request(remote_addr, &headers, &state.config.trusted_proxies);
     let role = connect_params
         .role
         .clone()
@@ -835,7 +853,16 @@ async fn handle_socket(
         None => None,
     };
 
-    if let Err(err) = authorize_connection(&state, &connect_params, &headers, remote_addr, is_local, device_id.as_deref(), &role, &scopes) {
+    if let Err(err) = authorize_connection(
+        &state,
+        &connect_params,
+        &headers,
+        remote_addr,
+        is_local,
+        device_id.as_deref(),
+        &role,
+        &scopes,
+    ) {
         let _ = send_response(&tx, &req_id, false, None, Some(err.clone()));
         let _ = send_close(&tx, 1008, err.message.as_str());
         return;
@@ -947,7 +974,11 @@ async fn handle_socket(
                 break;
             }
         };
-        let ParsedRequest { id: req_id, method, params } = match parse_request_frame(&parsed) {
+        let ParsedRequest {
+            id: req_id,
+            method,
+            params,
+        } = match parse_request_frame(&parsed) {
             Ok(req) => req,
             Err(err) => {
                 if let Some(id) = err.id {
@@ -973,11 +1004,17 @@ async fn handle_socket(
                 if method_known {
                     let _ = send_response(&tx, &req_id, false, None, Some(err));
                 } else {
-                    let _ = send_response(&tx, &req_id, false, None, Some(error_shape(
-                        ERROR_INVALID_REQUEST,
-                        "unknown method",
-                        Some(json!({ "method": method })),
-                    )));
+                    let _ = send_response(
+                        &tx,
+                        &req_id,
+                        false,
+                        None,
+                        Some(error_shape(
+                            ERROR_INVALID_REQUEST,
+                            "unknown method",
+                            Some(json!({ "method": method })),
+                        )),
+                    );
                 }
             }
         }
@@ -1068,93 +1105,361 @@ fn handle_status(state: &WsServerState) -> Value {
     })
 }
 
+/// Methods exclusively for the `node` role
+///
+/// These methods can ONLY be called by node connections.
+/// Non-node roles are explicitly blocked from calling these.
+/// This matches Node.js gateway behavior in src/gateway/server-methods.ts.
+const NODE_ONLY_METHODS: [&str; 3] = ["node.invoke.result", "node.event", "skills.bins"];
+
+/// Methods that require operator.admin scope for operator role
+///
+/// Per Node.js gateway: config.*, wizard.*, update.*, skills.install/update,
+/// channels.logout, sessions.*, and cron.* require operator.admin for operators.
+const OPERATOR_ADMIN_REQUIRED_METHODS: [&str; 20] = [
+    "config.get",
+    "config.set",
+    "config.apply",
+    "config.patch",
+    "config.schema",
+    "sessions.patch",
+    "sessions.reset",
+    "sessions.delete",
+    "sessions.compact",
+    "wizard.start",
+    "wizard.next",
+    "wizard.cancel",
+    "update.run",
+    "skills.install",
+    "skills.update",
+    "cron.add",
+    "cron.update",
+    "cron.remove",
+    "cron.run",
+    "channels.logout",
+];
+
 /// Method authorization levels
 ///
 /// Methods are categorized by the minimum role required to call them:
 /// - read: health, status, list operations (any authenticated connection)
-/// - write: config changes, session modifications, agent invocations
+/// - write: session modifications, agent invocations
 /// - admin: device pairing, exec approvals, sensitive operations
+///
+/// Note: For operators, additional scope checks are applied separately.
 fn get_method_required_role(method: &str) -> &'static str {
     match method {
         // Read-only operations (any authenticated role)
-        "health" | "status" | "last-heartbeat" |
-        "config.get" | "config.schema" |
-        "sessions.list" | "sessions.preview" |
-        "channels.status" |
-        "agent.identity.get" |
-        "chat.history" |
-        "tts.status" | "tts.providers" |
-        "voicewake.get" |
-        "wizard.status" |
-        "models.list" | "agents.list" |
-        "skills.status" | "skills.bins" |
-        "cron.status" | "cron.list" | "cron.runs" |
-        "node.list" | "node.describe" | "node.pair.list" |
-        "device.pair.list" |
-        "exec.approvals.get" | "exec.approvals.node.get" |
-        "usage.status" | "usage.cost" |
-        "logs.tail" => "read",
+        "health"
+        | "status"
+        | "last-heartbeat"
+        | "config.get"
+        | "config.schema"
+        | "sessions.list"
+        | "sessions.preview"
+        | "channels.status"
+        | "agent.identity.get"
+        | "chat.history"
+        | "tts.status"
+        | "tts.providers"
+        | "voicewake.get"
+        | "wizard.status"
+        | "models.list"
+        | "agents.list"
+        | "skills.status"
+        | "cron.status"
+        | "cron.list"
+        | "cron.runs"
+        | "node.list"
+        | "node.describe"
+        | "node.pair.list"
+        | "device.pair.list"
+        | "exec.approvals.get"
+        | "exec.approvals.node.get"
+        | "usage.status"
+        | "usage.cost"
+        | "logs.tail" => "read",
 
         // Write operations (requires write or admin role)
-        "config.set" | "config.apply" | "config.patch" |
-        "sessions.patch" | "sessions.reset" | "sessions.delete" | "sessions.compact" |
-        "channels.logout" |
-        "agent" | "agent.wait" |
-        "chat.send" | "chat.abort" |
-        "tts.enable" | "tts.disable" | "tts.convert" | "tts.setProvider" |
-        "voicewake.set" |
-        "wizard.start" | "wizard.next" | "wizard.cancel" |
-        "talk.mode" |
-        "skills.install" | "skills.update" | "update.run" |
-        "cron.add" | "cron.update" | "cron.remove" | "cron.run" |
-        "node.invoke" | "node.invoke.result" | "node.event" |
-        "set-heartbeats" | "wake" | "send" |
-        "system-presence" | "system-event" => "write",
+        "config.set" | "config.apply" | "config.patch" | "sessions.patch" | "sessions.reset"
+        | "sessions.delete" | "sessions.compact" | "channels.logout" | "agent" | "agent.wait"
+        | "chat.send" | "chat.abort" | "tts.enable" | "tts.disable" | "tts.convert"
+        | "tts.setProvider" | "voicewake.set" | "wizard.start" | "wizard.next"
+        | "wizard.cancel" | "talk.mode" | "skills.install" | "skills.update" | "update.run"
+        | "cron.add" | "cron.update" | "cron.remove" | "cron.run" | "node.invoke"
+        | "set-heartbeats" | "wake" | "send" | "system-presence" | "system-event" => "write",
 
-        // Admin operations (requires admin role)
-        "device.pair.approve" | "device.pair.reject" |
-        "device.token.rotate" | "device.token.revoke" |
-        "node.pair.request" | "node.pair.approve" | "node.pair.reject" | "node.pair.verify" | "node.rename" |
-        "exec.approvals.set" | "exec.approvals.node.set" |
-        "exec.approval.request" | "exec.approval.resolve" => "admin",
+        // Admin operations (requires admin role, or operator with specific scopes)
+        "device.pair.approve"
+        | "device.pair.reject"
+        | "device.token.rotate"
+        | "device.token.revoke"
+        | "node.pair.request"
+        | "node.pair.approve"
+        | "node.pair.reject"
+        | "node.pair.verify"
+        | "node.rename"
+        | "exec.approvals.set"
+        | "exec.approvals.node.set"
+        | "exec.approval.request"
+        | "exec.approval.resolve" => "admin",
 
         // Unknown methods default to admin (fail secure)
         _ => "admin",
     }
 }
 
+/// Get the required scope for admin-level methods (for operator role)
+///
+/// These are methods that require a specific scope beyond operator.admin.
+/// Operators can call these with the specific scope without needing full operator.admin.
+fn get_method_specific_scope(method: &str) -> Option<&'static str> {
+    match method {
+        // Pairing operations require operator.pairing scope
+        "device.pair.approve"
+        | "device.pair.reject"
+        | "device.token.rotate"
+        | "device.token.revoke"
+        | "node.pair.request"
+        | "node.pair.approve"
+        | "node.pair.reject"
+        | "node.pair.verify"
+        | "node.rename" => Some("operator.pairing"),
+
+        // Exec approval operations require operator.approvals scope
+        "exec.approvals.set"
+        | "exec.approvals.node.set"
+        | "exec.approval.request"
+        | "exec.approval.resolve" => Some("operator.approvals"),
+
+        // All other methods don't have a specific scope override
+        _ => None,
+    }
+}
+
 /// Check if a role satisfies the required role level
 ///
-/// Role hierarchy: admin > write > read
+/// Role hierarchy: admin > operator > write > read
 fn role_satisfies(has_role: &str, required_role: &str) -> bool {
     match required_role {
         "read" => true, // Any role satisfies read
-        "write" => has_role == "write" || has_role == "admin" || has_role == "operator",
+        "write" => matches!(has_role, "write" | "admin" | "operator"),
         "admin" => has_role == "admin",
         _ => false,
     }
 }
 
-/// Check if the connection is authorized to call a method
-fn check_method_authorization(method: &str, conn: &ConnectionContext) -> Result<(), ErrorShape> {
-    let required = get_method_required_role(method);
+/// Check if scopes satisfy the required scope
+fn scope_satisfies(scopes: &[String], required_scope: &str) -> bool {
+    for scope in scopes {
+        // Exact match
+        if scope == required_scope {
+            return true;
+        }
 
-    if role_satisfies(&conn.role, required) {
+        // Wildcard: operator.* covers all operator scopes
+        if scope == "operator.*" && required_scope.starts_with("operator.") {
+            return true;
+        }
+
+        // operator.admin covers all operator scopes
+        if scope == "operator.admin" && required_scope.starts_with("operator.") {
+            return true;
+        }
+
+        // operator.write covers operator.read
+        if scope == "operator.write" && required_scope == "operator.read" {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Check if the connection is authorized to call a method
+///
+/// Authorization flow (matching Node.js gateway):
+/// 1. Block node-only methods for non-node roles
+/// 2. Node role: only allow node-only methods
+/// 3. Admin role: full access
+/// 4. Operator role: check scopes per method requirements
+/// 5. Other roles: check role hierarchy
+fn check_method_authorization(method: &str, conn: &ConnectionContext) -> Result<(), ErrorShape> {
+    // Block node-only methods for non-node roles
+    if NODE_ONLY_METHODS.contains(&method) && conn.role != "node" {
+        return Err(error_shape(
+            ERROR_FORBIDDEN,
+            &format!("method '{}' is only allowed for node role", method),
+            Some(json!({
+                "method": method,
+                "connection_role": conn.role,
+                "required_role": "node"
+            })),
+        ));
+    }
+
+    // Node role: only allow node-only methods
+    if conn.role == "node" {
+        if NODE_ONLY_METHODS.contains(&method) {
+            return Ok(());
+        }
+        return Err(error_shape(
+            ERROR_FORBIDDEN,
+            &format!(
+                "method '{}' not allowed for node role (allowed: {:?})",
+                method, NODE_ONLY_METHODS
+            ),
+            Some(json!({
+                "method": method,
+                "connection_role": "node",
+                "allowed_methods": NODE_ONLY_METHODS
+            })),
+        ));
+    }
+
+    // Admin role: full access
+    if conn.role == "admin" {
         return Ok(());
     }
 
-    Err(error_shape(
-        ERROR_FORBIDDEN,
-        &format!(
-            "method '{}' requires role '{}', connection has role '{}'",
-            method, required, conn.role
-        ),
-        Some(json!({
-            "method": method,
-            "required_role": required,
-            "connection_role": conn.role
-        })),
-    ))
+    let required_role = get_method_required_role(method);
+
+    // Operator role: check scopes per Node.js gateway model
+    if conn.role == "operator" {
+        return check_operator_authorization(method, required_role, conn);
+    }
+
+    // Other roles: check role hierarchy
+    if !role_satisfies(&conn.role, required_role) {
+        return Err(error_shape(
+            ERROR_FORBIDDEN,
+            &format!(
+                "method '{}' requires role '{}', connection has role '{}'",
+                method, required_role, conn.role
+            ),
+            Some(json!({
+                "method": method,
+                "required_role": required_role,
+                "connection_role": conn.role
+            })),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Check operator authorization with scope-based access control
+///
+/// Per Node.js gateway:
+/// - operator.admin required for: config.*, wizard.*, update.*, skills.install/update, channels.logout
+/// - operator.pairing allows: device pairing methods (without needing operator.admin)
+/// - operator.approvals allows: exec approval methods (without needing operator.admin)
+/// - operator.write required for write-level methods
+/// - operator.read required for read-level methods
+fn check_operator_authorization(
+    method: &str,
+    required_role: &str,
+    conn: &ConnectionContext,
+) -> Result<(), ErrorShape> {
+    // Check if method requires operator.admin (config.*, wizard.*, etc.)
+    if OPERATOR_ADMIN_REQUIRED_METHODS.contains(&method) {
+        if !scope_satisfies(&conn.scopes, "operator.admin") {
+            return Err(error_shape(
+                ERROR_FORBIDDEN,
+                &format!("method '{}' requires 'operator.admin' scope", method),
+                Some(json!({
+                    "method": method,
+                    "required_scope": "operator.admin",
+                    "connection_scopes": conn.scopes
+                })),
+            ));
+        }
+        return Ok(());
+    }
+
+    // Check if method has a specific scope that can bypass operator.admin
+    // E.g., operator.pairing allows device.pair.* without full admin
+    if let Some(specific_scope) = get_method_specific_scope(method) {
+        if scope_satisfies(&conn.scopes, specific_scope) {
+            return Ok(());
+        }
+        // Also allow if they have operator.admin
+        if scope_satisfies(&conn.scopes, "operator.admin") {
+            return Ok(());
+        }
+        return Err(error_shape(
+            ERROR_FORBIDDEN,
+            &format!(
+                "method '{}' requires '{}' or 'operator.admin' scope",
+                method, specific_scope
+            ),
+            Some(json!({
+                "method": method,
+                "required_scope": specific_scope,
+                "connection_scopes": conn.scopes
+            })),
+        ));
+    }
+
+    // Check scope based on required role level
+    match required_role {
+        "write" => {
+            if !scope_satisfies(&conn.scopes, "operator.write") {
+                return Err(error_shape(
+                    ERROR_FORBIDDEN,
+                    &format!("method '{}' requires 'operator.write' scope", method),
+                    Some(json!({
+                        "method": method,
+                        "required_scope": "operator.write",
+                        "connection_scopes": conn.scopes
+                    })),
+                ));
+            }
+        }
+        "read" => {
+            if !scope_satisfies(&conn.scopes, "operator.read") {
+                return Err(error_shape(
+                    ERROR_FORBIDDEN,
+                    &format!("method '{}' requires 'operator.read' scope", method),
+                    Some(json!({
+                        "method": method,
+                        "required_scope": "operator.read",
+                        "connection_scopes": conn.scopes
+                    })),
+                ));
+            }
+        }
+        "admin" => {
+            // Admin methods that don't have specific scopes require operator.admin
+            if !scope_satisfies(&conn.scopes, "operator.admin") {
+                return Err(error_shape(
+                    ERROR_FORBIDDEN,
+                    &format!("method '{}' requires 'operator.admin' scope", method),
+                    Some(json!({
+                        "method": method,
+                        "required_scope": "operator.admin",
+                        "connection_scopes": conn.scopes
+                    })),
+                ));
+            }
+        }
+        _ => {
+            // Unknown role level, fail secure
+            return Err(error_shape(
+                ERROR_FORBIDDEN,
+                &format!(
+                    "method '{}' has unknown required role '{}'",
+                    method, required_role
+                ),
+                Some(json!({
+                    "method": method,
+                    "required_role": required_role
+                })),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn dispatch_method(
@@ -1493,7 +1798,10 @@ fn handle_chat_history(params: Option<&Value>) -> Result<Value, ErrorShape> {
     }))
 }
 
-fn handle_chat_send(params: Option<&Value>, _conn: &ConnectionContext) -> Result<Value, ErrorShape> {
+fn handle_chat_send(
+    params: Option<&Value>,
+    _conn: &ConnectionContext,
+) -> Result<Value, ErrorShape> {
     let session_key = params
         .and_then(|v| v.get("sessionKey"))
         .and_then(|v| v.as_str())
@@ -1765,9 +2073,7 @@ fn handle_cron_run(params: Option<&Value>) -> Result<Value, ErrorShape> {
 }
 
 fn handle_cron_runs(params: Option<&Value>) -> Result<Value, ErrorShape> {
-    let job_id = params
-        .and_then(|v| v.get("jobId"))
-        .and_then(|v| v.as_str());
+    let job_id = params.and_then(|v| v.get("jobId")).and_then(|v| v.as_str());
     Ok(json!({
         "runs": [],
         "jobId": job_id
@@ -1924,7 +2230,10 @@ fn handle_device_pair_list(state: &WsServerState) -> Result<Value, ErrorShape> {
     Ok(json!({ "devices": devices }))
 }
 
-fn handle_device_pair_approve(params: Option<&Value>, state: &WsServerState) -> Result<Value, ErrorShape> {
+fn handle_device_pair_approve(
+    params: Option<&Value>,
+    state: &WsServerState,
+) -> Result<Value, ErrorShape> {
     let device_id = params
         .and_then(|v| v.get("deviceId"))
         .and_then(|v| v.as_str())
@@ -1972,7 +2281,10 @@ fn handle_device_pair_approve(params: Option<&Value>, state: &WsServerState) -> 
     }))
 }
 
-fn handle_device_pair_reject(params: Option<&Value>, _state: &WsServerState) -> Result<Value, ErrorShape> {
+fn handle_device_pair_reject(
+    params: Option<&Value>,
+    _state: &WsServerState,
+) -> Result<Value, ErrorShape> {
     let device_id = params
         .and_then(|v| v.get("deviceId"))
         .and_then(|v| v.as_str())
@@ -1984,7 +2296,10 @@ fn handle_device_pair_reject(params: Option<&Value>, _state: &WsServerState) -> 
     }))
 }
 
-fn handle_device_token_rotate(params: Option<&Value>, state: &WsServerState) -> Result<Value, ErrorShape> {
+fn handle_device_token_rotate(
+    params: Option<&Value>,
+    state: &WsServerState,
+) -> Result<Value, ErrorShape> {
     let device_id = params
         .and_then(|v| v.get("deviceId"))
         .and_then(|v| v.as_str())
@@ -2001,7 +2316,10 @@ fn handle_device_token_rotate(params: Option<&Value>, state: &WsServerState) -> 
     }))
 }
 
-fn handle_device_token_revoke(params: Option<&Value>, state: &WsServerState) -> Result<Value, ErrorShape> {
+fn handle_device_token_revoke(
+    params: Option<&Value>,
+    state: &WsServerState,
+) -> Result<Value, ErrorShape> {
     let device_id = params
         .and_then(|v| v.get("deviceId"))
         .and_then(|v| v.as_str())
@@ -2204,9 +2522,8 @@ fn validate_device_identity(
     nonce: &str,
     is_local: bool,
 ) -> Result<(), ErrorShape> {
-    let derived_id = derive_device_id_from_public_key(&device.public_key).ok_or_else(|| {
-        error_shape(ERROR_INVALID_REQUEST, "device public key invalid", None)
-    })?;
+    let derived_id = derive_device_id_from_public_key(&device.public_key)
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "device public key invalid", None))?;
     if derived_id != device.id {
         return Err(error_shape(
             ERROR_INVALID_REQUEST,
@@ -2243,11 +2560,18 @@ fn validate_device_identity(
         device_id: device.id.clone(),
         client_id: connect.client.id.clone(),
         client_mode: connect.client.mode.clone(),
-        role: connect.role.clone().unwrap_or_else(|| "operator".to_string()),
+        role: connect
+            .role
+            .clone()
+            .unwrap_or_else(|| "operator".to_string()),
         scopes: connect.scopes.clone().unwrap_or_default(),
         signed_at_ms: signed_at,
         token: connect.auth.as_ref().and_then(|a| a.token.clone()),
-        nonce: if provided_nonce.is_empty() { None } else { Some(provided_nonce.clone()) },
+        nonce: if provided_nonce.is_empty() {
+            None
+        } else {
+            Some(provided_nonce.clone())
+        },
     });
     if !verify_device_signature(&device.public_key, &payload, &device.signature) {
         return Err(error_shape(
@@ -2294,7 +2618,11 @@ fn authorize_connection(
                 ));
             };
             let Some(provided) = connect_auth.and_then(|a| a.token.as_ref()) else {
-                return Err(error_shape(ERROR_INVALID_REQUEST, "unauthorized: token missing", None));
+                return Err(error_shape(
+                    ERROR_INVALID_REQUEST,
+                    "unauthorized: token missing",
+                    None,
+                ));
             };
             if timing_safe_eq(token, provided) {
                 return Ok(());
@@ -2309,7 +2637,11 @@ fn authorize_connection(
                 ));
             };
             let Some(provided) = connect_auth.and_then(|a| a.password.as_ref()) else {
-                return Err(error_shape(ERROR_INVALID_REQUEST, "unauthorized: password missing", None));
+                return Err(error_shape(
+                    ERROR_INVALID_REQUEST,
+                    "unauthorized: password missing",
+                    None,
+                ));
             };
             if timing_safe_eq(password, provided) {
                 return Ok(());
@@ -2670,11 +3002,7 @@ fn get_host_name(host_header: Option<String>) -> String {
             return trimmed[1..end].to_string();
         }
     }
-    trimmed
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .to_string()
+    trimmed.split(':').next().unwrap_or_default().to_string()
 }
 
 fn normalize_ip(raw: &str) -> Option<String> {
@@ -2695,10 +3023,7 @@ fn parse_forwarded_for(value: Option<String>) -> Option<String> {
 }
 
 fn is_loopback_address(ip: &str) -> bool {
-    ip == "127.0.0.1"
-        || ip.starts_with("127.")
-        || ip == "::1"
-        || ip.starts_with("::ffff:127.")
+    ip == "127.0.0.1" || ip.starts_with("127.") || ip == "::1" || ip.starts_with("::ffff:127.")
 }
 
 fn is_trusted_proxy(remote: Option<&str>, trusted: &[String]) -> bool {
@@ -2735,11 +3060,14 @@ fn is_local_direct_request(
     let real_ip = header_value(headers, "x-real-ip");
     let has_forwarded = forwarded_for.is_some() || real_ip.is_some();
     let host = get_host_name(header_value(headers, "host"));
-    let host_is_local =
-        host == "localhost" || host == "127.0.0.1" || host == "::1";
+    let host_is_local = host == "localhost" || host == "127.0.0.1" || host == "::1";
     let host_is_tailscale = host.ends_with(".ts.net");
     let client_ip = resolve_client_ip(&remote_ip, forwarded_for, real_ip, trusted);
-    if !client_ip.as_ref().map(|ip| is_loopback_address(ip)).unwrap_or(false) {
+    if !client_ip
+        .as_ref()
+        .map(|ip| is_loopback_address(ip))
+        .unwrap_or(false)
+    {
         return false;
     }
     (host_is_local || host_is_tailscale)
@@ -2853,7 +3181,10 @@ mod tests {
     #[test]
     fn test_normalize_ip() {
         assert_eq!(normalize_ip("192.168.1.1"), Some("192.168.1.1".to_string()));
-        assert_eq!(normalize_ip("::ffff:192.168.1.1"), Some("192.168.1.1".to_string()));
+        assert_eq!(
+            normalize_ip("::ffff:192.168.1.1"),
+            Some("192.168.1.1".to_string())
+        );
         assert_eq!(normalize_ip("  10.0.0.1  "), Some("10.0.0.1".to_string()));
         assert_eq!(normalize_ip(""), None);
         assert_eq!(normalize_ip("   "), None);
@@ -2861,7 +3192,10 @@ mod tests {
 
     #[test]
     fn test_get_host_name() {
-        assert_eq!(get_host_name(Some("localhost:8080".to_string())), "localhost");
+        assert_eq!(
+            get_host_name(Some("localhost:8080".to_string())),
+            "localhost"
+        );
         assert_eq!(get_host_name(Some("localhost".to_string())), "localhost");
         assert_eq!(get_host_name(Some("[::1]:8080".to_string())), "::1");
         assert_eq!(get_host_name(None), "");
@@ -2917,10 +3251,7 @@ mod tests {
             }
         });
 
-        assert_eq!(
-            get_value_at_path(&root, "gateway.port"),
-            Some(json!(8080))
-        );
+        assert_eq!(get_value_at_path(&root, "gateway.port"), Some(json!(8080)));
         assert_eq!(
             get_value_at_path(&root, "gateway.auth.mode"),
             Some(json!("token"))
@@ -2932,10 +3263,14 @@ mod tests {
     // ============== Method Authorization Tests ==============
 
     fn make_conn(role: &str) -> ConnectionContext {
+        make_conn_with_scopes(role, vec![])
+    }
+
+    fn make_conn_with_scopes(role: &str, scopes: Vec<String>) -> ConnectionContext {
         ConnectionContext {
             conn_id: "test-conn".to_string(),
             role: role.to_string(),
-            scopes: vec![],
+            scopes,
             client: ClientInfo {
                 id: "test-client".to_string(),
                 version: "1.0".to_string(),
@@ -2973,13 +3308,24 @@ mod tests {
     #[test]
     fn test_method_authorization_read_methods() {
         // Read-only methods should be allowed by any role
-        let read_methods = ["health", "status", "config.get", "sessions.list", "channels.status"];
+        let read_methods = [
+            "health",
+            "status",
+            "config.get",
+            "sessions.list",
+            "channels.status",
+        ];
 
         for method in read_methods {
             for role in ["read", "write", "admin"] {
                 let conn = make_conn(role);
                 let result = check_method_authorization(method, &conn);
-                assert!(result.is_ok(), "Method '{}' should be allowed for role '{}'", method, role);
+                assert!(
+                    result.is_ok(),
+                    "Method '{}' should be allowed for role '{}'",
+                    method,
+                    role
+                );
             }
         }
     }
@@ -2992,13 +3338,22 @@ mod tests {
         for method in write_methods {
             let read_conn = make_conn("read");
             let result = check_method_authorization(method, &read_conn);
-            assert!(result.is_err(), "Method '{}' should NOT be allowed for role 'read'", method);
+            assert!(
+                result.is_err(),
+                "Method '{}' should NOT be allowed for role 'read'",
+                method
+            );
 
             // But allowed for write and admin
             for role in ["write", "admin"] {
                 let conn = make_conn(role);
                 let result = check_method_authorization(method, &conn);
-                assert!(result.is_ok(), "Method '{}' should be allowed for role '{}'", method, role);
+                assert!(
+                    result.is_ok(),
+                    "Method '{}' should be allowed for role '{}'",
+                    method,
+                    role
+                );
             }
         }
     }
@@ -3018,13 +3373,22 @@ mod tests {
             for role in ["read", "write"] {
                 let conn = make_conn(role);
                 let result = check_method_authorization(method, &conn);
-                assert!(result.is_err(), "Method '{}' should NOT be allowed for role '{}'", method, role);
+                assert!(
+                    result.is_err(),
+                    "Method '{}' should NOT be allowed for role '{}'",
+                    method,
+                    role
+                );
             }
 
             // Allowed for admin
             let admin_conn = make_conn("admin");
             let result = check_method_authorization(method, &admin_conn);
-            assert!(result.is_ok(), "Method '{}' should be allowed for role 'admin'", method);
+            assert!(
+                result.is_ok(),
+                "Method '{}' should be allowed for role 'admin'",
+                method
+            );
         }
     }
 
@@ -3051,6 +3415,232 @@ mod tests {
         assert!(err.message.contains("config.set"));
         assert!(err.message.contains("write"));
         assert!(err.message.contains("read"));
+    }
+
+    // ============== Node Role Allowlist Tests ==============
+
+    #[test]
+    fn test_node_role_only_allows_specific_methods() {
+        let conn = make_conn("node");
+
+        // Allowed methods for node role
+        for method in NODE_ONLY_METHODS {
+            let result = check_method_authorization(method, &conn);
+            assert!(
+                result.is_ok(),
+                "Method '{}' should be allowed for node role",
+                method
+            );
+        }
+
+        // Read methods should NOT be allowed for node role
+        let blocked_methods = ["health", "status", "config.get", "sessions.list"];
+        for method in blocked_methods {
+            let result = check_method_authorization(method, &conn);
+            assert!(
+                result.is_err(),
+                "Method '{}' should NOT be allowed for node role",
+                method
+            );
+        }
+    }
+
+    // ============== Operator Scope Tests ==============
+
+    #[test]
+    fn test_operator_without_scopes_cannot_write() {
+        // Operator with no scopes should not be able to call write methods
+        let conn = make_conn_with_scopes("operator", vec![]);
+
+        let result = check_method_authorization("config.set", &conn);
+        assert!(
+            result.is_err(),
+            "Operator without scopes should not be able to write"
+        );
+    }
+
+    #[test]
+    fn test_operator_with_write_scope_can_write() {
+        let conn = make_conn_with_scopes("operator", vec!["operator.write".to_string()]);
+
+        // config.set requires operator.admin (it's in OPERATOR_ADMIN_REQUIRED_METHODS)
+        let result = check_method_authorization("config.set", &conn);
+        assert!(
+            result.is_err(),
+            "config.set requires operator.admin, not just write scope"
+        );
+
+        // sessions.patch also requires operator.admin
+        let result = check_method_authorization("sessions.patch", &conn);
+        assert!(
+            result.is_err(),
+            "sessions.patch requires operator.admin, not just write scope"
+        );
+
+        // agent/chat are write-level methods that DO work with operator.write
+        let result = check_method_authorization("agent", &conn);
+        assert!(
+            result.is_ok(),
+            "agent is a write-level method that works with operator.write"
+        );
+
+        let result = check_method_authorization("chat.send", &conn);
+        assert!(
+            result.is_ok(),
+            "chat.send is a write-level method that works with operator.write"
+        );
+    }
+
+    #[test]
+    fn test_operator_with_read_scope_can_read() {
+        let conn = make_conn_with_scopes("operator", vec!["operator.read".to_string()]);
+
+        // Read methods should work
+        let result = check_method_authorization("health", &conn);
+        assert!(
+            result.is_ok(),
+            "Operator with read scope should be able to read"
+        );
+
+        // Write methods should not work
+        let result = check_method_authorization("config.set", &conn);
+        assert!(
+            result.is_err(),
+            "Operator with only read scope should not be able to write"
+        );
+    }
+
+    #[test]
+    fn test_operator_needs_pairing_scope_for_pairing() {
+        // Per Node.js gateway: operator.pairing allows pairing methods WITHOUT needing operator.admin
+        // This enables granular access control where operators can be granted just pairing rights
+
+        // Operator with admin scope - can pair (admin covers all)
+        let conn = make_conn_with_scopes("operator", vec!["operator.admin".to_string()]);
+        let result = check_method_authorization("device.pair.approve", &conn);
+        assert!(
+            result.is_ok(),
+            "Operator with admin scope should be able to pair"
+        );
+
+        // Operator with only write scope - cannot pair (needs pairing or admin)
+        let conn_write = make_conn_with_scopes("operator", vec!["operator.write".to_string()]);
+        let result = check_method_authorization("device.pair.approve", &conn_write);
+        assert!(
+            result.is_err(),
+            "Operator with only write scope should not be able to pair"
+        );
+
+        // Operator with just pairing scope - CAN pair (per Node.js gateway)
+        let conn_pairing = make_conn_with_scopes("operator", vec!["operator.pairing".to_string()]);
+        let result = check_method_authorization("device.pair.approve", &conn_pairing);
+        assert!(
+            result.is_ok(),
+            "Operator with pairing scope should be able to pair (Node.js parity)"
+        );
+
+        // Operator with read scope only - cannot pair
+        let conn_read = make_conn_with_scopes("operator", vec!["operator.read".to_string()]);
+        let result = check_method_authorization("device.pair.approve", &conn_read);
+        assert!(
+            result.is_err(),
+            "Operator with only read scope should not be able to pair"
+        );
+    }
+
+    #[test]
+    fn test_operator_needs_approvals_scope_for_exec_approvals() {
+        // Per Node.js gateway: operator.approvals allows exec approval methods WITHOUT needing operator.admin
+
+        let conn = make_conn_with_scopes("operator", vec!["operator.write".to_string()]);
+        let result = check_method_authorization("exec.approvals.set", &conn);
+        assert!(
+            result.is_err(),
+            "Operator without approvals scope should not set approvals"
+        );
+
+        // Admin scope covers all
+        let conn_admin = make_conn_with_scopes("operator", vec!["operator.admin".to_string()]);
+        let result = check_method_authorization("exec.approvals.set", &conn_admin);
+        assert!(
+            result.is_ok(),
+            "Operator with admin scope should set approvals"
+        );
+
+        // Approvals scope alone allows exec approval methods (per Node.js gateway)
+        let conn_approvals =
+            make_conn_with_scopes("operator", vec!["operator.approvals".to_string()]);
+        let result = check_method_authorization("exec.approvals.set", &conn_approvals);
+        assert!(
+            result.is_ok(),
+            "Operator with approvals scope should set approvals (Node.js parity)"
+        );
+    }
+
+    #[test]
+    fn test_operator_wildcard_scope() {
+        let conn = make_conn_with_scopes("operator", vec!["operator.*".to_string()]);
+
+        // Wildcard should cover all operations (covers operator.admin, operator.pairing, etc.)
+        assert!(
+            check_method_authorization("config.set", &conn).is_ok(),
+            "wildcard covers operator.admin for config.set"
+        );
+        assert!(
+            check_method_authorization("device.pair.approve", &conn).is_ok(),
+            "wildcard covers operator.pairing"
+        );
+        assert!(
+            check_method_authorization("exec.approvals.set", &conn).is_ok(),
+            "wildcard covers operator.approvals"
+        );
+        assert!(
+            check_method_authorization("agent", &conn).is_ok(),
+            "wildcard covers operator.write"
+        );
+        assert!(
+            check_method_authorization("health", &conn).is_ok(),
+            "wildcard covers operator.read"
+        );
+    }
+
+    #[test]
+    fn test_scope_satisfies() {
+        // Exact match
+        assert!(scope_satisfies(
+            &vec!["operator.write".to_string()],
+            "operator.write"
+        ));
+        assert!(!scope_satisfies(
+            &vec!["operator.read".to_string()],
+            "operator.write"
+        ));
+
+        // Wildcard
+        assert!(scope_satisfies(
+            &vec!["operator.*".to_string()],
+            "operator.pairing"
+        ));
+        assert!(scope_satisfies(
+            &vec!["operator.*".to_string()],
+            "operator.admin"
+        ));
+
+        // Admin covers all
+        assert!(scope_satisfies(
+            &vec!["operator.admin".to_string()],
+            "operator.pairing"
+        ));
+        assert!(scope_satisfies(
+            &vec!["operator.admin".to_string()],
+            "operator.approvals"
+        ));
+
+        // Write covers read
+        assert!(scope_satisfies(
+            &vec!["operator.write".to_string()],
+            "operator.read"
+        ));
     }
 
     // ============== Device Store Bounds Tests ==============
@@ -3081,8 +3671,14 @@ mod tests {
         });
 
         assert_eq!(store.paired.len(), MAX_PAIRED_DEVICES);
-        assert!(!store.paired.contains_key("device-0"), "Oldest device should be evicted");
-        assert!(store.paired.contains_key("device-new"), "New device should be added");
+        assert!(
+            !store.paired.contains_key("device-0"),
+            "Oldest device should be evicted"
+        );
+        assert!(
+            store.paired.contains_key("device-new"),
+            "New device should be added"
+        );
     }
 
     #[test]
@@ -3092,28 +3688,40 @@ mod tests {
         // Fill up to limit
         for i in 0..MAX_DEVICE_TOKENS {
             let key = format!("token-key-{}", i);
-            store.add_token(key, DeviceToken {
-                token: format!("token-{}", i),
-                device_id: format!("device-{}", i % 10),
-                role: "write".to_string(),
-                scopes: vec![],
-                issued_at_ms: i as u64,
-            });
+            store.add_token(
+                key,
+                DeviceToken {
+                    token: format!("token-{}", i),
+                    device_id: format!("device-{}", i % 10),
+                    role: "write".to_string(),
+                    scopes: vec![],
+                    issued_at_ms: i as u64,
+                },
+            );
         }
         assert_eq!(store.tokens.len(), MAX_DEVICE_TOKENS);
 
         // Add one more - should evict oldest
-        store.add_token("token-key-new".to_string(), DeviceToken {
-            token: "token-new".to_string(),
-            device_id: "device-new".to_string(),
-            role: "write".to_string(),
-            scopes: vec![],
-            issued_at_ms: (MAX_DEVICE_TOKENS + 1) as u64,
-        });
+        store.add_token(
+            "token-key-new".to_string(),
+            DeviceToken {
+                token: "token-new".to_string(),
+                device_id: "device-new".to_string(),
+                role: "write".to_string(),
+                scopes: vec![],
+                issued_at_ms: (MAX_DEVICE_TOKENS + 1) as u64,
+            },
+        );
 
         assert_eq!(store.tokens.len(), MAX_DEVICE_TOKENS);
-        assert!(!store.tokens.contains_key("token-key-0"), "Oldest token should be evicted");
-        assert!(store.tokens.contains_key("token-key-new"), "New token should be added");
+        assert!(
+            !store.tokens.contains_key("token-key-0"),
+            "Oldest token should be evicted"
+        );
+        assert!(
+            store.tokens.contains_key("token-key-new"),
+            "New token should be added"
+        );
     }
 
     #[test]
@@ -3141,8 +3749,14 @@ mod tests {
 
         // Should still be 1 device, but updated
         assert_eq!(store.paired.len(), 1);
-        assert_eq!(store.paired.get("device-1").unwrap().public_key, "key-1-updated");
-        assert_eq!(store.paired.get("device-1").unwrap().roles, vec!["write".to_string()]);
+        assert_eq!(
+            store.paired.get("device-1").unwrap().public_key,
+            "key-1-updated"
+        );
+        assert_eq!(
+            store.paired.get("device-1").unwrap().roles,
+            vec!["write".to_string()]
+        );
     }
 
     #[test]
@@ -3159,29 +3773,38 @@ mod tests {
         });
 
         // Add tokens for this device
-        store.add_token("token-key-1".to_string(), DeviceToken {
-            token: "token-1".to_string(),
-            device_id: "device-old".to_string(),
-            role: "write".to_string(),
-            scopes: vec![],
-            issued_at_ms: 100,
-        });
-        store.add_token("token-key-2".to_string(), DeviceToken {
-            token: "token-2".to_string(),
-            device_id: "device-old".to_string(),
-            role: "admin".to_string(),
-            scopes: vec![],
-            issued_at_ms: 101,
-        });
+        store.add_token(
+            "token-key-1".to_string(),
+            DeviceToken {
+                token: "token-1".to_string(),
+                device_id: "device-old".to_string(),
+                role: "write".to_string(),
+                scopes: vec![],
+                issued_at_ms: 100,
+            },
+        );
+        store.add_token(
+            "token-key-2".to_string(),
+            DeviceToken {
+                token: "token-2".to_string(),
+                device_id: "device-old".to_string(),
+                role: "admin".to_string(),
+                scopes: vec![],
+                issued_at_ms: 101,
+            },
+        );
 
         // Add another device's token
-        store.add_token("token-key-3".to_string(), DeviceToken {
-            token: "token-3".to_string(),
-            device_id: "device-other".to_string(),
-            role: "write".to_string(),
-            scopes: vec![],
-            issued_at_ms: 102,
-        });
+        store.add_token(
+            "token-key-3".to_string(),
+            DeviceToken {
+                token: "token-3".to_string(),
+                device_id: "device-other".to_string(),
+                role: "write".to_string(),
+                scopes: vec![],
+                issued_at_ms: 102,
+            },
+        );
 
         assert_eq!(store.tokens.len(), 3);
 
@@ -3207,8 +3830,17 @@ mod tests {
 
         // device-old should be evicted along with its tokens
         assert!(!store.paired.contains_key("device-old"));
-        assert!(!store.tokens.contains_key("token-key-1"), "Token for evicted device should be removed");
-        assert!(!store.tokens.contains_key("token-key-2"), "Token for evicted device should be removed");
-        assert!(store.tokens.contains_key("token-key-3"), "Token for other device should remain");
+        assert!(
+            !store.tokens.contains_key("token-key-1"),
+            "Token for evicted device should be removed"
+        );
+        assert!(
+            !store.tokens.contains_key("token-key-2"),
+            "Token for evicted device should be removed"
+        );
+        assert!(
+            store.tokens.contains_key("token-key-3"),
+            "Token for other device should remain"
+        );
     }
 }

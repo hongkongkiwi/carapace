@@ -8,8 +8,8 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hickory_resolver::TokioAsyncResolver;
 use hickory_resolver::config::{ResolverConfig, ResolverOpts};
+use hickory_resolver::TokioAsyncResolver;
 use parking_lot::RwLock;
 use reqwest::Client;
 use serde_json::Value;
@@ -19,8 +19,8 @@ use crate::config;
 use crate::credentials::{CredentialBackend, CredentialStore};
 
 use super::capabilities::{
-    CapabilityError, ConfigEnforcer, CredentialEnforcer, RateLimiterRegistry,
-    SsrfConfig, SsrfProtection,
+    CapabilityError, ConfigEnforcer, CredentialEnforcer, RateLimiterRegistry, SsrfConfig,
+    SsrfProtection,
 };
 
 /// Maximum message size for logging (4KB)
@@ -115,9 +115,6 @@ pub struct PluginHostContext<B: CredentialBackend + 'static> {
 
     /// SSRF configuration (whether to allow Tailscale IPs, etc.)
     ssrf_config: SsrfConfig,
-
-    /// HTTP client for making requests
-    http_client: Client,
 }
 
 impl<B: CredentialBackend + 'static> PluginHostContext<B> {
@@ -127,7 +124,12 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         credential_store: Arc<CredentialStore<B>>,
         rate_limiters: Arc<RateLimiterRegistry>,
     ) -> Self {
-        Self::with_ssrf_config(plugin_id, credential_store, rate_limiters, SsrfConfig::default())
+        Self::with_ssrf_config(
+            plugin_id,
+            credential_store,
+            rate_limiters,
+            SsrfConfig::default(),
+        )
     }
 
     /// Create a new plugin host context with custom SSRF config
@@ -137,20 +139,12 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         rate_limiters: Arc<RateLimiterRegistry>,
         ssrf_config: SsrfConfig,
     ) -> Self {
-        // Create HTTP client with default settings
-        let http_client = Client::builder()
-            .timeout(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS as u64))
-            .redirect(reqwest::redirect::Policy::limited(10))
-            .build()
-            .unwrap_or_else(|_| Client::new());
-
         Self {
             plugin_id,
             credential_store,
             rate_limiters,
             config_cache: RwLock::new(None),
             ssrf_config,
-            http_client,
         }
     }
 
@@ -335,7 +329,9 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
     /// This function:
     /// 1. Validates the URL for obvious SSRF attacks
     /// 2. Resolves DNS and validates each resolved IP
-    /// 3. Makes the HTTP request using validated IPs
+    /// 3. Pins the validated IP to prevent DNS rebinding
+    /// 4. Disables redirects to prevent redirect-based SSRF bypass
+    /// 5. Streams response with size limits to prevent memory exhaustion
     pub async fn http_fetch(&self, req: HttpRequest) -> Result<HttpResponse, HostError> {
         // Validate URL length
         if req.url.len() > MAX_URL_LENGTH {
@@ -374,13 +370,30 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
 
         let host = parsed_url
             .host_str()
-            .ok_or_else(|| HostError::Http("URL has no host".to_string()))?;
+            .ok_or_else(|| HostError::Http("URL has no host".to_string()))?
+            .to_string();
 
-        // DNS resolution and validation (prevents DNS rebinding attacks)
-        // Only resolve if the host is not already an IP address
+        let port = parsed_url.port_or_known_default().unwrap_or(80);
+
+        // DNS resolution and validation, then pin the validated IP
+        // This prevents DNS rebinding attacks
+        let mut client_builder = Client::builder()
+            .timeout(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS as u64))
+            // SECURITY: Disable redirects to prevent redirect-based SSRF bypass
+            // Attackers could redirect from a public URL to a private IP
+            .redirect(reqwest::redirect::Policy::none());
+
+        // If host is not already an IP, resolve and pin it
         if host.parse::<IpAddr>().is_err() {
-            self.validate_dns_resolution(host).await?;
+            let validated_ip = self.resolve_and_validate_dns(&host).await?;
+            // Pin the validated IP so reqwest uses it instead of re-resolving
+            let socket_addr = std::net::SocketAddr::new(validated_ip, port);
+            client_builder = client_builder.resolve(&host, socket_addr);
         }
+
+        let client = client_builder
+            .build()
+            .map_err(|e| HostError::Http(format!("Failed to create HTTP client: {}", e)))?;
 
         tracing::debug!(
             plugin_id = %self.plugin_id,
@@ -401,7 +414,7 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
             _ => unreachable!(), // Already validated above
         };
 
-        let mut request_builder = self.http_client.request(reqwest_method, &req.url);
+        let mut request_builder = client.request(reqwest_method, &req.url);
 
         // Add headers
         for (name, value) in &req.headers {
@@ -419,13 +432,15 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
             .await
             .map_err(|e| HostError::Http(format!("Request failed: {}", e)))?;
 
-        // Check response body size
-        let content_length = response.content_length().unwrap_or(0);
-        if content_length > MAX_HTTP_RESPONSE_SIZE as u64 {
-            return Err(HostError::BodyTooLarge {
-                size: content_length as usize,
-                max: MAX_HTTP_RESPONSE_SIZE,
-            });
+        // Check content-length header if present
+        let content_length = response.content_length();
+        if let Some(len) = content_length {
+            if len > MAX_HTTP_RESPONSE_SIZE as u64 {
+                return Err(HostError::BodyTooLarge {
+                    size: len as usize,
+                    max: MAX_HTTP_RESPONSE_SIZE,
+                });
+            }
         }
 
         // Extract response data
@@ -433,42 +448,62 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         let headers: Vec<(String, String)> = response
             .headers()
             .iter()
-            .filter_map(|(k, v)| {
-                v.to_str().ok().map(|v| (k.to_string(), v.to_string()))
-            })
+            .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
             .collect();
 
-        // Read body with size limit
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| HostError::Http(format!("Failed to read response: {}", e)))?;
-
-        if body.len() > MAX_HTTP_RESPONSE_SIZE {
-            return Err(HostError::BodyTooLarge {
-                size: body.len(),
-                max: MAX_HTTP_RESPONSE_SIZE,
-            });
-        }
+        // Stream body with size limit to prevent memory exhaustion
+        let body = self
+            .read_response_body_limited(response, MAX_HTTP_RESPONSE_SIZE)
+            .await?;
 
         Ok(HttpResponse {
             status,
             headers,
-            body: if body.is_empty() { None } else { Some(body.to_vec()) },
+            body: if body.is_empty() { None } else { Some(body) },
         })
     }
 
-    /// Validate DNS resolution for SSRF protection
+    /// Read response body with streaming size limit
+    ///
+    /// Reads the response body in chunks, enforcing a hard size limit
+    /// to prevent memory exhaustion from chunked/unknown-length responses.
+    async fn read_response_body_limited(
+        &self,
+        response: reqwest::Response,
+        max_size: usize,
+    ) -> Result<Vec<u8>, HostError> {
+        use futures_util::StreamExt;
+
+        let mut body = Vec::new();
+        let mut stream = response.bytes_stream();
+
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result
+                .map_err(|e| HostError::Http(format!("Failed to read response chunk: {}", e)))?;
+
+            if body.len() + chunk.len() > max_size {
+                return Err(HostError::BodyTooLarge {
+                    size: body.len() + chunk.len(),
+                    max: max_size,
+                });
+            }
+
+            body.extend_from_slice(&chunk);
+        }
+
+        Ok(body)
+    }
+
+    /// Resolve DNS and validate all IPs for SSRF protection
     ///
     /// Resolves the hostname and validates that all resolved IPs are safe.
+    /// Returns the first validated IP to be pinned for the actual request.
     /// This prevents DNS rebinding attacks where an attacker's DNS initially
     /// returns a public IP but later returns a private IP.
-    async fn validate_dns_resolution(&self, host: &str) -> Result<(), HostError> {
+    async fn resolve_and_validate_dns(&self, host: &str) -> Result<IpAddr, HostError> {
         // Create a resolver
-        let resolver = TokioAsyncResolver::tokio(
-            ResolverConfig::default(),
-            ResolverOpts::default(),
-        );
+        let resolver =
+            TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
 
         // Resolve the hostname
         let lookup = resolver
@@ -476,20 +511,19 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
             .await
             .map_err(|e| HostError::Http(format!("DNS resolution failed for {}: {}", host, e)))?;
 
-        // Validate each resolved IP
+        // Collect IPs and validate each one
+        let mut validated_ip: Option<IpAddr> = None;
         for ip in lookup.iter() {
             SsrfProtection::validate_resolved_ip_with_config(&ip, host, &self.ssrf_config)?;
+            if validated_ip.is_none() {
+                validated_ip = Some(ip);
+            }
         }
 
-        // Ensure at least one IP was resolved
-        if lookup.iter().count() == 0 {
-            return Err(HostError::Http(format!(
-                "DNS resolution returned no addresses for {}",
-                host
-            )));
-        }
-
-        Ok(())
+        // Ensure at least one IP was resolved and validated
+        validated_ip.ok_or_else(|| {
+            HostError::Http(format!("DNS resolution returned no addresses for {}", host))
+        })
     }
 
     // ============== Media Functions ==============
@@ -497,7 +531,10 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
     /// Fetch media with SSRF protection and DNS validation
     ///
     /// Downloads media from a URL and saves it to a temporary file.
-    /// Applies the same SSRF protection as http_fetch.
+    /// Applies the same SSRF protection as http_fetch:
+    /// - Pins validated DNS IPs to prevent rebinding
+    /// - Disables redirects to prevent redirect-based bypass
+    /// - Streams response with size limit
     pub async fn media_fetch(
         &self,
         url: &str,
@@ -524,16 +561,10 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
 
         let host = parsed_url
             .host_str()
-            .ok_or_else(|| HostError::MediaFetch("URL has no host".to_string()))?;
+            .ok_or_else(|| HostError::MediaFetch("URL has no host".to_string()))?
+            .to_string();
 
-        // DNS resolution and validation
-        if host.parse::<IpAddr>().is_err() {
-            self.validate_dns_resolution(host).await
-                .map_err(|e| match e {
-                    HostError::Http(msg) => HostError::MediaFetch(msg),
-                    other => other,
-                })?;
-        }
+        let port = parsed_url.port_or_known_default().unwrap_or(80);
 
         // Calculate timeout
         let timeout = Duration::from_millis(
@@ -542,9 +573,27 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
                 .min(MAX_HTTP_TIMEOUT_MS) as u64,
         );
 
-        // Create a client with the specified timeout
-        let client = Client::builder()
+        // Build client with security settings
+        let mut client_builder = Client::builder()
             .timeout(timeout)
+            // SECURITY: Disable redirects to prevent redirect-based SSRF bypass
+            .redirect(reqwest::redirect::Policy::none());
+
+        // DNS resolution and validation, then pin the validated IP
+        if host.parse::<IpAddr>().is_err() {
+            let validated_ip = self
+                .resolve_and_validate_dns(&host)
+                .await
+                .map_err(|e| match e {
+                    HostError::Http(msg) => HostError::MediaFetch(msg),
+                    other => other,
+                })?;
+            // Pin the validated IP
+            let socket_addr = std::net::SocketAddr::new(validated_ip, port);
+            client_builder = client_builder.resolve(&host, socket_addr);
+        }
+
+        let client = client_builder
             .build()
             .map_err(|e| HostError::MediaFetch(format!("Failed to create client: {}", e)))?;
 
@@ -562,20 +611,22 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
             .await
             .map_err(|e| HostError::MediaFetch(format!("Request failed: {}", e)))?;
 
-        // Check content length before downloading
-        let content_length = response.content_length().unwrap_or(0);
-        let max_size = max_bytes.unwrap_or(MAX_HTTP_RESPONSE_SIZE as u64);
-        if content_length > max_size {
-            return Ok(MediaFetchResult {
-                ok: false,
-                local_path: None,
-                mime_type: None,
-                size: Some(content_length),
-                error: Some(format!(
-                    "Content too large: {} bytes (max {})",
-                    content_length, max_size
-                )),
-            });
+        // Check content length header if present
+        let content_length = response.content_length();
+        let max_size = max_bytes.unwrap_or(MAX_HTTP_RESPONSE_SIZE as u64) as usize;
+        if let Some(len) = content_length {
+            if len > max_size as u64 {
+                return Ok(MediaFetchResult {
+                    ok: false,
+                    local_path: None,
+                    mime_type: None,
+                    size: Some(len),
+                    error: Some(format!(
+                        "Content too large: {} bytes (max {})",
+                        len, max_size
+                    )),
+                });
+            }
         }
 
         // Get content type
@@ -585,26 +636,25 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        // Download the content
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| HostError::MediaFetch(format!("Failed to download: {}", e)))?;
-
-        // Check actual size
-        if bytes.len() as u64 > max_size {
-            return Ok(MediaFetchResult {
-                ok: false,
-                local_path: None,
-                mime_type,
-                size: Some(bytes.len() as u64),
-                error: Some(format!(
-                    "Content too large: {} bytes (max {})",
-                    bytes.len(),
-                    max_size
-                )),
-            });
-        }
+        // Stream download with size limit
+        let bytes = match self.read_response_body_limited(response, max_size).await {
+            Ok(b) => b,
+            Err(HostError::BodyTooLarge { size, max }) => {
+                return Ok(MediaFetchResult {
+                    ok: false,
+                    local_path: None,
+                    mime_type,
+                    size: Some(size as u64),
+                    error: Some(format!("Content too large: {} bytes (max {})", size, max)),
+                });
+            }
+            Err(e) => {
+                return Err(match e {
+                    HostError::Http(msg) => HostError::MediaFetch(msg),
+                    other => other,
+                });
+            }
+        };
 
         // Create temporary file
         let temp_dir = std::env::temp_dir();
@@ -694,9 +744,7 @@ mod tests {
     use crate::credentials::MockCredentialBackend;
     use tempfile::tempdir;
 
-    async fn create_test_context(
-        plugin_id: &str,
-    ) -> PluginHostContext<MockCredentialBackend> {
+    async fn create_test_context(plugin_id: &str) -> PluginHostContext<MockCredentialBackend> {
         let temp_dir = tempdir().unwrap();
         let backend = MockCredentialBackend::new(true);
         let credential_store = Arc::new(
@@ -778,7 +826,9 @@ mod tests {
         let ctx = create_test_context("test-plugin").await;
 
         // Should block private IP
-        let result = ctx.media_fetch("http://10.0.0.1/image.png", None, None).await;
+        let result = ctx
+            .media_fetch("http://10.0.0.1/image.png", None, None)
+            .await;
         assert!(result.is_err());
     }
 
@@ -811,7 +861,10 @@ mod tests {
         };
 
         let result = ctx.http_fetch(req).await;
-        assert!(matches!(result.unwrap_err(), HostError::BodyTooLarge { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            HostError::BodyTooLarge { .. }
+        ));
     }
 
     #[test]

@@ -198,7 +198,9 @@ pub fn validate_agent_request(
     let channel = resolve_channel_alias(req.channel.as_deref().unwrap_or("last"));
     if !valid_channels.is_empty()
         && channel != "last"
-        && !valid_channels.iter().any(|c| c.eq_ignore_ascii_case(&channel))
+        && !valid_channels
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(&channel))
     {
         return Err(format!(
             "channel must be one of: last, {}",

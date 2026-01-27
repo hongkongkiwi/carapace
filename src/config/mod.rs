@@ -542,7 +542,9 @@ mod tests {
         env::remove_var("NONEXISTENT_VAR_12345");
         let result = substitute_env_in_string("${NONEXISTENT_VAR_12345}");
 
-        assert!(matches!(result, Err(ConfigError::MissingEnvVar { var }) if var == "NONEXISTENT_VAR_12345"));
+        assert!(
+            matches!(result, Err(ConfigError::MissingEnvVar { var }) if var == "NONEXISTENT_VAR_12345")
+        );
     }
 
     #[test]
@@ -664,16 +666,8 @@ mod tests {
     fn test_circular_include_detection() {
         let dir = TempDir::new().unwrap();
 
-        create_temp_config(
-            &dir,
-            "a.json5",
-            r#"{ "$include": "./b.json5", "a": 1 }"#,
-        );
-        create_temp_config(
-            &dir,
-            "b.json5",
-            r#"{ "$include": "./a.json5", "b": 2 }"#,
-        );
+        create_temp_config(&dir, "a.json5", r#"{ "$include": "./b.json5", "a": 1 }"#);
+        create_temp_config(&dir, "b.json5", r#"{ "$include": "./a.json5", "b": 2 }"#);
         let main_path = dir.path().join("a.json5");
 
         let result = load_config_uncached(&main_path);
@@ -831,7 +825,10 @@ mod tests {
 
         let config = load_config_uncached(&main_path).unwrap();
 
-        assert_eq!(config["models"]["providers"]["openai"]["apiKey"], "sk-test-key");
+        assert_eq!(
+            config["models"]["providers"]["openai"]["apiKey"],
+            "sk-test-key"
+        );
 
         env::remove_var("TEST_OPENAI_KEY");
     }
@@ -853,7 +850,10 @@ mod tests {
         let main_path = dir.path().join("0.json5");
         let result = load_config_uncached(&main_path);
 
-        assert!(matches!(result, Err(ConfigError::IncludeDepthExceeded { .. })));
+        assert!(matches!(
+            result,
+            Err(ConfigError::IncludeDepthExceeded { .. })
+        ));
     }
 
     #[test]

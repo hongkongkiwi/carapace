@@ -1002,13 +1002,23 @@ mod tests {
     #[test]
     fn test_tailscale_ip_detection() {
         // Tailscale range: 100.64.0.0/10
-        assert!(SsrfProtection::is_tailscale_ip(&Ipv4Addr::new(100, 64, 0, 1)));
-        assert!(SsrfProtection::is_tailscale_ip(&Ipv4Addr::new(100, 100, 50, 25)));
-        assert!(SsrfProtection::is_tailscale_ip(&Ipv4Addr::new(100, 127, 255, 255)));
+        assert!(SsrfProtection::is_tailscale_ip(&Ipv4Addr::new(
+            100, 64, 0, 1
+        )));
+        assert!(SsrfProtection::is_tailscale_ip(&Ipv4Addr::new(
+            100, 100, 50, 25
+        )));
+        assert!(SsrfProtection::is_tailscale_ip(&Ipv4Addr::new(
+            100, 127, 255, 255
+        )));
 
         // Outside Tailscale range
-        assert!(!SsrfProtection::is_tailscale_ip(&Ipv4Addr::new(100, 63, 255, 255)));
-        assert!(!SsrfProtection::is_tailscale_ip(&Ipv4Addr::new(100, 128, 0, 0)));
+        assert!(!SsrfProtection::is_tailscale_ip(&Ipv4Addr::new(
+            100, 63, 255, 255
+        )));
+        assert!(!SsrfProtection::is_tailscale_ip(&Ipv4Addr::new(
+            100, 128, 0, 0
+        )));
         assert!(!SsrfProtection::is_tailscale_ip(&Ipv4Addr::new(8, 8, 8, 8)));
     }
 
@@ -1026,7 +1036,9 @@ mod tests {
 
     #[test]
     fn test_ssrf_allows_tailscale_when_configured() {
-        let config = SsrfConfig { allow_tailscale: true };
+        let config = SsrfConfig {
+            allow_tailscale: true,
+        };
 
         // Tailscale IP should be allowed with config
         let tailscale_ip = IpAddr::V4(Ipv4Addr::new(100, 100, 50, 25));
@@ -1044,24 +1056,20 @@ mod tests {
 
     #[test]
     fn test_ssrf_still_blocks_other_private_when_tailscale_allowed() {
-        let config = SsrfConfig { allow_tailscale: true };
+        let config = SsrfConfig {
+            allow_tailscale: true,
+        };
 
         // Other private ranges should still be blocked
         let private_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
-        let result = SsrfProtection::validate_resolved_ip_with_config(
-            &private_ip,
-            "internal-host",
-            &config,
-        );
+        let result =
+            SsrfProtection::validate_resolved_ip_with_config(&private_ip, "internal-host", &config);
         assert!(matches!(result, Err(CapabilityError::SsrfBlocked(_))));
 
         // Loopback should still be blocked
         let localhost = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
-        let result = SsrfProtection::validate_resolved_ip_with_config(
-            &localhost,
-            "localhost",
-            &config,
-        );
+        let result =
+            SsrfProtection::validate_resolved_ip_with_config(&localhost, "localhost", &config);
         assert!(matches!(result, Err(CapabilityError::SsrfBlocked(_))));
     }
 
