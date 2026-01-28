@@ -3,8 +3,10 @@
 //! Default tools available in every Carapace installation.
 
 pub mod bash;
+pub mod patch;
 
 pub use bash::BashTool;
+pub use patch::ApplyPatchTool;
 
 use super::{Tool, ToolOutput};
 use crate::tools::ToolError;
