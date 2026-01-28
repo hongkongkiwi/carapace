@@ -30,9 +30,17 @@ graph TB
         end
 
         subgraph "State Management"
-            Sessions[Session Store<br/>JSONL history]
+            Sessions[Session Store<br/>JSONL history, archiving]
             Nodes[Node Registry<br/>pairing, tokens]
             Devices[Device Registry<br/>pairing, tokens]
+            Cron[Cron Scheduler<br/>scheduled jobs]
+            ExecMgr[Exec Approvals<br/>tool execution gates]
+        end
+
+        subgraph "Voice & TTS"
+            TTS[TTS Providers<br/>text-to-speech]
+            VoiceWake[Voice Wake<br/>trigger detection]
+            TalkMode[Talk Mode<br/>voice interaction state]
         end
 
         subgraph "Extensions"
@@ -41,9 +49,10 @@ graph TB
         end
 
         subgraph "Infrastructure"
-            Logging[Logging<br/>tracing]
+            Logging[Log Buffer<br/>tracing, ring buffer]
             Media[Media Pipeline<br/>fetch, store]
             Creds[Credential Store]
+            Usage[Usage Tracking<br/>token costs]
         end
     end
 
@@ -90,6 +99,8 @@ graph TB
     Nodes --> FS
     Devices --> FS
     Creds --> FS
+    Cron --> FS
+    Cron --> Sessions
 
     %% Plugin integration
     Plugins --> PluginDispatch
@@ -163,16 +174,32 @@ sequenceDiagram
 | Control API | `src/server/control.rs` | /control/status, /control/channels |
 | Auth | `src/auth/mod.rs` | Token/password verification, loopback detection |
 | Channels | `src/channels/mod.rs` | Channel registry, status tracking |
-| Sessions | `src/sessions/store.rs` | Session CRUD, JSONL history, compaction |
+| Sessions | `src/sessions/store.rs` | Session CRUD, JSONL history, compaction, archiving |
 | Nodes | `src/nodes/mod.rs` | Node pairing state machine |
 | Devices | `src/devices/mod.rs` | Device pairing state machine |
+| Cron | `src/cron/mod.rs` | Scheduled job management, run history |
+| Exec Approvals | `src/exec/mod.rs` | Tool execution approval workflow |
+| TTS | `src/server/ws/handlers/tts.rs` | Text-to-speech provider abstraction |
+| Voice Wake | WS handler | Wake word trigger management |
+| Talk Mode | WS handler | Voice interaction state machine |
+| Usage | WS handler | Token/cost tracking |
 | Plugins | `src/plugins/runtime.rs` | WASM plugin loading, wasmtime |
 | Plugin Dispatch | `src/plugins/dispatch.rs` | Tool/webhook/hook routing |
 | Hooks | `src/hooks/registry.rs` | Webhook transformations, templates |
 | Messages | `src/messages/outbound.rs` | Outbound message queue |
 | Media | `src/media/` | Media fetch, store, pipeline |
 | Credentials | `src/credentials/mod.rs` | Encrypted credential storage |
-| Logging | `src/logging/mod.rs` | tracing setup, log rotation |
+| Logging | `src/logging/mod.rs` | tracing setup, ring buffer, log tail streaming |
+
+## Not Yet Implemented
+
+These modules are designed but not yet built. See [Critical Path](refactor/critical-path.md) for full designs.
+
+| Component | Planned Path | Description |
+|-----------|-------------|-------------|
+| Agent Executor | `src/agent/` | LLM provider abstraction, streaming, tool orchestration |
+| Message Delivery | `src/messages/delivery.rs` | Background worker that delivers queued messages via channel plugins |
+| Cron Execution | `src/cron/tick.rs`, `src/cron/executor.rs` | Background tick loop, payload dispatch (SystemEvent, AgentTurn) |
 
 ## Design Decisions
 
