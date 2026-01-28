@@ -18,6 +18,7 @@ pub mod exec;
 pub mod hooks;
 pub mod logging;
 pub mod media;
+pub mod memory;
 pub mod metrics;
 pub mod messages;
 pub mod nodes;
