@@ -30,6 +30,7 @@ use uuid::Uuid;
 use crate::{auth, channels, config, credentials, cron, devices, exec, messages, nodes, sessions};
 
 mod handlers;
+#[cfg(test)]
 mod tests;
 
 pub(super) use handlers::*;
@@ -490,6 +491,12 @@ impl WsServerState {
 
     pub fn with_device_registry(mut self, registry: Arc<devices::DevicePairingRegistry>) -> Self {
         self.device_registry = registry;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_session_store(mut self, store: Arc<sessions::SessionStore>) -> Self {
+        self.session_store = store;
         self
     }
 

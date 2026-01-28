@@ -8,19 +8,8 @@
 //! - cron.remove: Remove a job
 //! - cron.run: Manually run a job
 //! - cron.runs: Get run history
-//!
-//! TODO(Package 1 coordination): The cron handlers need access to a CronScheduler
-//! instance on WsServerState. When integrating:
-//! 1. Add `cron_scheduler: Arc<CronScheduler>` to WsServerState
-//! 2. Update dispatch_method calls to pass state:
-//!    - `"cron.status" => handle_cron_status(state)`
-//!    - `"cron.list" => handle_cron_list(state, params)`
-//!    - `"cron.add" => handle_cron_add(state, params)`
-//!    - etc.
-//! 3. Update handler signatures to take `state: &WsServerState`
 
 use serde_json::{json, Value};
-use uuid::Uuid;
 
 use super::super::*;
 
@@ -33,28 +22,42 @@ pub use crate::cron::{
 };
 
 /// Get the cron scheduler status.
-pub(super) fn handle_cron_status() -> Result<Value, ErrorShape> {
-    // TODO(Package 1 coordination): Change signature to take state
-    // and use: state.cron_scheduler.status()
+pub(super) fn handle_cron_status(state: &WsServerState) -> Result<Value, ErrorShape> {
+    let status = state.cron_scheduler.status();
     Ok(json!({
-        "enabled": true,
-        "storePath": null,
-        "jobs": 0,
-        "nextRunAtMs": null
+        "enabled": status.enabled,
+        "storePath": status.store_path,
+        "jobs": status.jobs,
+        "nextRunAtMs": status.next_run_at_ms
     }))
 }
 
 /// List all cron jobs.
-pub(super) fn handle_cron_list() -> Result<Value, ErrorShape> {
-    // TODO(Package 1 coordination): Change signature to take (state, params)
-    // and use: state.cron_scheduler.list(include_disabled)
+pub(super) fn handle_cron_list(
+    state: &WsServerState,
+    params: Option<&Value>,
+) -> Result<Value, ErrorShape> {
+    let include_disabled = params
+        .and_then(|p| p.get("includeDisabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let jobs = state.cron_scheduler.list(include_disabled);
+    let jobs_json: Vec<Value> = jobs
+        .iter()
+        .map(|j| serde_json::to_value(j).unwrap_or(json!({})))
+        .collect();
+
     Ok(json!({
-        "jobs": []
+        "jobs": jobs_json
     }))
 }
 
 /// Add a new cron job.
-pub(super) fn handle_cron_add(params: Option<&Value>) -> Result<Value, ErrorShape> {
+pub(super) fn handle_cron_add(
+    state: &WsServerState,
+    params: Option<&Value>,
+) -> Result<Value, ErrorShape> {
     let params =
         params.ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "params required", None))?;
 
@@ -72,40 +75,86 @@ pub(super) fn handle_cron_add(params: Option<&Value>) -> Result<Value, ErrorShap
         ));
     }
 
+    if name.len() > 256 {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "name too long (max 256 characters)",
+            None,
+        ));
+    }
+
     let schedule = parse_schedule(params.get("schedule"))?;
     let payload = parse_payload(params.get("payload"))?;
 
-    let job_id = Uuid::new_v4().to_string();
-    let now = now_ms();
+    // Parse optional fields
+    let agent_id = params
+        .get("agentId")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let description = params
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let enabled = params
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let delete_after_run = params.get("deleteAfterRun").and_then(|v| v.as_bool());
+    let session_target = parse_session_target(params.get("sessionTarget"));
+    let wake_mode = parse_wake_mode(params.get("wakeMode"));
+    let isolation = params.get("isolation").and_then(|v| parse_isolation(v));
 
-    let next_run_at_ms = compute_next_run(&schedule, now);
+    let input = CronJobCreate {
+        name: name.to_string(),
+        agent_id,
+        description,
+        enabled,
+        delete_after_run,
+        schedule,
+        session_target,
+        wake_mode,
+        payload,
+        isolation,
+    };
 
-    // TODO(Package 1 coordination): Use state.cron_scheduler.add() instead
-    // and broadcast_event(state, "cron", json!({...}))
+    let job = state.cron_scheduler.add(input).map_err(|e| match e {
+        CronError::LimitExceeded(max) => error_shape(
+            ERROR_INVALID_REQUEST,
+            &format!("cron job limit exceeded (max {})", max),
+            None,
+        ),
+        _ => error_shape(ERROR_UNAVAILABLE, &e.to_string(), None),
+    })?;
+
+    // Broadcast cron.scheduled event
+    broadcast_cron_event(
+        state,
+        &job.id,
+        "scheduled",
+        None,
+        Some(json!({
+            "jobId": job.id,
+            "name": job.name,
+            "nextRunAtMs": job.state.next_run_at_ms
+        })),
+    );
 
     Ok(json!({
         "ok": true,
-        "job": {
-            "id": job_id,
-            "name": name,
-            "enabled": params.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
-            "schedule": schedule,
-            "payload": payload,
-            "createdAtMs": now,
-            "updatedAtMs": now,
-            "sessionTarget": params.get("sessionTarget").and_then(|v| v.as_str()).unwrap_or("main"),
-            "wakeMode": params.get("wakeMode").and_then(|v| v.as_str()).unwrap_or("now"),
-            "state": {
-                "nextRunAtMs": next_run_at_ms
-            }
-        }
+        "job": serde_json::to_value(&job).unwrap_or(json!({}))
     }))
 }
 
 /// Update an existing cron job.
-pub(super) fn handle_cron_update(params: Option<&Value>) -> Result<Value, ErrorShape> {
+pub(super) fn handle_cron_update(
+    state: &WsServerState,
+    params: Option<&Value>,
+) -> Result<Value, ErrorShape> {
+    let params =
+        params.ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "params required", None))?;
+
     let job_id = params
-        .and_then(|v| v.get("jobId"))
+        .get("jobId")
         .and_then(|v| v.as_str())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "jobId is required", None))?;
 
@@ -117,89 +166,218 @@ pub(super) fn handle_cron_update(params: Option<&Value>) -> Result<Value, ErrorS
         ));
     }
 
-    // TODO(Package 1 coordination): Use state.cron_scheduler.update() instead
-
-    Ok(json!({
-        "ok": true,
-        "jobId": job_id,
-        "updated": true
-    }))
-}
-
-/// Remove a cron job.
-pub(super) fn handle_cron_remove(params: Option<&Value>) -> Result<Value, ErrorShape> {
-    let job_id = params
-        .and_then(|v| v.get("jobId"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "jobId is required", None))?;
-
-    if job_id.trim().is_empty() {
-        return Err(error_shape(
-            ERROR_INVALID_REQUEST,
-            "jobId cannot be empty",
-            None,
-        ));
-    }
-
-    // TODO(Package 1 coordination): Use state.cron_scheduler.remove() instead
-
-    Ok(json!({
-        "ok": true,
-        "jobId": job_id,
-        "removed": true
-    }))
-}
-
-/// Manually run a cron job.
-pub(super) fn handle_cron_run(params: Option<&Value>) -> Result<Value, ErrorShape> {
-    let job_id = params
-        .and_then(|v| v.get("jobId"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "jobId is required", None))?;
-
-    if job_id.trim().is_empty() {
-        return Err(error_shape(
-            ERROR_INVALID_REQUEST,
-            "jobId cannot be empty",
-            None,
-        ));
-    }
-
-    let mode = params.and_then(|v| v.get("mode")).and_then(|v| v.as_str());
-
-    // Validate mode if provided
-    if let Some(m) = mode {
-        if m != "due" && m != "force" {
+    // Validate name length if provided
+    if let Some(name) = params.get("name").and_then(|v| v.as_str()) {
+        if name.len() > 256 {
             return Err(error_shape(
                 ERROR_INVALID_REQUEST,
-                "mode must be 'due' or 'force'",
+                "name too long (max 256 characters)",
                 None,
             ));
         }
     }
 
-    // TODO(Package 1 coordination): Use state.cron_scheduler.run() instead
+    // Build patch from params
+    let patch = CronJobPatch {
+        name: params
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        agent_id: params
+            .get("agentId")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        description: params
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        enabled: params.get("enabled").and_then(|v| v.as_bool()),
+        delete_after_run: params.get("deleteAfterRun").and_then(|v| v.as_bool()),
+        schedule: match params.get("schedule") {
+            Some(v) => Some(parse_schedule(Some(v))?),
+            None => None,
+        },
+        session_target: params
+            .get("sessionTarget")
+            .map(|_| parse_session_target(params.get("sessionTarget"))),
+        wake_mode: params
+            .get("wakeMode")
+            .map(|_| parse_wake_mode(params.get("wakeMode"))),
+        payload: match params.get("payload") {
+            Some(v) => Some(parse_payload(Some(v))?),
+            None => None,
+        },
+        isolation: params.get("isolation").and_then(|v| parse_isolation(v)),
+    };
+
+    let job = state
+        .cron_scheduler
+        .update(job_id, patch)
+        .map_err(|e| match e {
+            CronError::JobNotFound(_) => error_shape(
+                ERROR_INVALID_REQUEST,
+                "job not found",
+                Some(json!({ "jobId": job_id })),
+            ),
+            _ => error_shape(ERROR_UNAVAILABLE, &e.to_string(), None),
+        })?;
+
+    // Broadcast cron.scheduled event (job was rescheduled)
+    broadcast_cron_event(
+        state,
+        &job.id,
+        "scheduled",
+        None,
+        Some(json!({
+            "jobId": job.id,
+            "name": job.name,
+            "nextRunAtMs": job.state.next_run_at_ms,
+            "action": "updated"
+        })),
+    );
 
     Ok(json!({
         "ok": true,
+        "jobId": job.id,
+        "updated": true,
+        "job": serde_json::to_value(&job).unwrap_or(json!({}))
+    }))
+}
+
+/// Remove a cron job.
+pub(super) fn handle_cron_remove(
+    state: &WsServerState,
+    params: Option<&Value>,
+) -> Result<Value, ErrorShape> {
+    let job_id = params
+        .and_then(|v| v.get("jobId"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "jobId is required", None))?;
+
+    if job_id.trim().is_empty() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "jobId cannot be empty",
+            None,
+        ));
+    }
+
+    let result = state.cron_scheduler.remove(job_id);
+
+    Ok(json!({
+        "ok": result.ok,
         "jobId": job_id,
-        "ran": true,
-        "reason": null
+        "removed": result.removed
+    }))
+}
+
+/// Manually run a cron job.
+pub(super) fn handle_cron_run(
+    state: &WsServerState,
+    params: Option<&Value>,
+) -> Result<Value, ErrorShape> {
+    let job_id = params
+        .and_then(|v| v.get("jobId"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "jobId is required", None))?;
+
+    if job_id.trim().is_empty() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "jobId cannot be empty",
+            None,
+        ));
+    }
+
+    let mode_str = params.and_then(|v| v.get("mode")).and_then(|v| v.as_str());
+
+    // Validate mode if provided
+    let mode = if let Some(m) = mode_str {
+        match m {
+            "due" => Some(CronRunMode::Due),
+            "force" => Some(CronRunMode::Force),
+            _ => {
+                return Err(error_shape(
+                    ERROR_INVALID_REQUEST,
+                    "mode must be 'due' or 'force'",
+                    None,
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
+    // Get job info before running for event
+    let job = state.cron_scheduler.get(job_id);
+
+    let result = state
+        .cron_scheduler
+        .run(job_id, mode)
+        .map_err(|e| match e {
+            CronError::JobNotFound(_) => error_shape(
+                ERROR_INVALID_REQUEST,
+                "job not found",
+                Some(json!({ "jobId": job_id })),
+            ),
+            _ => error_shape(ERROR_UNAVAILABLE, &e.to_string(), None),
+        })?;
+
+    if result.ran {
+        // Broadcast cron.started event
+        broadcast_cron_event(
+            state,
+            job_id,
+            "started",
+            None,
+            Some(json!({
+                "jobId": job_id,
+                "name": job.as_ref().map(|j| j.name.as_str()),
+                "manual": true
+            })),
+        );
+
+        // Broadcast cron.completed event
+        broadcast_cron_event(
+            state,
+            job_id,
+            "completed",
+            None,
+            Some(json!({
+                "jobId": job_id,
+                "name": job.as_ref().map(|j| j.name.as_str()),
+                "status": "ok"
+            })),
+        );
+    }
+
+    Ok(json!({
+        "ok": result.ok,
+        "jobId": job_id,
+        "ran": result.ran,
+        "reason": result.reason
     }))
 }
 
 /// Get run history for jobs.
-pub(super) fn handle_cron_runs(params: Option<&Value>) -> Result<Value, ErrorShape> {
+pub(super) fn handle_cron_runs(
+    state: &WsServerState,
+    params: Option<&Value>,
+) -> Result<Value, ErrorShape> {
     let job_id = params.and_then(|v| v.get("jobId")).and_then(|v| v.as_str());
-    let _limit = params
+    let limit = params
         .and_then(|v| v.get("limit"))
         .and_then(|v| v.as_u64())
-        .unwrap_or(200);
+        .map(|n| (n as usize).min(5000)); // Cap at 5000 at handler level
 
-    // TODO(Package 1 coordination): Use state.cron_scheduler.runs() instead
+    let runs = state.cron_scheduler.runs(job_id, limit);
+    let runs_json: Vec<Value> = runs
+        .iter()
+        .map(|r| serde_json::to_value(r).unwrap_or(json!({})))
+        .collect();
 
     Ok(json!({
-        "runs": [],
+        "runs": runs_json,
         "jobId": job_id
     }))
 }
@@ -346,8 +524,29 @@ fn parse_payload(value: Option<&Value>) -> Result<CronPayload, ErrorShape> {
     }
 }
 
+/// Parse session target from JSON.
+fn parse_session_target(value: Option<&Value>) -> CronSessionTarget {
+    value
+        .and_then(|v| v.as_str())
+        .map(|s| match s {
+            "isolated" => CronSessionTarget::Isolated,
+            _ => CronSessionTarget::Main,
+        })
+        .unwrap_or(CronSessionTarget::Main)
+}
+
+/// Parse wake mode from JSON.
+fn parse_wake_mode(value: Option<&Value>) -> CronWakeMode {
+    value
+        .and_then(|v| v.as_str())
+        .map(|s| match s {
+            "next-heartbeat" => CronWakeMode::NextHeartbeat,
+            _ => CronWakeMode::Now,
+        })
+        .unwrap_or(CronWakeMode::Now)
+}
+
 /// Parse isolation settings from JSON.
-#[allow(dead_code)]
 fn parse_isolation(value: &Value) -> Option<CronIsolation> {
     if !value.is_object() {
         return None;
@@ -369,166 +568,9 @@ fn parse_isolation(value: &Value) -> Option<CronIsolation> {
     })
 }
 
-/// Compute the next run time for a schedule.
-fn compute_next_run(schedule: &CronSchedule, now: u64) -> Option<u64> {
-    match schedule {
-        CronSchedule::At { at_ms } => {
-            if *at_ms > now {
-                Some(*at_ms)
-            } else {
-                None // Already passed
-            }
-        }
-        CronSchedule::Every {
-            every_ms,
-            anchor_ms,
-        } => {
-            // Guard against divide-by-zero (should be validated at parse time)
-            if *every_ms == 0 {
-                return None;
-            }
-            let anchor = anchor_ms.unwrap_or(now);
-            if now < anchor {
-                Some(anchor)
-            } else {
-                let elapsed = now - anchor;
-                let periods = elapsed / every_ms;
-                Some(anchor + (periods + 1) * every_ms)
-            }
-        }
-        CronSchedule::Cron { expr: _, tz: _ } => {
-            // Cron expression parsing would require a cron library
-            // For now, return a default next minute
-            let next_minute = (now / 60_000 + 1) * 60_000;
-            Some(next_minute)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_handle_cron_status() {
-        let result = handle_cron_status();
-        assert!(result.is_ok());
-        let value = result.unwrap();
-        assert_eq!(value["enabled"], true);
-        assert_eq!(value["jobs"], 0);
-    }
-
-    #[test]
-    fn test_handle_cron_list() {
-        let result = handle_cron_list();
-        assert!(result.is_ok());
-        let value = result.unwrap();
-        assert!(value["jobs"].as_array().unwrap().is_empty());
-    }
-
-    #[test]
-    fn test_handle_cron_add_requires_params() {
-        let result = handle_cron_add(None);
-        assert!(result.is_err());
-
-        let params = json!({});
-        let result = handle_cron_add(Some(&params));
-        assert!(result.is_err()); // Missing name
-    }
-
-    #[test]
-    fn test_handle_cron_add_validates_name() {
-        let params = json!({
-            "name": "",
-            "schedule": { "kind": "at", "atMs": 1000 },
-            "payload": { "kind": "systemEvent", "text": "test" }
-        });
-        let result = handle_cron_add(Some(&params));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_handle_cron_add_success() {
-        let params = json!({
-            "name": "Test Job",
-            "schedule": { "kind": "every", "everyMs": 60000 },
-            "payload": { "kind": "systemEvent", "text": "Hello!" }
-        });
-        let result = handle_cron_add(Some(&params));
-        assert!(result.is_ok());
-        let value = result.unwrap();
-        assert_eq!(value["ok"], true);
-        assert_eq!(value["job"]["name"], "Test Job");
-        assert!(value["job"]["id"].as_str().is_some());
-    }
-
-    #[test]
-    fn test_handle_cron_update_requires_job_id() {
-        let result = handle_cron_update(None);
-        assert!(result.is_err());
-
-        let params = json!({ "jobId": "" });
-        let result = handle_cron_update(Some(&params));
-        assert!(result.is_err());
-
-        let params = json!({ "jobId": "test-id" });
-        let result = handle_cron_update(Some(&params));
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_handle_cron_remove_requires_job_id() {
-        let result = handle_cron_remove(None);
-        assert!(result.is_err());
-
-        let params = json!({ "jobId": "" });
-        let result = handle_cron_remove(Some(&params));
-        assert!(result.is_err());
-
-        let params = json!({ "jobId": "test-id" });
-        let result = handle_cron_remove(Some(&params));
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_handle_cron_run_requires_job_id() {
-        let result = handle_cron_run(None);
-        assert!(result.is_err());
-
-        let params = json!({ "jobId": "" });
-        let result = handle_cron_run(Some(&params));
-        assert!(result.is_err());
-
-        let params = json!({ "jobId": "test-id" });
-        let result = handle_cron_run(Some(&params));
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_handle_cron_run_validates_mode() {
-        let params = json!({ "jobId": "test-id", "mode": "invalid" });
-        let result = handle_cron_run(Some(&params));
-        assert!(result.is_err());
-
-        let params = json!({ "jobId": "test-id", "mode": "force" });
-        let result = handle_cron_run(Some(&params));
-        assert!(result.is_ok());
-
-        let params = json!({ "jobId": "test-id", "mode": "due" });
-        let result = handle_cron_run(Some(&params));
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_handle_cron_runs() {
-        let result = handle_cron_runs(None);
-        assert!(result.is_ok());
-
-        let params = json!({ "jobId": "test-id", "limit": 50 });
-        let result = handle_cron_runs(Some(&params));
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap()["jobId"], "test-id");
-    }
 
     #[test]
     fn test_parse_schedule_at() {
@@ -587,17 +629,6 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_next_run_every_zero_returns_none() {
-        // Defensive guard: even if everyMs=0 somehow gets through validation,
-        // compute_next_run should return None instead of panicking
-        let schedule = CronSchedule::Every {
-            every_ms: 0,
-            anchor_ms: None,
-        };
-        assert_eq!(compute_next_run(&schedule, 1000), None);
-    }
-
-    #[test]
     fn test_parse_payload_system_event() {
         let value = json!({ "kind": "systemEvent", "text": "Hello" });
         let payload = parse_payload(Some(&value)).unwrap();
@@ -645,37 +676,25 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_next_run_at() {
-        let now = 1000;
-
-        // Future time
-        let schedule = CronSchedule::At { at_ms: 2000 };
-        assert_eq!(compute_next_run(&schedule, now), Some(2000));
-
-        // Past time
-        let schedule = CronSchedule::At { at_ms: 500 };
-        assert_eq!(compute_next_run(&schedule, now), None);
+    fn test_parse_session_target() {
+        assert_eq!(parse_session_target(None), CronSessionTarget::Main);
+        assert_eq!(
+            parse_session_target(Some(&json!("main"))),
+            CronSessionTarget::Main
+        );
+        assert_eq!(
+            parse_session_target(Some(&json!("isolated"))),
+            CronSessionTarget::Isolated
+        );
     }
 
     #[test]
-    fn test_compute_next_run_every() {
-        let now = 1000;
-
-        // Simple interval
-        let schedule = CronSchedule::Every {
-            every_ms: 100,
-            anchor_ms: None,
-        };
-        let next = compute_next_run(&schedule, now).unwrap();
-        assert!(next > now);
-        assert!(next <= now + 100);
-
-        // With anchor
-        let schedule = CronSchedule::Every {
-            every_ms: 100,
-            anchor_ms: Some(950),
-        };
-        let next = compute_next_run(&schedule, now).unwrap();
-        assert_eq!(next, 1050); // 950 + 100
+    fn test_parse_wake_mode() {
+        assert_eq!(parse_wake_mode(None), CronWakeMode::Now);
+        assert_eq!(parse_wake_mode(Some(&json!("now"))), CronWakeMode::Now);
+        assert_eq!(
+            parse_wake_mode(Some(&json!("next-heartbeat"))),
+            CronWakeMode::NextHeartbeat
+        );
     }
 }

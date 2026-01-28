@@ -423,7 +423,7 @@ pub(super) fn handle_sessions_list(
     let mut filter = sessions::SessionFilter::new();
     if let Some(limit) = params.and_then(|v| v.get("limit")).and_then(|v| v.as_i64()) {
         if limit > 0 {
-            filter = filter.with_limit(limit as usize);
+            filter = filter.with_limit((limit as usize).min(1000)); // Cap at 1000
         }
     }
     if let Some(offset) = params
@@ -988,6 +988,15 @@ pub(super) fn handle_sessions_compact(
         }
     };
 
+    // Archived sessions are read-only — reject compaction
+    if session.status == sessions::SessionStatus::Archived {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "cannot compact an archived session",
+            Some(json!({ "key": key, "status": "archived" })),
+        ));
+    }
+
     let history_len = state
         .session_store
         .get_history(&session.id, None, None)
@@ -1024,14 +1033,306 @@ pub(super) fn handle_sessions_compact(
             )
         })?;
 
-    // Node returns archived as a path (string) to the archived transcript file
-    // Rust implementation doesn't archive to file yet, so omit the field
-    // TODO: Add archived field when file archiving is implemented
+    // Return the compaction result
     Ok(json!({
         "ok": true,
         "key": session.session_key,
         "compacted": compacted.messages_compacted > 0,
-        "kept": keep_recent
+        "kept": keep_recent,
+        "messagesCompacted": compacted.messages_compacted
+    }))
+}
+
+/// Handle `sessions.archive` - archive a session to persistent storage
+///
+/// Archives the session metadata and all messages to a single archive file.
+/// The session status is set to Archived, making it read-only.
+///
+/// ## Parameters
+/// - `key` or `sessionKey` (required): Session key to archive
+/// - `deleteHistory` (optional): Whether to delete the history file after archiving (default: false)
+///
+/// ## Response
+/// ```json
+/// {
+///   "ok": true,
+///   "key": "...",
+///   "archived": true,
+///   "archivePath": "/path/to/archive.json",
+///   "messageCount": 42,
+///   "archiveSize": 12345,
+///   "archivedAt": 1234567890
+/// }
+/// ```
+pub(super) fn handle_sessions_archive(
+    state: &WsServerState,
+    params: Option<&Value>,
+) -> Result<Value, ErrorShape> {
+    let key = extract_session_key(params)
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "key is required", None))?;
+    let delete_history = params
+        .and_then(|v| v.get("deleteHistory"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let session = match state.session_store.get_session_by_key(&key) {
+        Ok(session) => session,
+        Err(sessions::SessionStoreError::NotFound(_)) => {
+            return Ok(json!({
+                "ok": true,
+                "key": key,
+                "archived": false,
+                "reason": "not_found"
+            }))
+        }
+        Err(err) => {
+            return Err(error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("session load failed: {}", err),
+                None,
+            ))
+        }
+    };
+
+    // Check if already archived
+    if session.status == sessions::SessionStatus::Archived {
+        return Ok(json!({
+            "ok": true,
+            "key": key,
+            "archived": false,
+            "reason": "already_archived"
+        }));
+    }
+
+    let result = state
+        .session_store
+        .archive_session(&session.id, delete_history)
+        .map_err(|err| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("session archive failed: {}", err),
+                None,
+            )
+        })?;
+
+    Ok(json!({
+        "ok": true,
+        "key": key,
+        "archived": true,
+        "archivePath": result.archive_path,
+        "messageCount": result.message_count,
+        "archiveSize": result.archive_size,
+        "archivedAt": result.archived_at,
+        "historyDeleted": result.history_deleted
+    }))
+}
+
+/// Handle `sessions.restore` - restore an archived session
+///
+/// Restores session history from the archive file and sets status back to Active.
+///
+/// ## Parameters
+/// - `key` or `sessionKey` (required): Session key to restore
+///
+/// ## Response
+/// ```json
+/// {
+///   "ok": true,
+///   "key": "...",
+///   "restored": true,
+///   "messageCount": 42,
+///   "restoredAt": 1234567890
+/// }
+/// ```
+pub(super) fn handle_sessions_restore(
+    state: &WsServerState,
+    params: Option<&Value>,
+) -> Result<Value, ErrorShape> {
+    let key = extract_session_key(params)
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "key is required", None))?;
+
+    let session = match state.session_store.get_session_by_key(&key) {
+        Ok(session) => session,
+        Err(sessions::SessionStoreError::NotFound(_)) => {
+            return Ok(json!({
+                "ok": true,
+                "key": key,
+                "restored": false,
+                "reason": "not_found"
+            }))
+        }
+        Err(err) => {
+            return Err(error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("session load failed: {}", err),
+                None,
+            ))
+        }
+    };
+
+    // Check if not archived
+    if session.status != sessions::SessionStatus::Archived {
+        return Ok(json!({
+            "ok": true,
+            "key": key,
+            "restored": false,
+            "reason": "not_archived"
+        }));
+    }
+
+    let result = state
+        .session_store
+        .restore_session(&session.id)
+        .map_err(|err| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("session restore failed: {}", err),
+                None,
+            )
+        })?;
+
+    Ok(json!({
+        "ok": true,
+        "key": key,
+        "restored": true,
+        "messageCount": result.message_count,
+        "restoredAt": result.restored_at
+    }))
+}
+
+/// Handle `sessions.archives` - list all archived sessions
+///
+/// Returns a list of all sessions with Archived status.
+///
+/// ## Parameters
+/// - `limit` (optional): Maximum number of sessions to return (default: 100)
+/// - `offset` (optional): Number of sessions to skip (default: 0)
+///
+/// ## Response
+/// ```json
+/// {
+///   "ts": 1234567890,
+///   "count": 5,
+///   "archives": [
+///     {
+///       "key": "...",
+///       "sessionId": "...",
+///       "archiveSize": 12345,
+///       "updatedAt": 1234567890
+///     }
+///   ]
+/// }
+/// ```
+pub(super) fn handle_sessions_archives(
+    state: &WsServerState,
+    params: Option<&Value>,
+) -> Result<Value, ErrorShape> {
+    let limit = params
+        .and_then(|v| v.get("limit"))
+        .and_then(|v| v.as_i64())
+        .map(|v| (v.max(1) as usize).min(1000)) // Cap at 1000 to prevent DoS
+        .unwrap_or(100);
+    let offset = params
+        .and_then(|v| v.get("offset"))
+        .and_then(|v| v.as_i64())
+        .map(|v| v.max(0) as usize)
+        .unwrap_or(0);
+
+    let archived_sessions = state
+        .session_store
+        .list_archived_sessions()
+        .map_err(|err| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("failed to list archives: {}", err),
+                None,
+            )
+        })?;
+
+    let total = archived_sessions.len();
+
+    let archives: Vec<_> = archived_sessions
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|(session, archive_size)| {
+            json!({
+                "key": session.session_key,
+                "sessionId": session.id,
+                "label": session.metadata.name,
+                "messageCount": session.message_count,
+                "archiveSize": archive_size,
+                "updatedAt": session.updated_at,
+                "createdAt": session.created_at
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "ts": now_ms(),
+        "total": total,
+        "count": archives.len(),
+        "archives": archives
+    }))
+}
+
+/// Handle `sessions.archive.delete` - delete an archive file
+///
+/// Deletes the archive file without affecting the session metadata.
+/// The session remains in Archived status.
+///
+/// ## Parameters
+/// - `key` or `sessionKey` (required): Session key whose archive to delete
+///
+/// ## Response
+/// ```json
+/// {
+///   "ok": true,
+///   "key": "...",
+///   "deleted": true
+/// }
+/// ```
+pub(super) fn handle_sessions_archive_delete(
+    state: &WsServerState,
+    params: Option<&Value>,
+) -> Result<Value, ErrorShape> {
+    let key = extract_session_key(params)
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "key is required", None))?;
+
+    let session = match state.session_store.get_session_by_key(&key) {
+        Ok(session) => session,
+        Err(sessions::SessionStoreError::NotFound(_)) => {
+            return Ok(json!({
+                "ok": true,
+                "key": key,
+                "deleted": false,
+                "reason": "not_found"
+            }))
+        }
+        Err(err) => {
+            return Err(error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("session load failed: {}", err),
+                None,
+            ))
+        }
+    };
+
+    let deleted = state
+        .session_store
+        .delete_archive(&session.id)
+        .map_err(|err| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("archive delete failed: {}", err),
+                None,
+            )
+        })?;
+
+    Ok(json!({
+        "ok": true,
+        "key": key,
+        "deleted": deleted
     }))
 }
 
@@ -1428,14 +1729,20 @@ pub(super) fn handle_chat_send(
         })?;
 
     // Emit chat event for the user message
-    // TODO: When ws/mod.rs exposes broadcast_event, emit chat event here
-    // broadcast_event(state, "chat", json!({
-    //     "sessionKey": session.session_key,
-    //     "messageId": message_id,
-    //     "role": "user",
-    //     "content": message,
-    //     "ts": now_ms()
-    // }));
+    broadcast_chat_event(
+        state,
+        &idempotency_key,
+        &session.session_key,
+        0, // First event in this run
+        "delta",
+        Some(json!({
+            "role": "user",
+            "content": message
+        })),
+        None,
+        None,
+        None,
+    );
 
     // If agent triggering is enabled, queue the agent run
     let (run_id, status) = if trigger_agent {
@@ -1876,5 +2183,195 @@ mod tests {
         assert_eq!(event_name, "agent.error");
         assert_eq!(payload["runId"], "run-1");
         assert_eq!(payload["error"], "Something went wrong");
+    }
+
+    // ============== Session Archive Handler Tests ==============
+
+    use crate::sessions;
+
+    fn make_state_with_temp_sessions() -> (WsServerState, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(sessions::SessionStore::with_base_path(
+            tmp.path().join("sessions"),
+        ));
+        let state = WsServerState::new(crate::server::ws::WsServerConfig::default())
+            .with_session_store(store);
+        (state, tmp)
+    }
+
+    #[test]
+    fn test_handle_sessions_archive_requires_key() {
+        let (state, _tmp) = make_state_with_temp_sessions();
+        let result = handle_sessions_archive(&state, None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, "INVALID_REQUEST");
+    }
+
+    #[test]
+    fn test_handle_sessions_archive_not_found() {
+        let (state, _tmp) = make_state_with_temp_sessions();
+        let params = json!({ "key": "nonexistent-key" });
+        let result = handle_sessions_archive(&state, Some(&params)).unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["archived"], false);
+        assert_eq!(result["reason"], "not_found");
+    }
+
+    #[test]
+    fn test_handle_sessions_archive_success() {
+        let (state, _tmp) = make_state_with_temp_sessions();
+
+        let session = state
+            .session_store
+            .create_session("agent-1", sessions::SessionMetadata::default())
+            .unwrap();
+        state
+            .session_store
+            .append_message(sessions::ChatMessage::user(&session.id, "Hello"))
+            .unwrap();
+
+        let params = json!({ "key": session.session_key });
+        let result = handle_sessions_archive(&state, Some(&params)).unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["archived"], true);
+        assert_eq!(result["messageCount"], 1);
+        assert!(result["archiveSize"].as_u64().unwrap() > 0);
+        assert!(result["archivedAt"].as_i64().is_some());
+    }
+
+    #[test]
+    fn test_handle_sessions_archive_already_archived() {
+        let (state, _tmp) = make_state_with_temp_sessions();
+
+        let session = state
+            .session_store
+            .create_session("agent-1", sessions::SessionMetadata::default())
+            .unwrap();
+        state
+            .session_store
+            .append_message(sessions::ChatMessage::user(&session.id, "Hello"))
+            .unwrap();
+        state
+            .session_store
+            .archive_session(&session.id, false)
+            .unwrap();
+
+        let params = json!({ "key": session.session_key });
+        let result = handle_sessions_archive(&state, Some(&params)).unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["archived"], false);
+        assert_eq!(result["reason"], "already_archived");
+    }
+
+    #[test]
+    fn test_handle_sessions_restore_requires_key() {
+        let (state, _tmp) = make_state_with_temp_sessions();
+        let result = handle_sessions_restore(&state, None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, "INVALID_REQUEST");
+    }
+
+    #[test]
+    fn test_handle_sessions_restore_not_found() {
+        let (state, _tmp) = make_state_with_temp_sessions();
+        let params = json!({ "key": "nonexistent-key" });
+        let result = handle_sessions_restore(&state, Some(&params)).unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["restored"], false);
+        assert_eq!(result["reason"], "not_found");
+    }
+
+    #[test]
+    fn test_handle_sessions_restore_success() {
+        let (state, _tmp) = make_state_with_temp_sessions();
+
+        let session = state
+            .session_store
+            .create_session("agent-1", sessions::SessionMetadata::default())
+            .unwrap();
+        state
+            .session_store
+            .append_message(sessions::ChatMessage::user(&session.id, "Hello"))
+            .unwrap();
+        state
+            .session_store
+            .archive_session(&session.id, true)
+            .unwrap();
+
+        let params = json!({ "key": session.session_key });
+        let result = handle_sessions_restore(&state, Some(&params)).unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["restored"], true);
+        assert_eq!(result["messageCount"], 1);
+    }
+
+    #[test]
+    fn test_handle_sessions_archives_list() {
+        let (state, _tmp) = make_state_with_temp_sessions();
+
+        for i in 0..2 {
+            let session = state
+                .session_store
+                .create_session(
+                    &format!("agent-{}", i),
+                    sessions::SessionMetadata {
+                        name: Some(format!("Session {}", i)),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            state
+                .session_store
+                .append_message(sessions::ChatMessage::user(&session.id, "msg"))
+                .unwrap();
+            state
+                .session_store
+                .archive_session(&session.id, false)
+                .unwrap();
+        }
+
+        let result = handle_sessions_archives(&state, None).unwrap();
+        assert_eq!(result["total"], 2);
+        let archives = result["archives"].as_array().unwrap();
+        assert_eq!(archives.len(), 2);
+        for entry in archives {
+            assert!(entry["sessionId"].is_string());
+            assert!(entry["key"].is_string());
+            assert!(entry["messageCount"].as_u64().is_some());
+        }
+    }
+
+    #[test]
+    fn test_handle_sessions_archive_delete_requires_key() {
+        let (state, _tmp) = make_state_with_temp_sessions();
+        let result = handle_sessions_archive_delete(&state, None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, "INVALID_REQUEST");
+    }
+
+    #[test]
+    fn test_handle_sessions_archive_delete_success() {
+        let (state, _tmp) = make_state_with_temp_sessions();
+
+        let session = state
+            .session_store
+            .create_session("agent-1", sessions::SessionMetadata::default())
+            .unwrap();
+        state
+            .session_store
+            .append_message(sessions::ChatMessage::user(&session.id, "Hello"))
+            .unwrap();
+        state
+            .session_store
+            .archive_session(&session.id, false)
+            .unwrap();
+
+        let params = json!({ "key": session.session_key });
+        let result = handle_sessions_archive_delete(&state, Some(&params)).unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["deleted"], true);
     }
 }

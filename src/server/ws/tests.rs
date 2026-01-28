@@ -1590,3 +1590,204 @@ fn test_health_broadcast_on_status_change() {
     let msg = rx.try_recv();
     assert!(msg.is_err(), "Should not broadcast when status unchanged");
 }
+
+// ============================================================================
+// Cron Scheduler Integration Tests
+// ============================================================================
+
+#[test]
+fn test_cron_scheduler_integration() {
+    use crate::cron::{
+        CronJobCreate, CronJobPatch, CronPayload, CronRunMode, CronSchedule, CronSessionTarget,
+        CronWakeMode,
+    };
+
+    let state = WsServerState::new(WsServerConfig::default());
+
+    // Test scheduler status
+    let status = state.cron_scheduler.status();
+    assert!(status.enabled);
+    assert_eq!(status.jobs, 0);
+
+    // Add a job
+    let job = state
+        .cron_scheduler
+        .add(CronJobCreate {
+            name: "Test Job".to_string(),
+            agent_id: None,
+            description: None,
+            enabled: true,
+            delete_after_run: None,
+            schedule: CronSchedule::Every {
+                every_ms: 60000,
+                anchor_ms: None,
+            },
+            session_target: CronSessionTarget::Main,
+            wake_mode: CronWakeMode::Now,
+            payload: CronPayload::SystemEvent {
+                text: "Hello!".to_string(),
+            },
+            isolation: None,
+        })
+        .unwrap();
+    assert_eq!(job.name, "Test Job");
+    assert!(job.state.next_run_at_ms.is_some());
+
+    // List jobs
+    let jobs = state.cron_scheduler.list(true);
+    assert_eq!(jobs.len(), 1);
+
+    // Check status after adding
+    let status = state.cron_scheduler.status();
+    assert_eq!(status.jobs, 1);
+
+    // Update the job
+    let updated = state
+        .cron_scheduler
+        .update(
+            &job.id,
+            CronJobPatch {
+                name: Some("Updated Job".to_string()),
+                enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(updated.name, "Updated Job");
+    assert!(!updated.enabled);
+
+    // Force run the job
+    let result = state
+        .cron_scheduler
+        .run(&job.id, Some(CronRunMode::Force))
+        .unwrap();
+    assert!(result.ok);
+    assert!(result.ran);
+
+    // Check runs
+    let runs = state.cron_scheduler.runs(Some(&job.id), None);
+    assert_eq!(runs.len(), 1);
+
+    // Remove the job
+    let remove_result = state.cron_scheduler.remove(&job.id);
+    assert!(remove_result.ok);
+    assert!(remove_result.removed);
+
+    // Verify removed
+    let jobs = state.cron_scheduler.list(true);
+    assert_eq!(jobs.len(), 0);
+}
+
+#[test]
+fn test_cron_scheduler_update_job_not_found() {
+    use crate::cron::CronJobPatch;
+
+    let state = WsServerState::new(WsServerConfig::default());
+
+    let result = state.cron_scheduler.update(
+        "non-existent-job",
+        CronJobPatch {
+            name: Some("Updated".to_string()),
+            ..Default::default()
+        },
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_cron_scheduler_run_not_found() {
+    use crate::cron::CronRunMode;
+
+    let state = WsServerState::new(WsServerConfig::default());
+
+    let result = state
+        .cron_scheduler
+        .run("non-existent-job", Some(CronRunMode::Force));
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_cron_scheduler_event_integration() {
+    use crate::cron::{
+        CronJobCreate, CronPayload, CronRunMode, CronSchedule, CronSessionTarget, CronWakeMode,
+    };
+
+    let state = WsServerState::new(WsServerConfig::default());
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let conn = make_conn_with_id("operator", vec![], "conn-1");
+    state.register_connection(&conn, tx, None);
+
+    // Clear the presence broadcast
+    let _ = rx.try_recv();
+
+    // Add a job and manually broadcast event (simulating what handlers do)
+    let job = state
+        .cron_scheduler
+        .add(CronJobCreate {
+            name: "Test Job".to_string(),
+            agent_id: None,
+            description: None,
+            enabled: true,
+            delete_after_run: None,
+            schedule: CronSchedule::Every {
+                every_ms: 60000,
+                anchor_ms: None,
+            },
+            session_target: CronSessionTarget::Main,
+            wake_mode: CronWakeMode::Now,
+            payload: CronPayload::SystemEvent {
+                text: "Hello!".to_string(),
+            },
+            isolation: None,
+        })
+        .unwrap();
+
+    // Broadcast event manually (normally done by handlers)
+    broadcast_cron_event(
+        &state,
+        &job.id,
+        "scheduled",
+        None,
+        Some(json!({"name": job.name})),
+    );
+
+    // Should receive cron event
+    let msg = rx.try_recv();
+    assert!(msg.is_ok());
+    let Message::Text(text) = msg.unwrap() else {
+        panic!("expected text message");
+    };
+    let event: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(event["event"], "cron");
+    assert_eq!(event["payload"]["jobId"], job.id);
+    assert_eq!(event["payload"]["status"], "scheduled");
+
+    // Run the job and broadcast events
+    let result = state
+        .cron_scheduler
+        .run(&job.id, Some(CronRunMode::Force))
+        .unwrap();
+    assert!(result.ran);
+
+    broadcast_cron_event(&state, &job.id, "started", None, None);
+    broadcast_cron_event(
+        &state,
+        &job.id,
+        "completed",
+        None,
+        Some(json!({"status": "ok"})),
+    );
+
+    // Should receive started event
+    let msg = rx.try_recv().unwrap();
+    let Message::Text(text) = msg else { panic!() };
+    let event: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(event["payload"]["status"], "started");
+
+    // Should receive completed event
+    let msg = rx.try_recv().unwrap();
+    let Message::Text(text) = msg else { panic!() };
+    let event: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(event["payload"]["status"], "completed");
+}

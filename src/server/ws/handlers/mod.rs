@@ -514,6 +514,10 @@ pub(super) async fn dispatch_method(
         "sessions.reset" => handle_sessions_reset(state, params),
         "sessions.delete" => handle_sessions_delete(state, params),
         "sessions.compact" => handle_sessions_compact(state, params),
+        "sessions.archive" => handle_sessions_archive(state, params),
+        "sessions.restore" => handle_sessions_restore(state, params),
+        "sessions.archives" => handle_sessions_archives(state, params),
+        "sessions.archive.delete" => handle_sessions_archive_delete(state, params),
 
         // Channels
         "channels.status" => handle_channels_status(state),
@@ -585,13 +589,13 @@ pub(super) async fn dispatch_method(
         "update.releaseNotes" => handle_update_release_notes(),
 
         // Cron
-        "cron.status" => handle_cron_status(),
-        "cron.list" => handle_cron_list(),
-        "cron.add" => handle_cron_add(params),
-        "cron.update" => handle_cron_update(params),
-        "cron.remove" => handle_cron_remove(params),
-        "cron.run" => handle_cron_run(params),
-        "cron.runs" => handle_cron_runs(params),
+        "cron.status" => handle_cron_status(state),
+        "cron.list" => handle_cron_list(state, params),
+        "cron.add" => handle_cron_add(state, params),
+        "cron.update" => handle_cron_update(state, params),
+        "cron.remove" => handle_cron_remove(state, params),
+        "cron.run" => handle_cron_run(state, params),
+        "cron.runs" => handle_cron_runs(state, params),
 
         // Node pairing
         "node.pair.request" => handle_node_pair_request(params, state),
@@ -616,8 +620,8 @@ pub(super) async fn dispatch_method(
         // Exec approvals
         "exec.approvals.get" => handle_exec_approvals_get(),
         "exec.approvals.set" => handle_exec_approvals_set(params),
-        "exec.approvals.node.get" => handle_exec_approvals_node_get(params),
-        "exec.approvals.node.set" => handle_exec_approvals_node_set(params),
+        "exec.approvals.node.get" => handle_exec_approvals_node_get(params, state).await,
+        "exec.approvals.node.set" => handle_exec_approvals_node_set(params, state).await,
         "exec.approval.request" => handle_exec_approval_request(params),
         "exec.approval.resolve" => handle_exec_approval_resolve(params),
 

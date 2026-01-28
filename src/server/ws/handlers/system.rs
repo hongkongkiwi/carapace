@@ -35,8 +35,16 @@ pub(super) fn parse_presence(text: &str) -> ParsedPresence {
     let mut parsed = ParsedPresence::default();
 
     // Store text_slice as full text truncated to 64 chars (Node uses text.slice(0,64))
+    // Use safe truncation to avoid panicking on multi-byte UTF-8 boundaries
     parsed.text_slice = Some(if text.len() > 64 {
-        text[..64].to_string()
+        // Find the last character that ends at or before 64 bytes
+        let truncate_at = text
+            .char_indices()
+            .take_while(|(i, c)| i + c.len_utf8() <= 64)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+        text[..truncate_at].to_string()
     } else {
         text.to_string()
     });
@@ -330,6 +338,15 @@ pub(super) fn handle_system_event(
         .and_then(|v| v.as_str())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "text is required", None))?;
 
+    // Reject whitespace-only text (Node trims and rejects empty)
+    if text.trim().is_empty() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "text cannot be empty or whitespace-only",
+            None,
+        ));
+    }
+
     // Parse presence fields from text (Node's parsePresence)
     let parsed = parse_presence(text);
 
@@ -569,6 +586,41 @@ mod tests {
         let long_text = "a".repeat(100);
         let parsed = parse_presence(&long_text);
         assert_eq!(parsed.text_slice.as_ref().map(|s| s.len()), Some(64));
+    }
+
+    #[test]
+    fn test_parse_presence_text_slice_utf8_safe() {
+        // Test that truncation doesn't panic on multi-byte UTF-8 characters
+        // The emoji "😀" is 4 bytes. Create a string that would split mid-character
+        // if we used naive byte slicing.
+
+        // 62 ASCII chars + 1 emoji (4 bytes) = 66 bytes, but 63 chars
+        // Naive [..64] would try to slice in the middle of the emoji and panic
+        let text = format!("{}{}", "a".repeat(62), "😀");
+        assert_eq!(text.len(), 66); // 62 + 4 bytes
+
+        // This should NOT panic
+        let parsed = parse_presence(&text);
+
+        // Should truncate before the emoji since it doesn't fit in 64 bytes
+        let text_slice = parsed.text_slice.unwrap();
+        assert!(text_slice.len() <= 64);
+        assert!(text_slice.is_char_boundary(text_slice.len()));
+
+        // Test with emoji at the start (edge case)
+        let emoji_text = format!("😀{}", "a".repeat(100));
+        let parsed2 = parse_presence(&emoji_text);
+        let text_slice2 = parsed2.text_slice.unwrap();
+        assert!(text_slice2.len() <= 64);
+        assert!(text_slice2.is_char_boundary(text_slice2.len()));
+
+        // Test with all multi-byte characters (Japanese)
+        let japanese = "あいうえおかきくけこさしすせそたちつてと"; // 20 chars, 60 bytes
+        let long_japanese = format!("{}{}", japanese, japanese); // 40 chars, 120 bytes
+        let parsed3 = parse_presence(&long_japanese);
+        let text_slice3 = parsed3.text_slice.unwrap();
+        assert!(text_slice3.len() <= 64);
+        assert!(text_slice3.is_char_boundary(text_slice3.len()));
     }
 
     #[test]
