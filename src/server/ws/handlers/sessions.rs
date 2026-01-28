@@ -77,7 +77,7 @@ pub struct AgentRun {
     /// When the run completed (Unix ms)
     pub completed_at: Option<u64>,
     /// Waiters for this run to complete
-    waiters: Vec<oneshot::Sender<AgentRunResult>>,
+    pub(crate) waiters: Vec<oneshot::Sender<AgentRunResult>>,
 }
 
 /// Result of an agent run for waiters

@@ -43,6 +43,10 @@ pub use handlers::record_usage;
 pub use handlers::AgentRunRegistry;
 pub use handlers::AgentRunStatus;
 
+// Re-export AgentRun for test construction
+#[cfg(test)]
+pub use handlers::sessions::AgentRun;
+
 const PROTOCOL_VERSION: u32 = 3;
 const MAX_PAYLOAD_BYTES: usize = 512 * 1024;
 const MAX_BUFFERED_BYTES: usize = (1024 * 1024 * 3) / 2;
