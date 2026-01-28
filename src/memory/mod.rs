@@ -2,10 +2,14 @@
 //!
 //! Vector database and embeddings for agent memory.
 
+pub mod coordinator;
 pub mod embeddings;
+pub mod indexer;
 pub mod store;
 
+pub use coordinator::*;
 pub use embeddings::*;
+pub use indexer::*;
 pub use store::*;
 
 use serde::{Deserialize, Serialize};

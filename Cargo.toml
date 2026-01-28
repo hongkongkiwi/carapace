@@ -45,14 +45,19 @@ libc = "0.2"
 async-trait = "0.1"
 sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "chrono", "migrate", "macros"], default-features = false }
 sqlite-vec = "0.1"
+teloxide = { version = "0.12", features = ["macros"], optional = true }
+serenity = { version = "0.12", optional = true }
+
+[features]
+default = []
+telegram = ["teloxide"]
+discord = ["serenity"]
+keychain-tests = []
 
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }
 tokio-test = "0.4"
 tempfile = "3"
-
-[features]
-keychain-tests = []
 
 [lib]
 name = "carapace"
