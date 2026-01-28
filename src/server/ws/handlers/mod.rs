@@ -585,13 +585,13 @@ pub(super) async fn dispatch_method(
         "update.releaseNotes" => handle_update_release_notes(),
 
         // Cron
-        "cron.status" => handle_cron_status(),
-        "cron.list" => handle_cron_list(),
-        "cron.add" => handle_cron_add(params),
-        "cron.update" => handle_cron_update(params),
-        "cron.remove" => handle_cron_remove(params),
-        "cron.run" => handle_cron_run(params),
-        "cron.runs" => handle_cron_runs(params),
+        "cron.status" => handle_cron_status(state),
+        "cron.list" => handle_cron_list(state, params),
+        "cron.add" => handle_cron_add(state, params),
+        "cron.update" => handle_cron_update(state, params),
+        "cron.remove" => handle_cron_remove(state, params),
+        "cron.run" => handle_cron_run(state, params),
+        "cron.runs" => handle_cron_runs(state, params),
 
         // Node pairing
         "node.pair.request" => handle_node_pair_request(params, state),
