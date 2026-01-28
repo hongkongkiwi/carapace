@@ -2,6 +2,10 @@
 //!
 //! Default tools available in every Carapace installation.
 
+pub mod bash;
+
+pub use bash::BashTool;
+
 use super::{Tool, ToolOutput};
 use crate::tools::ToolError;
 use serde_json::json;
