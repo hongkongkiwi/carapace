@@ -17,6 +17,7 @@ pub mod hooks;
 pub mod logging;
 pub mod media;
 pub mod messages;
+pub mod metrics;
 pub mod nodes;
 pub mod plugins;
 pub mod server;
