@@ -25,4 +25,5 @@ pub mod nodes;
 pub mod plugins;
 pub mod server;
 pub mod sessions;
+pub mod skills;
 pub mod tools;
