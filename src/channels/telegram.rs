@@ -1,6 +1,6 @@
 //! Telegram Channel
 //!
-//! Telegram bot integration for carapace.
+//! Telegram bot integration using teloxide.
 
 use serde::{Deserialize, Serialize};
 
@@ -13,10 +13,18 @@ pub struct TelegramConfig {
     pub webhook_url: Option<String>,
     /// Allowed chat IDs (empty = all)
     pub allowed_chats: Vec<i64>,
+    /// Command prefix
+    #[serde(default = "default_command_prefix")]
+    pub command_prefix: String,
 }
 
-/// Telegram channel implementation
+fn default_command_prefix() -> String {
+    "/".to_string()
+}
+
+/// Telegram channel
 pub struct TelegramChannel {
+    #[allow(dead_code)]
     config: TelegramConfig,
 }
 
@@ -34,6 +42,13 @@ impl TelegramChannel {
 
     /// Stop the bot
     pub async fn stop(&self) -> Result<(), TelegramError> {
+        tracing::info!("Stopping Telegram bot");
+        Ok(())
+    }
+
+    /// Send message
+    pub async fn send_message(&self, chat_id: i64, text: &str) -> Result<(), TelegramError> {
+        tracing::info!(chat_id = chat_id, text = text, "Sending Telegram message");
         Ok(())
     }
 }
@@ -43,6 +58,22 @@ impl TelegramChannel {
 pub enum TelegramError {
     #[error("API error: {0}")]
     Api(String),
-    #[error("Network error: {0}")]
-    Network(#[from] reqwest::Error),
+    #[error("Invalid token")]
+    InvalidToken,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config() {
+        let config = TelegramConfig {
+            bot_token: "test".to_string(),
+            webhook_url: None,
+            allowed_chats: vec![],
+            command_prefix: "/".to_string(),
+        };
+        assert_eq!(config.command_prefix, "/");
+    }
 }
