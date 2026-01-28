@@ -1,4 +1,4 @@
-# Moltbot Gateway WebSocket Protocol
+# carapace Gateway WebSocket Protocol
 
 Protocol Version: 3
 
@@ -205,6 +205,10 @@ Note: Method dispatch is implemented in `src/server/ws/handlers/mod.rs`.
 - `sessions.reset` - Reset session
 - `sessions.delete` - Delete session
 - `sessions.compact` - Compact session storage
+- `sessions.archive` - Archive session to persistent storage (sets status to Archived/read-only)
+- `sessions.restore` - Restore an archived session (sets status back to Active)
+- `sessions.archives` - List all archived sessions with metadata and archive size
+- `sessions.archive.delete` - Delete an archive file without affecting session metadata
 
 ### TTS (Text-to-Speech)
 - `tts.status` - Get TTS status

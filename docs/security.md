@@ -93,6 +93,23 @@ let sanitized = plugin_id
 - [x] Session isolation by key
 - [x] Atomic file writes
 - [x] No cross-session data leakage
+- [x] Session ID validation (alphanumeric, hyphens, underscores only)
+- [x] Path traversal prevention (`..`, `/`, `\` rejected in session IDs)
+- [x] Archived sessions are read-only (writes rejected with `AlreadyArchived` error)
+- [x] Defense-in-depth validation at both path construction and `get_session` entry point
+
+```rust
+// Session IDs are validated before any path construction
+fn validate_session_id(session_id: &str) -> Result<(), SessionStoreError> {
+    if session_id.contains("..") || session_id.contains('/') || session_id.contains('\\') {
+        return Err(SessionStoreError::InvalidSessionKey(...));
+    }
+    if !session_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err(SessionStoreError::InvalidSessionKey(...));
+    }
+    Ok(())
+}
+```
 
 ## Sensitive Data Locations
 
@@ -156,6 +173,14 @@ let sanitized = plugin_id
    let safe_id = plugin_id.replace("..", "_").replace(['/', '\\'], "_");
    let path = format!("plugins/{}/config.json", safe_id);
    ```
+
+### Input Validation
+
+- [x] UTF-8-safe string truncation using `char_indices()` (prevents panics on multi-byte boundaries)
+- [x] Whitespace-only text rejected in system events
+- [x] Pagination limits capped server-side (max 1000 for sessions, archives; max 5000 for cron runs)
+- [x] Cron job name length validated (max 256 characters)
+- [x] Invalid cron schedule/payload inputs rejected with errors (not silently ignored)
 
 ## Rate Limiting
 
@@ -231,6 +256,75 @@ If compromise is suspected:
    - Tighten bind mode (prefer loopback)
    - Enable/strengthen rate limiting
    - Review allowlists
+
+## Known Issues & Open Items
+
+The following issues were identified during security review. Each includes analysis, a recommendation, and the main counterargument considered.
+
+### Priority summary
+
+| Issue | Recommendation | Effort | Risk if deferred |
+|-------|---------------|--------|------------------|
+| Streaming buffer stall | Fix later | Moderate | Low (self-harm only) |
+| Heartbeat parity | Fix when needed | Trivial | None (stub is valid) |
+| Cron scope granularity | Defer | Low | None (write-gate exists) |
+| Compaction TOCTOU | Defer | Moderate | None (idempotent, no concurrent trigger) |
+
+### Cron scope granularity
+
+**Status**: Deferred.
+
+Cron methods (`cron.add`, `cron.update`, `cron.remove`, `cron.run`) go through `check_method_authorization` in `dispatch_method` (`src/server/ws/handlers/mod.rs`). They are classified as `"write"` role, meaning admin gets full access, operator connections require `operator.write` scope, and node/read-only connections are blocked entirely.
+
+What's missing is a **dedicated scope** (e.g., `operator.cron`) to grant an operator write access to sessions/chat without implicitly granting cron access. Today `operator.write` is an all-or-nothing bundle.
+
+**Why defer**: The gateway is a single-tenant personal agent — the operator is the owner. A dedicated `operator.cron` scope would matter in a multi-tenant or delegated-access scenario, which this project isn't targeting. The existing scope system blocks unauthenticated and read-only connections, which is sufficient for the current threat model.
+
+**Counterargument addressed**: A compromised client with `operator.write` can already call `agent`, `chat.send`, `system-event`, and `sessions.delete`, all equally or more damaging than creating cron jobs. A cron-specific scope wouldn't meaningfully reduce blast radius without splitting every write method into its own scope — overengineering for a single-user gateway.
+
+### TOCTOU race in compaction status check
+
+**Status**: Deferred. Add a `// NOTE:` comment if auto-compaction is ever introduced.
+
+`compact_session` (`src/sessions/store.rs`) reads the session, checks `status != Compacting`, sets status to `Compacting`, writes metadata, then does the work. Two concurrent calls could both pass the check before either writes the `Compacting` status.
+
+**Why defer**: Three factors make this a non-issue in practice:
+
+1. **No concurrent trigger path exists.** Compaction is triggered by explicit client request (`sessions.compact`), not by a background timer. Two concurrent compaction requests for the same session would require a client to deliberately race itself.
+2. **Compaction is idempotent.** If two runs overlap, the result is a correctly compacted session — just with wasted CPU. The atomic rename ensures the final history file is consistent regardless of ordering.
+3. **The fix has real complexity cost.** Per-session locking requires either a `DashMap<SessionId, Mutex>` or a lock striping scheme, adding code, potential deadlock surface area, and memory overhead for a race condition that essentially can't happen via the WebSocket API (requests are processed sequentially per connection).
+
+**Counterargument addressed**: A future background auto-compaction feature would make this a real race. If auto-compaction is ever added, per-session locking should be added *at that time*. Designing for hypothetical future concurrency now adds complexity without benefit.
+
+### Heartbeat parity with Node.js
+
+**Status**: Deferred until a client depends on it.
+
+`handle_last_heartbeat()` (`src/server/ws/handlers/system.rs`) returns `null` — it's a stub. `handle_set_heartbeats()` accepts `enabled` and `interval` params but doesn't persist or act on them. The Node.js reference implementation tracks a global last-heartbeat timestamp updated on any client heartbeat tick.
+
+**Why defer**: This is a behavioral compatibility gap, not a security or correctness issue. Returning `null` is a valid "no heartbeat received yet" state. If any client depends on a real value, the fix is straightforward: add an `AtomicI64` to `WsServerState`, update it on each tick event, and return it from `handle_last_heartbeat()` (~10 lines of code).
+
+**Counterargument addressed**: The per-connection vs. global distinction only matters if a client asks "when was the last heartbeat from *any* connection?" vs. "when was *my* last heartbeat?" Since `last-heartbeat` is documented as a global query in Node.js and the Rust implementation doesn't track it at all, there's no semantic mismatch — just a missing feature. When implemented, it should match Node.js global semantics.
+
+### Streaming buffer stall risk
+
+**Status**: Fix later. Moderate refactor.
+
+The send path uses `mpsc::UnboundedSender<Message>` (`src/server/ws/mod.rs`). If a client stops reading, messages accumulate without bound. The `MAX_BUFFERED_BYTES` constant (1.5 MB) is defined and reported in the `hello-ok` policy but is **not enforced server-side**.
+
+**Recommended fix**: Switch from `mpsc::unbounded_channel()` to `mpsc::channel(CAPACITY)` where `CAPACITY` is derived from `MAX_BUFFERED_BYTES` (e.g., 1024 messages). Use `try_send()` instead of `send()`. On `Err(TrySendError::Full)`, drop the message and increment a counter. After N consecutive drops, close the connection. This is preferable to a background timer because:
+
+- Backpressure is applied immediately when the buffer fills, not on a timer tick.
+- No extra `tokio::spawn` per connection.
+- Clear semantics: "if you can't keep up, you get disconnected."
+
+**Effort**: Moderate. Every `send_json()` call site needs to handle the `Full` case.
+
+**Counterargument addressed**: "Just use a timer, it's simpler." A timer adds a `tokio::spawn` per connection, introduces a tuning parameter (how long is "stalled"?), and still lets the buffer grow unbounded between ticks. The bounded channel is both more correct and lower overhead. The counterargument to *both* fixes is that on a single-user gateway, only the operator can create this situation, and they're only hurting themselves — making this the weakest issue of the four.
+
+### Resolved
+
+- **Unbounded cron job creation**: Fixed. `CronScheduler::add()` enforces a hard cap of 500 jobs (`CronError::LimitExceeded`).
 
 ## Security Contacts
 

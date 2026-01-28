@@ -20,6 +20,7 @@ Rust implementation of the Moltbot gateway.
 - [Migration Plan](refactor/rust-migration.md) - Migration strategy overview
 - [Implementation Plan](refactor/implementation-plan.md) - Phased implementation details
 - [Compatibility Checklist](refactor/compatibility-checklist.md) - Node gateway compatibility tracking
+- [Critical Path](refactor/critical-path.md) - Agent executor, channel delivery, cron execution designs
 
 ## Quick Links
 
