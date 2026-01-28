@@ -254,6 +254,18 @@ pub fn init_logging(config: LogConfig) -> Result<(), LoggingError> {
     Ok(())
 }
 
+/// Initialize logging with default configuration.
+///
+/// This is a convenience function for applications that don't need custom
+/// logging configuration. It uses the default LogConfig settings.
+///
+/// # Panics
+///
+/// Panics if logging initialization fails (intended for use in main()).
+pub fn init() {
+    init_logging(LogConfig::default()).expect("Failed to initialize logging");
+}
+
 /// Initialize logging for tests.
 ///
 /// This is a convenience function that initializes logging with test-friendly
