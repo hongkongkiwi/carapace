@@ -3,9 +3,21 @@
 //! Provides channel registry for tracking active messaging channels
 //! and their connection states.
 
+pub mod discord;
+pub mod imessage;
+pub mod signal;
+pub mod slack;
 pub mod telegram;
+pub mod r#trait;
+pub mod whatsapp;
 
+pub use discord::*;
+pub use imessage::*;
+pub use signal::*;
+pub use slack::*;
 pub use telegram::*;
+pub use r#trait::*;
+pub use whatsapp::*;
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};

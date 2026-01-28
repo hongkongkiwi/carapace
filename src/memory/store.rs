@@ -180,6 +180,17 @@ impl SqliteMemoryStore {
     }
 }
 
+#[async_trait::async_trait]
+impl super::MemoryStore for SqliteMemoryStore {
+    async fn store(&self, content: &str, embedding: Vec<f32>, metadata: MemoryMetadata) -> Result<String, MemoryError> {
+        self.store(content, embedding, metadata).await
+    }
+
+    async fn search(&self, query_embedding: &[f32], limit: usize) -> Result<Vec<Memory>, MemoryError> {
+        self.search(query_embedding, limit).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
