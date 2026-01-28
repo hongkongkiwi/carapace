@@ -219,6 +219,9 @@ pub enum ResponseFormat {
     JsonSchema { schema: serde_json::Value },
 }
 
+/// Alias for Message (compatibility)
+pub type ChatMessage = Message;
+
 /// Chat completion request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRequest {
