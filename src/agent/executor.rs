@@ -361,6 +361,302 @@ fn estimate_cost(model: &str, input_tokens: u64, output_tokens: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::provider::{LlmProvider, StopReason, StreamEvent, TokenUsage};
+    use crate::agent::AgentConfig;
+    use crate::server::ws::{WsServerConfig, WsServerState};
+    use crate::sessions;
+    use async_trait::async_trait;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    /// Mock LLM provider that returns canned responses.
+    struct MockProvider {
+        /// Each call to `complete` pops the next response sequence.
+        responses: parking_lot::Mutex<Vec<Vec<StreamEvent>>>,
+    }
+
+    impl MockProvider {
+        /// Create a provider that returns the given sequences in order.
+        fn new(responses: Vec<Vec<StreamEvent>>) -> Self {
+            // Reverse so we can pop from the back (FIFO via pop from reversed vec)
+            let mut reversed = responses;
+            reversed.reverse();
+            Self {
+                responses: parking_lot::Mutex::new(reversed),
+            }
+        }
+
+        /// Convenience: single-turn text response.
+        fn text(text: &str) -> Self {
+            Self::new(vec![vec![
+                StreamEvent::TextDelta {
+                    text: text.to_string(),
+                },
+                StreamEvent::Stop {
+                    reason: StopReason::EndTurn,
+                    usage: TokenUsage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                    },
+                },
+            ]])
+        }
+
+        /// Always returns a tool_use, useful for testing max_turns.
+        fn always_tool_use(turns: usize) -> Self {
+            let mut responses = Vec::new();
+            for _ in 0..turns {
+                responses.push(vec![
+                    StreamEvent::ToolUse {
+                        id: "tool_1".to_string(),
+                        name: "time".to_string(),
+                        input: serde_json::json!({}),
+                    },
+                    StreamEvent::Stop {
+                        reason: StopReason::ToolUse,
+                        usage: TokenUsage {
+                            input_tokens: 10,
+                            output_tokens: 5,
+                        },
+                    },
+                ]);
+            }
+            Self::new(responses)
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for MockProvider {
+        async fn complete(
+            &self,
+            _request: crate::agent::provider::CompletionRequest,
+        ) -> Result<mpsc::Receiver<StreamEvent>, crate::agent::AgentError> {
+            let events = {
+                let mut responses = self.responses.lock();
+                responses.pop().unwrap_or_default()
+            };
+            let (tx, rx) = mpsc::channel(64);
+            tokio::spawn(async move {
+                for event in events {
+                    let _ = tx.send(event).await;
+                }
+            });
+            Ok(rx)
+        }
+    }
+
+    /// Helper to set up test state with a temp session store.
+    fn make_test_state() -> (Arc<WsServerState>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(sessions::SessionStore::with_base_path(
+            tmp.path().join("sessions"),
+        ));
+        let state = WsServerState::new(WsServerConfig::default()).with_session_store(store);
+        (Arc::new(state), tmp)
+    }
+
+    /// Helper to set up test state with a tools registry.
+    fn make_test_state_with_tools() -> (Arc<WsServerState>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(sessions::SessionStore::with_base_path(
+            tmp.path().join("sessions"),
+        ));
+        let tools_registry = Arc::new(crate::plugins::tools::ToolsRegistry::new());
+        let state = WsServerState::new(WsServerConfig::default())
+            .with_session_store(store)
+            .with_tools_registry(tools_registry);
+        (Arc::new(state), tmp)
+    }
+
+    /// Helper to set up a session and register an agent run.
+    fn setup_session_and_run(
+        state: &WsServerState,
+        session_key: &str,
+        run_id: &str,
+    ) -> sessions::Session {
+        let session = state
+            .session_store()
+            .get_or_create_session(session_key, sessions::SessionMetadata::default())
+            .unwrap();
+        // Append a user message so the executor has context
+        state
+            .session_store()
+            .append_message(sessions::ChatMessage::user(&session.id, "Hello"))
+            .unwrap();
+        // Register the run
+        {
+            use crate::server::ws::{AgentRun, AgentRunStatus};
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            let mut registry = state.agent_run_registry.lock();
+            registry.register(AgentRun {
+                run_id: run_id.to_string(),
+                session_key: session_key.to_string(),
+                status: AgentRunStatus::Queued,
+                message: "Hello".to_string(),
+                response: String::new(),
+                error: None,
+                created_at: now,
+                started_at: None,
+                completed_at: None,
+                waiters: Vec::new(),
+            });
+        }
+        session
+    }
+
+    #[tokio::test]
+    async fn test_single_turn_text_response() {
+        let (state, _tmp) = make_test_state();
+        let run_id = "run-text-1";
+        let session_key = "test-session-1";
+        setup_session_and_run(&state, session_key, run_id);
+
+        let provider = Arc::new(MockProvider::text("Hello world!"));
+        let config = AgentConfig {
+            max_turns: 5,
+            ..Default::default()
+        };
+
+        let result = execute_run(
+            run_id.to_string(),
+            session_key.to_string(),
+            config,
+            state.clone(),
+            provider,
+        )
+        .await;
+        assert!(result.is_ok(), "execute_run failed: {:?}", result.err());
+
+        // Verify the run is marked completed
+        let registry = state.agent_run_registry.lock();
+        let run = registry.get(run_id).unwrap();
+        assert_eq!(run.status, crate::server::ws::AgentRunStatus::Completed);
+        assert_eq!(run.response, "Hello world!");
+    }
+
+    #[tokio::test]
+    async fn test_max_turns_reached() {
+        let (state, _tmp) = make_test_state_with_tools();
+        let run_id = "run-max-turns";
+        let session_key = "test-session-max";
+        setup_session_and_run(&state, session_key, run_id);
+
+        let max_turns = 3;
+        let provider = Arc::new(MockProvider::always_tool_use(max_turns as usize + 1));
+        let config = AgentConfig {
+            max_turns,
+            ..Default::default()
+        };
+
+        let result = execute_run(
+            run_id.to_string(),
+            session_key.to_string(),
+            config,
+            state.clone(),
+            provider,
+        )
+        .await;
+        // Should complete without error — the loop simply exits after max_turns
+        assert!(result.is_ok(), "execute_run failed: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn test_tool_use_loop() {
+        let (state, _tmp) = make_test_state_with_tools();
+        let run_id = "run-tool-loop";
+        let session_key = "test-session-tool";
+        setup_session_and_run(&state, session_key, run_id);
+
+        // Turn 1: tool use (time), Turn 2: text response
+        let provider = Arc::new(MockProvider::new(vec![
+            // Turn 1: tool use
+            vec![
+                StreamEvent::ToolUse {
+                    id: "tool_1".to_string(),
+                    name: "time".to_string(),
+                    input: serde_json::json!({}),
+                },
+                StreamEvent::Stop {
+                    reason: StopReason::ToolUse,
+                    usage: TokenUsage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                    },
+                },
+            ],
+            // Turn 2: text response
+            vec![
+                StreamEvent::TextDelta {
+                    text: "The time is now.".to_string(),
+                },
+                StreamEvent::Stop {
+                    reason: StopReason::EndTurn,
+                    usage: TokenUsage {
+                        input_tokens: 20,
+                        output_tokens: 10,
+                    },
+                },
+            ],
+        ]));
+        let config = AgentConfig {
+            max_turns: 5,
+            ..Default::default()
+        };
+
+        let result = execute_run(
+            run_id.to_string(),
+            session_key.to_string(),
+            config,
+            state.clone(),
+            provider,
+        )
+        .await;
+        assert!(result.is_ok(), "execute_run failed: {:?}", result.err());
+
+        let registry = state.agent_run_registry.lock();
+        let run = registry.get(run_id).unwrap();
+        assert_eq!(run.status, crate::server::ws::AgentRunStatus::Completed);
+        assert_eq!(run.response, "The time is now.");
+    }
+
+    #[tokio::test]
+    async fn test_empty_response_handling() {
+        let (state, _tmp) = make_test_state();
+        let run_id = "run-empty";
+        let session_key = "test-session-empty";
+        setup_session_and_run(&state, session_key, run_id);
+
+        // Provider returns stop immediately with no text
+        let provider = Arc::new(MockProvider::new(vec![vec![StreamEvent::Stop {
+            reason: StopReason::EndTurn,
+            usage: TokenUsage {
+                input_tokens: 5,
+                output_tokens: 0,
+            },
+        }]]));
+        let config = AgentConfig {
+            max_turns: 5,
+            ..Default::default()
+        };
+
+        let result = execute_run(
+            run_id.to_string(),
+            session_key.to_string(),
+            config,
+            state.clone(),
+            provider,
+        )
+        .await;
+        assert!(result.is_ok(), "execute_run failed: {:?}", result.err());
+
+        let registry = state.agent_run_registry.lock();
+        let run = registry.get(run_id).unwrap();
+        assert_eq!(run.status, crate::server::ws::AgentRunStatus::Completed);
+        assert!(run.response.is_empty(), "response should be empty");
+    }
 
     #[test]
     fn test_estimate_cost_sonnet() {

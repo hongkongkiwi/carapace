@@ -12,7 +12,7 @@ mod exec;
 mod logs;
 mod misc;
 mod node;
-mod sessions;
+pub(crate) mod sessions;
 mod skills;
 mod system;
 mod talk;
