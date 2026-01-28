@@ -400,7 +400,7 @@ pub struct FunctionCallDelta {
 }
 
 /// Model information
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelInfo {
     /// Model ID
     pub id: String,
