@@ -75,7 +75,12 @@ pub(super) fn handle_exec_approvals_set(params: Option<&Value>) -> Result<Value,
 /// Get exec approvals for a specific node.
 ///
 /// This proxies to the node to get its local exec approvals configuration.
-pub(super) fn handle_exec_approvals_node_get(params: Option<&Value>) -> Result<Value, ErrorShape> {
+/// If the node is not connected or doesn't support the command, returns
+/// default placeholder settings.
+pub(super) async fn handle_exec_approvals_node_get(
+    params: Option<&Value>,
+    state: &WsServerState,
+) -> Result<Value, ErrorShape> {
     let node_id = params
         .and_then(|v| v.get("nodeId"))
         .and_then(|v| v.as_str())
@@ -89,24 +94,80 @@ pub(super) fn handle_exec_approvals_node_get(params: Option<&Value>) -> Result<V
         ));
     }
 
-    // TODO: Invoke system.execApprovals.get on the node
-    // For now, return a placeholder response
-    Ok(json!({
+    // Check if the node is connected and supports the command
+    let node_supports_command = {
+        let registry = state.node_registry.lock();
+        registry.get(node_id).map_or(false, |node| {
+            node.commands.contains("system.execApprovals.get")
+        })
+    };
+
+    if !node_supports_command {
+        // Node not connected or doesn't support the command - return default settings
+        return Ok(json!({
+            "nodeId": node_id,
+            "path": null,
+            "exists": false,
+            "hash": null,
+            "file": {
+                "mode": "ask",
+                "rules": []
+            }
+        }));
+    }
+
+    // Invoke the command on the node
+    let invoke_params = json!({
         "nodeId": node_id,
-        "path": null,
-        "exists": false,
-        "hash": null,
-        "file": {
-            "mode": "ask",
-            "rules": []
+        "command": "system.execApprovals.get",
+        "idempotencyKey": Uuid::new_v4().to_string(),
+        "timeoutMs": 10000
+    });
+
+    match super::node::handle_node_invoke(Some(&invoke_params), state).await {
+        Ok(result) => {
+            // Extract the payload from the node response
+            let payload = result.get("payload").cloned().unwrap_or(Value::Null);
+
+            // Merge nodeId into the response
+            if let Some(obj) = payload.as_object() {
+                let mut response = obj.clone();
+                response.insert("nodeId".to_string(), json!(node_id));
+                Ok(Value::Object(response))
+            } else {
+                Ok(json!({
+                    "nodeId": node_id,
+                    "path": null,
+                    "exists": false,
+                    "hash": null,
+                    "file": payload
+                }))
+            }
         }
-    }))
+        Err(_) => {
+            // Node invoke failed - return default settings
+            Ok(json!({
+                "nodeId": node_id,
+                "path": null,
+                "exists": false,
+                "hash": null,
+                "file": {
+                    "mode": "ask",
+                    "rules": []
+                }
+            }))
+        }
+    }
 }
 
 /// Set exec approvals for a specific node.
 ///
 /// This proxies to the node to update its local exec approvals configuration.
-pub(super) fn handle_exec_approvals_node_set(params: Option<&Value>) -> Result<Value, ErrorShape> {
+/// If the node is not connected or doesn't support the command, returns an error.
+pub(super) async fn handle_exec_approvals_node_set(
+    params: Option<&Value>,
+    state: &WsServerState,
+) -> Result<Value, ErrorShape> {
     let node_id = params
         .and_then(|v| v.get("nodeId"))
         .and_then(|v| v.as_str())
@@ -132,16 +193,66 @@ pub(super) fn handle_exec_approvals_node_set(params: Option<&Value>) -> Result<V
         ));
     }
 
-    // TODO: Invoke system.execApprovals.set on the node
-    // For now, return the file as confirmation
-    Ok(json!({
-        "ok": true,
+    // Check if the node is connected and supports the command
+    let node_supports_command = {
+        let registry = state.node_registry.lock();
+        registry.get(node_id).map_or(false, |node| {
+            node.commands.contains("system.execApprovals.set")
+        })
+    };
+
+    if !node_supports_command {
+        return Err(error_shape(
+            ERROR_UNAVAILABLE,
+            "node not connected or does not support exec approvals",
+            Some(json!({
+                "nodeId": node_id,
+                "command": "system.execApprovals.set"
+            })),
+        ));
+    }
+
+    // Invoke the command on the node
+    let invoke_params = json!({
         "nodeId": node_id,
-        "path": null,
-        "exists": true,
-        "hash": Uuid::new_v4().to_string(),
-        "file": file.clone()
-    }))
+        "command": "system.execApprovals.set",
+        "idempotencyKey": Uuid::new_v4().to_string(),
+        "timeoutMs": 10000,
+        "params": {
+            "file": file.clone()
+        }
+    });
+
+    match super::node::handle_node_invoke(Some(&invoke_params), state).await {
+        Ok(result) => {
+            // Extract the payload from the node response
+            let payload = result.get("payload").cloned().unwrap_or(Value::Null);
+
+            // Merge nodeId and ok into the response
+            if let Some(obj) = payload.as_object() {
+                let mut response = obj.clone();
+                response.insert("nodeId".to_string(), json!(node_id));
+                if !response.contains_key("ok") {
+                    response.insert("ok".to_string(), json!(true));
+                }
+                Ok(Value::Object(response))
+            } else {
+                Ok(json!({
+                    "ok": true,
+                    "nodeId": node_id,
+                    "file": file.clone()
+                }))
+            }
+        }
+        Err(e) => Err(error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("failed to set exec approvals on node: {}", e.message),
+            Some(json!({
+                "nodeId": node_id,
+                "error": e.details
+            })),
+        )),
+    }
 }
 
 /// Request approval for a command execution.
@@ -306,33 +417,43 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_handle_exec_approvals_node_get_requires_node_id() {
-        let result = handle_exec_approvals_node_get(None);
+    #[tokio::test]
+    async fn test_handle_exec_approvals_node_get_requires_node_id() {
+        let state = WsServerState::new(crate::server::ws::WsServerConfig::default());
+
+        let result = handle_exec_approvals_node_get(None, &state).await;
         assert!(result.is_err());
 
         let params = json!({ "nodeId": "" });
-        let result = handle_exec_approvals_node_get(Some(&params));
+        let result = handle_exec_approvals_node_get(Some(&params), &state).await;
         assert!(result.is_err());
 
+        // When node is not connected, returns default settings
         let params = json!({ "nodeId": "node-1" });
-        let result = handle_exec_approvals_node_get(Some(&params));
+        let result = handle_exec_approvals_node_get(Some(&params), &state).await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap()["nodeId"], "node-1");
+        let value = result.unwrap();
+        assert_eq!(value["nodeId"], "node-1");
+        assert_eq!(value["exists"], false);
     }
 
-    #[test]
-    fn test_handle_exec_approvals_node_set_requires_params() {
-        let result = handle_exec_approvals_node_set(None);
+    #[tokio::test]
+    async fn test_handle_exec_approvals_node_set_requires_params() {
+        let state = WsServerState::new(crate::server::ws::WsServerConfig::default());
+
+        let result = handle_exec_approvals_node_set(None, &state).await;
         assert!(result.is_err());
 
         let params = json!({ "nodeId": "node-1" });
-        let result = handle_exec_approvals_node_set(Some(&params));
+        let result = handle_exec_approvals_node_set(Some(&params), &state).await;
         assert!(result.is_err()); // Missing file
 
+        // When node is not connected, returns error (can't set on disconnected node)
         let params = json!({ "nodeId": "node-1", "file": { "mode": "ask" } });
-        let result = handle_exec_approvals_node_set(Some(&params));
-        assert!(result.is_ok());
+        let result = handle_exec_approvals_node_set(Some(&params), &state).await;
+        assert!(result.is_err()); // Node not connected
+        let err = result.unwrap_err();
+        assert_eq!(err.code, ERROR_UNAVAILABLE);
     }
 
     #[test]

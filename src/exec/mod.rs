@@ -201,21 +201,20 @@ impl ExecApprovalManager {
 
     /// Resolve a pending approval request.
     ///
-    /// Returns `true` if the request was found and resolved, `false` otherwise.
+    /// Returns the resolved record if found, `None` otherwise.
+    /// The record is returned so callers can use it (e.g., to add allow-always patterns).
     pub fn resolve(
         &self,
         record_id: &str,
         decision: ExecApprovalDecision,
         _resolved_by: Option<&str>,
-    ) -> bool {
+    ) -> Option<ExecApprovalRecord> {
         let mut pending = self.pending.lock();
-        let Some(entry) = pending.remove(record_id) else {
-            return false;
-        };
+        let entry = pending.remove(record_id)?;
 
         // Send the decision (ignore if receiver dropped)
         let _ = entry.responder.send(Some(decision));
-        true
+        Some(entry.record)
     }
 
     /// Get a snapshot of a pending approval record.
@@ -367,11 +366,12 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         // Resolve the approval
-        assert!(manager.resolve(
+        let resolved = manager.resolve(
             "resolve-test",
             ExecApprovalDecision::AllowOnce,
-            Some("tester")
-        ));
+            Some("tester"),
+        );
+        assert!(resolved.is_some());
 
         // Wait should return the decision
         let decision = wait_handle.await.unwrap();
@@ -401,6 +401,8 @@ mod tests {
     #[test]
     fn test_resolve_unknown_id() {
         let manager = ExecApprovalManager::new();
-        assert!(!manager.resolve("unknown-id", ExecApprovalDecision::Deny, None));
+        assert!(manager
+            .resolve("unknown-id", ExecApprovalDecision::Deny, None)
+            .is_none());
     }
 }

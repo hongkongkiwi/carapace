@@ -143,7 +143,14 @@ fn normalize_triggers(raw: Vec<String>) -> Vec<String> {
         .map(|s| {
             let trimmed = s.trim();
             if trimmed.len() > MAX_TRIGGER_LEN {
-                trimmed[..MAX_TRIGGER_LEN].to_string()
+                // Safe UTF-8 truncation to avoid panicking on multi-byte chars
+                let truncate_at = trimmed
+                    .char_indices()
+                    .take_while(|(i, c)| i + c.len_utf8() <= MAX_TRIGGER_LEN)
+                    .last()
+                    .map(|(i, c)| i + c.len_utf8())
+                    .unwrap_or(0);
+                trimmed[..truncate_at].to_string()
             } else {
                 trimmed.to_string()
             }
