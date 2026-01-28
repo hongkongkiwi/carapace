@@ -9,6 +9,7 @@
 pub mod agent;
 pub mod ai;
 pub mod auth;
+pub mod browser;
 pub mod channels;
 pub mod config;
 pub mod credentials;
