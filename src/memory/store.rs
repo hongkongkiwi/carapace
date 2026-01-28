@@ -180,6 +180,74 @@ impl SqliteMemoryStore {
     }
 }
 
+#[async_trait::async_trait]
+impl super::MemoryStore for SqliteMemoryStore {
+    async fn store(
+        &self,
+        content: &str,
+        _embedding: Vec<f32>,
+        metadata: super::MemoryMetadata,
+    ) -> Result<String, super::MemoryError> {
+        let id = uuid::Uuid::new_v4().to_string();
+
+        sqlx::query(
+            r#"
+            INSERT INTO memories (id, content, source, session_id, tags)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+        )
+        .bind(&id)
+        .bind(content)
+        .bind(&metadata.source)
+        .bind(&metadata.session_id)
+        .bind(metadata.tags.join(","))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| super::MemoryError::Storage(format!("Failed to store: {}", e)))?;
+
+        Ok(id)
+    }
+
+    async fn search(
+        &self,
+        _query_embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<super::Memory>, super::MemoryError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, content, source, session_id, tags, created_at
+            FROM memories
+            ORDER BY created_at DESC
+            LIMIT ?1
+            "#,
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| super::MemoryError::Storage(format!("Search failed: {}", e)))?;
+
+        let memories = rows
+            .into_iter()
+            .map(|row| super::Memory {
+                id: row.get("id"),
+                content: row.get("content"),
+                embedding: None,
+                metadata: super::MemoryMetadata {
+                    source: row.get::<Option<String>, _>("source").unwrap_or_default(),
+                    session_id: row.get("session_id"),
+                    tags: row
+                        .get::<Option<String>, _>("tags")
+                        .map(|t| t.split(',').map(|s| s.to_string()).collect())
+                        .unwrap_or_default(),
+                },
+                created_at: row.get("created_at"),
+            })
+            .collect();
+
+        Ok(memories)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

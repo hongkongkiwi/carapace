@@ -112,7 +112,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_indexer() {
-        let store = Arc::new(SqliteMemoryStore::new(":memory:"));
+        let store = Arc::new(SqliteMemoryStore::new(":memory:", 384).await.unwrap());
         let embedder = Arc::new(MockEmbeddingProvider::new(384));
         let indexer = MemoryIndexer::new(store, embedder, IndexerConfig::default());
 

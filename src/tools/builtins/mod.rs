@@ -3,8 +3,12 @@
 //! Default tools available in every Carapace installation.
 
 pub mod bash;
+pub mod screen;
+pub mod web;
 
 pub use bash::BashTool;
+pub use screen::{CameraTool, ScreenTool};
+pub use web::{WebFetchTool, WebSearchTool};
 
 use super::{Tool, ToolOutput};
 use crate::tools::ToolError;
