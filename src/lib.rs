@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
+// pub mod ai;  // TODO: PR 4 - AI Provider Abstractions (has compilation errors)
 pub mod auth;
 pub mod channels;
 pub mod config;
@@ -16,6 +17,7 @@ pub mod exec;
 pub mod hooks;
 pub mod logging;
 pub mod media;
+pub mod metrics;
 pub mod messages;
 pub mod nodes;
 pub mod plugins;

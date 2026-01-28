@@ -3,6 +3,9 @@
 //! Handles JSON5 configuration with includes, environment variable substitution,
 //! and caching. Matches moltbot's format for drop-in compatibility.
 
+pub mod schema;
+pub mod types;
+
 use parking_lot::RwLock;
 use regex::Regex;
 use serde_json::Value;
