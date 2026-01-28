@@ -3,6 +3,10 @@
 //! Provides channel registry for tracking active messaging channels
 //! and their connection states.
 
+pub mod telegram;
+
+pub use telegram::*;
+
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

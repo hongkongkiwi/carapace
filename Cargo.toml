@@ -43,6 +43,8 @@ schemars = { version = "0.8", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 async-trait = "0.1"
+sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "chrono", "migrate", "macros"], default-features = false }
+sqlite-vec = "0.1"
 
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }
