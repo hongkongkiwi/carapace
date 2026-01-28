@@ -237,7 +237,7 @@ impl ToolExecutor {
 
     /// Get tool information
     pub fn get_tool_info(&self, tool_name: &str) -> Option<ToolInfo> {
-        self.registry.get_tool_info(tool_name)
+        self.registry.as_ref().get_tool_info(tool_name)
     }
 
     /// List all available tools
