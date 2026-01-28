@@ -3,8 +3,12 @@
 //! Provides channel registry for tracking active messaging channels
 //! and their connection states.
 
+pub mod discord;
 pub mod telegram;
+pub mod r#trait;
 
+pub use discord::*;
+pub use r#trait::*;
 pub use telegram::*;
 
 use parking_lot::RwLock;
