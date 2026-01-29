@@ -26,3 +26,4 @@ pub mod plugins;
 pub mod server;
 pub mod sessions;
 pub mod tools;
+pub mod voice;
