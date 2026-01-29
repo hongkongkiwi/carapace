@@ -3,6 +3,7 @@
 //! Provides channel registry for tracking active messaging channels
 //! and their connection states.
 
+pub mod config;
 pub mod console;
 pub mod discord;
 pub mod google_chat;
@@ -20,6 +21,7 @@ pub mod webhook;
 pub mod webchat;
 pub mod zalo;
 
+pub use config::*;
 pub use line::*;
 
 use parking_lot::RwLock;
