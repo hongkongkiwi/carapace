@@ -8,6 +8,7 @@
 
 pub mod agent;
 pub mod auth;
+pub mod autoreply;
 pub mod channels;
 pub mod config;
 pub mod credentials;
@@ -20,6 +21,8 @@ pub mod media;
 pub mod messages;
 pub mod nodes;
 pub mod plugins;
+pub mod polls;
 pub mod server;
 pub mod sessions;
+pub mod tts;
 pub mod usage;
