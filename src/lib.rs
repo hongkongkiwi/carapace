@@ -16,6 +16,7 @@ pub mod cron;
 pub mod devices;
 pub mod discovery;
 pub mod exec;
+pub mod gateway;
 pub mod hooks;
 pub mod links;
 pub mod logging;

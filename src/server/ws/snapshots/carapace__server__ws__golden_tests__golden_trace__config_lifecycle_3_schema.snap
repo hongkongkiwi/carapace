@@ -1,0 +1,23 @@
+---
+source: src/server/ws/golden_tests.rs
+assertion_line: 649
+expression: normalized
+---
+{
+  "ok": true,
+  "result": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "properties": {
+      "agent": {
+        "type": "object"
+      },
+      "channels": {
+        "type": "object"
+      },
+      "gateway": {
+        "type": "object"
+      }
+    },
+    "type": "object"
+  }
+}

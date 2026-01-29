@@ -32,6 +32,8 @@ use crate::{
     sessions,
 };
 
+#[cfg(test)]
+mod golden_tests;
 mod handlers;
 #[cfg(test)]
 mod tests;

@@ -1,0 +1,14 @@
+---
+source: src/server/ws/golden_tests.rs
+assertion_line: 378
+expression: normalized
+---
+{
+  "ok": true,
+  "result": {
+    "channels": [],
+    "connected": 0,
+    "total": 0,
+    "ts": "<TIMESTAMP>"
+  }
+}

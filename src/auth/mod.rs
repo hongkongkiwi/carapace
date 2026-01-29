@@ -3,6 +3,8 @@
 //! Implements timing-safe comparisons, Tailscale header verification,
 //! local-direct detection, and gateway token/password authorization.
 
+pub mod profiles;
+
 use axum::http::HeaderMap;
 use serde_json::Value;
 use std::net::{IpAddr, SocketAddr};

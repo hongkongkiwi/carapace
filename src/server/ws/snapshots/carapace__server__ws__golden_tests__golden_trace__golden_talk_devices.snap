@@ -1,0 +1,34 @@
+---
+source: src/server/ws/golden_tests.rs
+assertion_line: 699
+expression: normalized
+---
+{
+  "ok": true,
+  "result": {
+    "inputDevices": [
+      {
+        "default": true,
+        "id": "default",
+        "name": "Default Input"
+      },
+      {
+        "default": false,
+        "id": "built-in-mic",
+        "name": "Built-in Microphone"
+      }
+    ],
+    "outputDevices": [
+      {
+        "default": true,
+        "id": "default",
+        "name": "Default Output"
+      },
+      {
+        "default": false,
+        "id": "built-in-speakers",
+        "name": "Built-in Speakers"
+      }
+    ]
+  }
+}

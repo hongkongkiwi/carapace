@@ -1,0 +1,17 @@
+---
+source: src/server/ws/golden_tests.rs
+assertion_line: 434
+expression: normalized
+---
+{
+  "ok": true,
+  "result": {
+    "exists": true,
+    "file": {
+      "mode": "deny",
+      "rules": []
+    },
+    "hash": "736b32d7cd392d37c42c4432ff60d86190509fec34e0e05eb2079205aa150526",
+    "path": "<PATH>"
+  }
+}

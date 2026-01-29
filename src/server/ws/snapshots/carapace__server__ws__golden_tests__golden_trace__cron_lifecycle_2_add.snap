@@ -1,0 +1,13 @@
+---
+source: src/server/ws/golden_tests.rs
+assertion_line: 542
+expression: normalized
+---
+{
+  "error": {
+    "code": "INVALID_REQUEST",
+    "message": "schedule.kind is required",
+    "retryable": false
+  },
+  "ok": false
+}

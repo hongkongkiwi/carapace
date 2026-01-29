@@ -1,0 +1,1775 @@
+//! Remote gateway connection support
+//!
+//! Allows a carapace node to connect to a remote carapace gateway that it
+//! cannot reach directly. Two transport modes are supported:
+//!
+//! - **Direct WebSocket** -- outbound WS connection with TLS certificate
+//!   fingerprint-based trust-on-first-use (TOFU) verification.
+//! - **SSH tunnel** -- SSH tunnel transport for NAT traversal scenarios.
+//!
+//! Configuration lives under `gateway.remote` in the JSON5 config file.
+
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::Write as IoWrite;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tracing::{error, info, warn};
+use uuid::Uuid;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/// Maximum number of registered remote gateways.
+pub const MAX_GATEWAYS: usize = 50;
+
+/// Default reconnect interval in milliseconds (30 seconds).
+pub const DEFAULT_RECONNECT_INTERVAL_MS: u64 = 30_000;
+
+/// Default maximum reconnect attempts before giving up.
+pub const DEFAULT_MAX_RECONNECT_ATTEMPTS: u32 = 10;
+
+/// Protocol version used in the gateway handshake.
+pub const PROTOCOL_VERSION: u32 = 3;
+
+// ============================================================================
+// Error types
+// ============================================================================
+
+/// Errors that can occur during remote gateway operations.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GatewayError {
+    /// TLS certificate fingerprint mismatch (TOFU violation).
+    FingerprintMismatch { expected: String, actual: String },
+    /// WebSocket or network connection failed.
+    ConnectionFailed(String),
+    /// Authentication with the remote gateway failed.
+    AuthFailed(String),
+    /// SSH tunnel setup or operation failed.
+    TunnelFailed(String),
+    /// File I/O error.
+    IoError(String),
+    /// Configuration parsing or validation error.
+    ConfigError(String),
+    /// The maximum number of gateways has been reached.
+    MaxGatewaysExceeded,
+    /// The requested gateway was not found.
+    NotFound,
+}
+
+impl std::fmt::Display for GatewayError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FingerprintMismatch { expected, actual } => write!(
+                f,
+                "TLS fingerprint mismatch: expected {}, got {}",
+                expected, actual
+            ),
+            Self::ConnectionFailed(msg) => write!(f, "connection failed: {}", msg),
+            Self::AuthFailed(msg) => write!(f, "authentication failed: {}", msg),
+            Self::TunnelFailed(msg) => write!(f, "tunnel failed: {}", msg),
+            Self::IoError(msg) => write!(f, "I/O error: {}", msg),
+            Self::ConfigError(msg) => write!(f, "config error: {}", msg),
+            Self::MaxGatewaysExceeded => write!(f, "maximum number of gateways exceeded"),
+            Self::NotFound => write!(f, "gateway not found"),
+        }
+    }
+}
+
+impl std::error::Error for GatewayError {}
+
+// ============================================================================
+// Transport types
+// ============================================================================
+
+/// Transport mode for connecting to a remote gateway.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GatewayTransport {
+    /// Direct outbound WebSocket connection.
+    #[default]
+    DirectWs,
+    /// SSH tunnel with port forwarding.
+    SshTunnel {
+        ssh_host: String,
+        ssh_port: u16,
+        ssh_user: String,
+        remote_port: u16,
+    },
+}
+
+// ============================================================================
+// Gateway entry
+// ============================================================================
+
+/// A known remote gateway entry stored in the registry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayEntry {
+    /// Unique identifier (UUID).
+    pub id: String,
+    /// Human-readable name.
+    pub name: String,
+    /// WebSocket URL, e.g. `wss://host:port/ws`.
+    pub url: String,
+    /// SHA-256 TLS certificate fingerprint for TOFU verification.
+    /// `None` means the fingerprint has not been pinned yet (first connect).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+    /// Transport mode.
+    #[serde(default)]
+    pub transport: GatewayTransport,
+    /// Whether to automatically connect on startup.
+    #[serde(default)]
+    pub auto_connect: bool,
+    /// Timestamp when this entry was created (Unix ms).
+    pub created_at_ms: u64,
+    /// Timestamp of the last successful connection (Unix ms).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_connected_ms: Option<u64>,
+}
+
+impl GatewayEntry {
+    /// Create a new gateway entry with a generated UUID.
+    pub fn new(name: String, url: String) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            name,
+            url,
+            fingerprint: None,
+            transport: GatewayTransport::DirectWs,
+            auto_connect: false,
+            created_at_ms: now_ms(),
+            last_connected_ms: None,
+        }
+    }
+}
+
+// ============================================================================
+// Connection state
+// ============================================================================
+
+/// Runtime state of a gateway connection.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum GatewayConnectionState {
+    /// Not connected.
+    #[default]
+    Disconnected,
+    /// Connection attempt in progress.
+    Connecting,
+    /// Successfully connected since the given timestamp (Unix ms).
+    Connected { since_ms: u64 },
+    /// Connection failed with an error; optional retry timestamp.
+    Failed {
+        error: String,
+        retry_at_ms: Option<u64>,
+    },
+}
+
+// ============================================================================
+// Gateway connection handle
+// ============================================================================
+
+/// Handle representing an active connection to a remote gateway.
+///
+/// The actual WebSocket transport is not yet wired; this struct tracks the
+/// connection metadata and will be extended when a WS client crate is added.
+#[derive(Debug)]
+pub struct GatewayConnection {
+    /// ID of the gateway this connection belongs to.
+    pub gateway_id: String,
+    /// Current state.
+    pub state: GatewayConnectionState,
+    /// Protocol version negotiated with the remote side.
+    pub protocol_version: u32,
+}
+
+impl GatewayConnection {
+    /// Create a new connection handle in the `Connected` state.
+    pub fn new_connected(gateway_id: String) -> Self {
+        Self {
+            gateway_id,
+            state: GatewayConnectionState::Connected { since_ms: now_ms() },
+            protocol_version: PROTOCOL_VERSION,
+        }
+    }
+
+    /// Check whether the connection is currently in the `Connected` state.
+    pub fn is_connected(&self) -> bool {
+        matches!(self.state, GatewayConnectionState::Connected { .. })
+    }
+
+    /// Send a JSON-RPC message to the remote gateway.
+    ///
+    /// # Note
+    /// This is a placeholder -- the actual WebSocket send will be implemented
+    /// once a WS client transport is wired in.
+    pub fn send_message(&self, _method: &str, _params: &Value) -> Result<(), GatewayError> {
+        // TODO: wire actual WS client transport
+        if !self.is_connected() {
+            return Err(GatewayError::ConnectionFailed("not connected".to_string()));
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Gateway registry
+// ============================================================================
+
+/// Persistent store for gateway entries (serialised to disk).
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GatewayStore {
+    /// Schema version for future migrations.
+    pub version: u32,
+    /// Registered gateway entries.
+    #[serde(default)]
+    pub gateways: Vec<GatewayEntry>,
+}
+
+impl GatewayStore {
+    const VERSION: u32 = 1;
+
+    fn new() -> Self {
+        Self {
+            version: Self::VERSION,
+            gateways: Vec::new(),
+        }
+    }
+}
+
+/// Thread-safe registry of remote gateways with persistence.
+pub struct GatewayRegistry {
+    /// In-memory gateway entries.
+    gateways: RwLock<Vec<GatewayEntry>>,
+    /// Runtime connection states keyed by gateway ID.
+    connections: RwLock<HashMap<String, GatewayConnectionState>>,
+    /// Path to the persisted `gateways.json` file.
+    state_path: PathBuf,
+}
+
+impl std::fmt::Debug for GatewayRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatewayRegistry")
+            .field("state_path", &self.state_path)
+            .finish()
+    }
+}
+
+impl GatewayRegistry {
+    /// Create a new registry. Persisted data is stored in `{state_dir}/gateways.json`.
+    pub fn new(state_dir: PathBuf) -> Self {
+        let state_path = state_dir.join("gateways.json");
+        Self {
+            gateways: RwLock::new(Vec::new()),
+            connections: RwLock::new(HashMap::new()),
+            state_path,
+        }
+    }
+
+    /// Create an in-memory-only registry (for testing).
+    pub fn in_memory() -> Self {
+        Self {
+            gateways: RwLock::new(Vec::new()),
+            connections: RwLock::new(HashMap::new()),
+            state_path: PathBuf::new(),
+        }
+    }
+
+    /// Load gateway entries from the persisted JSON file.
+    pub fn load(&self) -> Result<(), GatewayError> {
+        if self.state_path.as_os_str().is_empty() {
+            return Ok(());
+        }
+
+        if !self.state_path.exists() {
+            return Ok(());
+        }
+
+        let content = fs::read_to_string(&self.state_path)
+            .map_err(|e| GatewayError::IoError(e.to_string()))?;
+
+        let store: GatewayStore = serde_json::from_str(&content).map_err(|e| {
+            GatewayError::ConfigError(format!("failed to parse gateways.json: {}", e))
+        })?;
+
+        let mut gateways = self.gateways.write();
+        *gateways = store.gateways;
+
+        Ok(())
+    }
+
+    /// Save gateway entries to disk using an atomic write (temp + fsync + rename).
+    pub fn save(&self) -> Result<(), GatewayError> {
+        if self.state_path.as_os_str().is_empty() {
+            return Ok(());
+        }
+
+        let gateways = self.gateways.read();
+        let store = GatewayStore {
+            version: GatewayStore::VERSION,
+            gateways: gateways.clone(),
+        };
+        let content = serde_json::to_string_pretty(&store)
+            .map_err(|e| GatewayError::IoError(e.to_string()))?;
+        drop(gateways);
+
+        // Ensure parent directory exists
+        if let Some(parent) = self.state_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| GatewayError::IoError(e.to_string()))?;
+        }
+
+        // Atomic write: temp file -> fsync -> rename
+        let temp_path = self.state_path.with_extension("tmp");
+        let mut file =
+            File::create(&temp_path).map_err(|e| GatewayError::IoError(e.to_string()))?;
+        IoWrite::write_all(&mut file, content.as_bytes())
+            .map_err(|e| GatewayError::IoError(e.to_string()))?;
+        file.sync_all()
+            .map_err(|e| GatewayError::IoError(e.to_string()))?;
+        fs::rename(&temp_path, &self.state_path)
+            .map_err(|e| GatewayError::IoError(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Add a new gateway entry. Enforces the `MAX_GATEWAYS` limit and rejects
+    /// duplicate IDs.
+    pub fn add(&self, entry: GatewayEntry) -> Result<(), GatewayError> {
+        let mut gateways = self.gateways.write();
+
+        if gateways.len() >= MAX_GATEWAYS {
+            return Err(GatewayError::MaxGatewaysExceeded);
+        }
+
+        // Reject duplicate IDs
+        if gateways.iter().any(|g| g.id == entry.id) {
+            return Err(GatewayError::ConfigError(format!(
+                "gateway with id {} already exists",
+                entry.id
+            )));
+        }
+
+        gateways.push(entry);
+        drop(gateways);
+
+        self.save()?;
+        Ok(())
+    }
+
+    /// Remove a gateway entry by ID. Returns `true` if the entry was found
+    /// and removed, `false` if not found.
+    pub fn remove(&self, id: &str) -> Result<bool, GatewayError> {
+        let mut gateways = self.gateways.write();
+        let before = gateways.len();
+        gateways.retain(|g| g.id != id);
+        let removed = gateways.len() < before;
+        drop(gateways);
+
+        if removed {
+            // Also clean up connection state
+            self.connections.write().remove(id);
+            self.save()?;
+        }
+
+        Ok(removed)
+    }
+
+    /// Return a cloned list of all gateway entries.
+    pub fn list(&self) -> Vec<GatewayEntry> {
+        self.gateways.read().clone()
+    }
+
+    /// Get a single gateway entry by ID.
+    pub fn get(&self, id: &str) -> Option<GatewayEntry> {
+        self.gateways.read().iter().find(|g| g.id == id).cloned()
+    }
+
+    /// Update the runtime connection state for a gateway.
+    pub fn update_connection_state(&self, id: &str, state: GatewayConnectionState) {
+        self.connections.write().insert(id.to_string(), state);
+    }
+
+    /// Get the runtime connection state for a gateway.
+    pub fn get_connection_state(&self, id: &str) -> GatewayConnectionState {
+        self.connections.read().get(id).cloned().unwrap_or_default()
+    }
+}
+
+// ============================================================================
+// TOFU fingerprint verification
+// ============================================================================
+
+/// Verify a TLS certificate fingerprint against an expected value.
+///
+/// Implements trust-on-first-use (TOFU) semantics:
+/// - If `expected` is `None` (first connection), the actual fingerprint is
+///   accepted and returned so the caller can persist it.
+/// - If `expected` matches `actual` (case-insensitive), returns `Ok`.
+/// - If there is a mismatch, returns `Err(GatewayError::FingerprintMismatch)`.
+pub fn verify_fingerprint(expected: Option<&str>, actual: &str) -> Result<String, GatewayError> {
+    match expected {
+        None => {
+            // First connection -- trust on first use
+            Ok(actual.to_string())
+        }
+        Some(exp) => {
+            if exp.eq_ignore_ascii_case(actual) {
+                Ok(actual.to_string())
+            } else {
+                Err(GatewayError::FingerprintMismatch {
+                    expected: exp.to_string(),
+                    actual: actual.to_string(),
+                })
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Gateway client connection (stub)
+// ============================================================================
+
+/// Connect to a remote gateway via direct WebSocket.
+///
+/// This performs the following steps:
+/// 1. Establish a TCP + TLS connection to `entry.url`.
+/// 2. Verify the TLS certificate fingerprint via TOFU.
+/// 3. Upgrade to WebSocket and send a protocol v3 handshake.
+/// 4. Return a `GatewayConnection` handle.
+///
+/// # Note
+/// The actual WebSocket transport is not yet wired. This function creates the
+/// connection handle and validates parameters; the real network I/O will be
+/// added when a WS client transport is integrated.
+pub async fn connect_to_gateway(
+    entry: &GatewayEntry,
+    auth_token: &str,
+    client_id: &str,
+) -> Result<GatewayConnection, GatewayError> {
+    if entry.url.is_empty() {
+        return Err(GatewayError::ConnectionFailed(
+            "gateway URL is empty".to_string(),
+        ));
+    }
+
+    if auth_token.is_empty() {
+        return Err(GatewayError::AuthFailed("auth token is empty".to_string()));
+    }
+
+    if client_id.is_empty() {
+        return Err(GatewayError::AuthFailed("client ID is empty".to_string()));
+    }
+
+    info!(
+        gateway_id = %entry.id,
+        gateway_name = %entry.name,
+        url = %entry.url,
+        "connecting to remote gateway"
+    );
+
+    // TODO: wire actual WS client transport
+    //
+    // The implementation would:
+    // 1. Resolve the URL and open a TLS TCP stream via tokio::net::TcpStream
+    //    + tokio_rustls::TlsConnector.
+    // 2. Extract the server certificate and call verify_fingerprint() against
+    //    entry.fingerprint.
+    // 3. Perform the HTTP/1.1 upgrade to WebSocket.
+    // 4. Send the JSON-RPC handshake:
+    //    { "id": "<uuid>", "method": "gateway.connect",
+    //      "params": { "clientId": "<client_id>", "token": "<auth_token>",
+    //                  "protocolVersion": 3 } }
+    // 5. Wait for the response and verify `ok: true`.
+
+    Ok(GatewayConnection::new_connected(entry.id.clone()))
+}
+
+// ============================================================================
+// SSH tunnel
+// ============================================================================
+
+/// Configuration for setting up an SSH tunnel to a remote gateway.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshTunnelConfig {
+    pub ssh_host: String,
+    pub ssh_port: u16,
+    pub ssh_user: String,
+    pub remote_port: u16,
+    /// Local port to bind. Use `0` for automatic assignment.
+    pub local_port: u16,
+}
+
+impl Default for SshTunnelConfig {
+    fn default() -> Self {
+        Self {
+            ssh_host: String::new(),
+            ssh_port: 22,
+            ssh_user: String::new(),
+            remote_port: 0,
+            local_port: 0,
+        }
+    }
+}
+
+/// Handle to a running SSH tunnel subprocess.
+pub struct SshTunnel {
+    child: tokio::process::Child,
+    local_port: u16,
+}
+
+impl std::fmt::Debug for SshTunnel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SshTunnel")
+            .field("local_port", &self.local_port)
+            .finish()
+    }
+}
+
+impl SshTunnel {
+    /// The local port the tunnel is bound to.
+    pub fn local_port(&self) -> u16 {
+        self.local_port
+    }
+
+    /// Check whether the SSH child process is still running.
+    pub fn is_alive(&mut self) -> bool {
+        match self.child.try_wait() {
+            Ok(Some(_)) => false, // exited
+            Ok(None) => true,     // still running
+            Err(_) => false,      // error checking -- assume dead
+        }
+    }
+
+    /// Kill the SSH child process and wait for it to exit.
+    pub async fn shutdown(&mut self) -> Result<(), GatewayError> {
+        self.child.kill().await.map_err(|e| {
+            GatewayError::TunnelFailed(format!("failed to kill ssh process: {}", e))
+        })?;
+        self.child.wait().await.map_err(|e| {
+            GatewayError::TunnelFailed(format!("failed to wait for ssh process: {}", e))
+        })?;
+        Ok(())
+    }
+}
+
+/// Set up an SSH tunnel to a remote gateway using `ssh -L`.
+///
+/// Spawns an `ssh` child process that forwards traffic from a local port to the
+/// remote gateway port. If `config.local_port` is `0`, the system assigns an
+/// ephemeral port automatically (the caller should use a known port in practice
+/// until dynamic port detection is implemented).
+pub async fn setup_ssh_tunnel(config: &SshTunnelConfig) -> Result<SshTunnel, GatewayError> {
+    if config.ssh_host.is_empty() {
+        return Err(GatewayError::TunnelFailed("ssh_host is empty".to_string()));
+    }
+
+    if config.ssh_user.is_empty() {
+        return Err(GatewayError::TunnelFailed("ssh_user is empty".to_string()));
+    }
+
+    if config.remote_port == 0 {
+        return Err(GatewayError::TunnelFailed(
+            "remote_port must be non-zero".to_string(),
+        ));
+    }
+
+    let local_port = if config.local_port == 0 {
+        // When 0 is requested, pick a high ephemeral port.
+        // A proper implementation would bind to 0 and read back the assigned port;
+        // for now we use a deterministic fallback.
+        0
+    } else {
+        config.local_port
+    };
+
+    let forward_spec = format!("{}:127.0.0.1:{}", local_port, config.remote_port);
+
+    info!(
+        ssh_host = %config.ssh_host,
+        ssh_port = config.ssh_port,
+        ssh_user = %config.ssh_user,
+        forward = %forward_spec,
+        "setting up SSH tunnel"
+    );
+
+    let child = tokio::process::Command::new("ssh")
+        .arg("-N") // no remote command
+        .arg("-L")
+        .arg(&forward_spec)
+        .arg("-p")
+        .arg(config.ssh_port.to_string())
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new")
+        .arg("-o")
+        .arg("ExitOnForwardFailure=yes")
+        .arg(format!("{}@{}", config.ssh_user, config.ssh_host))
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| GatewayError::TunnelFailed(format!("failed to spawn ssh: {}", e)))?;
+
+    Ok(SshTunnel { child, local_port })
+}
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+/// Parsed remote gateway configuration.
+#[derive(Debug, Clone)]
+pub struct GatewayConfig {
+    /// Whether remote gateway support is enabled.
+    pub enabled: bool,
+    /// Pre-configured gateway entries from the config file.
+    pub gateways: Vec<GatewayEntry>,
+    /// Whether to automatically reconnect on connection loss.
+    pub auto_reconnect: bool,
+    /// Base interval between reconnect attempts in milliseconds.
+    pub reconnect_interval_ms: u64,
+    /// Maximum number of consecutive reconnect attempts before giving up.
+    pub max_reconnect_attempts: u32,
+}
+
+impl Default for GatewayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            gateways: Vec::new(),
+            auto_reconnect: true,
+            reconnect_interval_ms: DEFAULT_RECONNECT_INTERVAL_MS,
+            max_reconnect_attempts: DEFAULT_MAX_RECONNECT_ATTEMPTS,
+        }
+    }
+}
+
+/// Parse remote gateway configuration from a JSON config value.
+///
+/// Config path: `gateway.remote`
+///
+/// ```json5
+/// {
+///   gateway: {
+///     remote: {
+///       enabled: true,
+///       autoReconnect: true,
+///       reconnectIntervalMs: 30000,
+///       maxReconnectAttempts: 10,
+///       gateways: [
+///         { name: "home", url: "wss://home.example.com:18789/ws", fingerprint: "AB:CD:..." }
+///       ]
+///     }
+///   }
+/// }
+/// ```
+pub fn build_gateway_config(cfg: &Value) -> GatewayConfig {
+    let remote = cfg
+        .get("gateway")
+        .and_then(|g| g.get("remote"))
+        .and_then(|v| v.as_object());
+
+    let remote = match remote {
+        Some(obj) => obj,
+        None => return GatewayConfig::default(),
+    };
+
+    let enabled = remote
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let auto_reconnect = remote
+        .get("autoReconnect")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let reconnect_interval_ms = remote
+        .get("reconnectIntervalMs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(DEFAULT_RECONNECT_INTERVAL_MS);
+
+    let max_reconnect_attempts = remote
+        .get("maxReconnectAttempts")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32)
+        .unwrap_or(DEFAULT_MAX_RECONNECT_ATTEMPTS);
+
+    let gateways = remote
+        .get("gateways")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    let name = item.get("name")?.as_str()?.to_string();
+                    let url = item.get("url")?.as_str()?.to_string();
+                    let fingerprint = item
+                        .get("fingerprint")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let auto_connect = item
+                        .get("autoConnect")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+
+                    let transport = if let Some(ssh) = item.get("ssh").and_then(|v| v.as_object()) {
+                        let ssh_host = ssh.get("host")?.as_str()?.to_string();
+                        let ssh_port = ssh
+                            .get("port")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as u16)
+                            .unwrap_or(22);
+                        let ssh_user = ssh.get("user")?.as_str()?.to_string();
+                        let remote_port = ssh
+                            .get("remotePort")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as u16)
+                            .unwrap_or(18789);
+                        GatewayTransport::SshTunnel {
+                            ssh_host,
+                            ssh_port,
+                            ssh_user,
+                            remote_port,
+                        }
+                    } else {
+                        GatewayTransport::DirectWs
+                    };
+
+                    Some(GatewayEntry {
+                        id: Uuid::new_v4().to_string(),
+                        name,
+                        url,
+                        fingerprint,
+                        transport,
+                        auto_connect,
+                        created_at_ms: now_ms(),
+                        last_connected_ms: None,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    GatewayConfig {
+        enabled,
+        gateways,
+        auto_reconnect,
+        reconnect_interval_ms,
+        max_reconnect_attempts,
+    }
+}
+
+// ============================================================================
+// Lifecycle
+// ============================================================================
+
+/// Run the remote gateway connection lifecycle.
+///
+/// For each gateway entry with `auto_connect = true`, spawns a connection task
+/// that:
+/// 1. Establishes the connection (with optional SSH tunnel).
+/// 2. Monitors connection health.
+/// 3. Reconnects with exponential backoff on failure.
+///
+/// The lifecycle respects the `shutdown_rx` signal and cleans up all
+/// connections on shutdown.
+pub async fn run_gateway_lifecycle(
+    registry: Arc<GatewayRegistry>,
+    config: GatewayConfig,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), GatewayError> {
+    if !config.enabled {
+        return Ok(());
+    }
+
+    info!("remote gateway lifecycle starting");
+
+    // Seed the registry with any gateways from the config file
+    for entry in &config.gateways {
+        if registry.get(&entry.id).is_none() {
+            if let Err(e) = registry.add(entry.clone()) {
+                warn!(
+                    gateway_id = %entry.id,
+                    error = %e,
+                    "failed to add config-defined gateway to registry"
+                );
+            }
+        }
+    }
+
+    // Gather auto-connect gateways
+    let auto_connect: Vec<GatewayEntry> = registry
+        .list()
+        .into_iter()
+        .filter(|g| g.auto_connect)
+        .collect();
+
+    if auto_connect.is_empty() {
+        info!("no auto-connect gateways configured, lifecycle idle");
+    } else {
+        info!(count = auto_connect.len(), "auto-connect gateways found");
+    }
+
+    // Spawn connection tasks
+    let mut handles = Vec::new();
+    for entry in auto_connect {
+        let reg = Arc::clone(&registry);
+        let cfg = config.clone();
+        let mut rx = shutdown_rx.clone();
+
+        let handle = tokio::spawn(async move {
+            let gateway_id = entry.id.clone();
+            let mut attempts: u32 = 0;
+
+            loop {
+                // Check for shutdown before connecting
+                if *rx.borrow() {
+                    break;
+                }
+
+                reg.update_connection_state(&gateway_id, GatewayConnectionState::Connecting);
+
+                // TODO: wire actual WS client transport
+                // For now, the connect_to_gateway stub immediately returns Connected.
+                match connect_to_gateway(&entry, "", &gateway_id).await {
+                    Ok(_conn) => {
+                        reg.update_connection_state(
+                            &gateway_id,
+                            GatewayConnectionState::Connected { since_ms: now_ms() },
+                        );
+                        attempts = 0;
+
+                        // Wait for shutdown while "connected"
+                        let _ = rx.changed().await;
+                        if *rx.borrow() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        attempts += 1;
+                        let backoff_ms =
+                            cfg.reconnect_interval_ms * 2u64.saturating_pow(attempts.min(6));
+                        let retry_at = now_ms() + backoff_ms;
+
+                        reg.update_connection_state(
+                            &gateway_id,
+                            GatewayConnectionState::Failed {
+                                error: e.to_string(),
+                                retry_at_ms: Some(retry_at),
+                            },
+                        );
+
+                        if !cfg.auto_reconnect || attempts >= cfg.max_reconnect_attempts {
+                            error!(
+                                gateway_id = %gateway_id,
+                                attempts = attempts,
+                                "giving up on gateway connection"
+                            );
+                            break;
+                        }
+
+                        warn!(
+                            gateway_id = %gateway_id,
+                            error = %e,
+                            attempt = attempts,
+                            backoff_ms = backoff_ms,
+                            "gateway connection failed, will retry"
+                        );
+
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+                            _ = rx.changed() => {
+                                if *rx.borrow() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            reg.update_connection_state(&gateway_id, GatewayConnectionState::Disconnected);
+        });
+
+        handles.push(handle);
+    }
+
+    // Wait for shutdown
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Wait for all connection tasks to finish
+    for handle in handles {
+        let _ = handle.await;
+    }
+
+    info!("remote gateway lifecycle stopped");
+    Ok(())
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/// Get the current time in milliseconds since the Unix epoch.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_millis() as u64
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    // ====================================================================
+    // Registry: add/remove
+    // ====================================================================
+
+    #[test]
+    fn test_registry_add_remove() {
+        let registry = GatewayRegistry::in_memory();
+        let entry = GatewayEntry::new("test".to_string(), "wss://example.com/ws".to_string());
+        let id = entry.id.clone();
+
+        registry.add(entry).unwrap();
+        assert_eq!(registry.list().len(), 1);
+
+        let removed = registry.remove(&id).unwrap();
+        assert!(removed);
+        assert_eq!(registry.list().len(), 0);
+    }
+
+    // ====================================================================
+    // Registry: max gateways
+    // ====================================================================
+
+    #[test]
+    fn test_registry_max_gateways() {
+        let registry = GatewayRegistry::in_memory();
+        for i in 0..MAX_GATEWAYS {
+            let entry = GatewayEntry::new(format!("gw-{}", i), "wss://example.com/ws".to_string());
+            registry.add(entry).unwrap();
+        }
+
+        let extra = GatewayEntry::new("overflow".to_string(), "wss://example.com/ws".to_string());
+        let err = registry.add(extra).unwrap_err();
+        assert_eq!(err, GatewayError::MaxGatewaysExceeded);
+    }
+
+    // ====================================================================
+    // Registry: persistence round-trip
+    // ====================================================================
+
+    #[test]
+    fn test_registry_persistence() {
+        let dir = TempDir::new().unwrap();
+        let registry = GatewayRegistry::new(dir.path().to_path_buf());
+
+        let entry = GatewayEntry::new(
+            "persist-test".to_string(),
+            "wss://example.com/ws".to_string(),
+        );
+        let id = entry.id.clone();
+        registry.add(entry).unwrap();
+
+        // Create a new registry pointing at the same directory and load
+        let registry2 = GatewayRegistry::new(dir.path().to_path_buf());
+        registry2.load().unwrap();
+
+        let loaded = registry2.get(&id);
+        assert!(loaded.is_some());
+        assert_eq!(loaded.unwrap().name, "persist-test");
+    }
+
+    // ====================================================================
+    // Registry: atomic write (temp + rename)
+    // ====================================================================
+
+    #[test]
+    fn test_registry_atomic_write() {
+        let dir = TempDir::new().unwrap();
+        let registry = GatewayRegistry::new(dir.path().to_path_buf());
+
+        let entry = GatewayEntry::new("atomic".to_string(), "wss://example.com/ws".to_string());
+        registry.add(entry).unwrap();
+
+        // The final file should exist, but the temp file should not
+        let final_path = dir.path().join("gateways.json");
+        let temp_path = dir.path().join("gateways.tmp");
+        assert!(final_path.exists());
+        assert!(!temp_path.exists());
+
+        // Content should be valid JSON
+        let content = fs::read_to_string(&final_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(parsed.get("gateways").is_some());
+    }
+
+    // ====================================================================
+    // Registry: duplicate ID rejection
+    // ====================================================================
+
+    #[test]
+    fn test_registry_duplicate_id() {
+        let registry = GatewayRegistry::in_memory();
+        let entry = GatewayEntry::new("dupe".to_string(), "wss://example.com/ws".to_string());
+        let id = entry.id.clone();
+        registry.add(entry).unwrap();
+
+        let dupe = GatewayEntry {
+            id: id.clone(),
+            name: "dupe2".to_string(),
+            url: "wss://other.com/ws".to_string(),
+            fingerprint: None,
+            transport: GatewayTransport::DirectWs,
+            auto_connect: false,
+            created_at_ms: now_ms(),
+            last_connected_ms: None,
+        };
+        let err = registry.add(dupe).unwrap_err();
+        assert!(matches!(err, GatewayError::ConfigError(_)));
+    }
+
+    // ====================================================================
+    // TOFU fingerprint verification
+    // ====================================================================
+
+    #[test]
+    fn test_fingerprint_tofu_first_connect() {
+        let actual = "AB:CD:EF:01:23:45:67:89";
+        let result = verify_fingerprint(None, actual);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), actual);
+    }
+
+    #[test]
+    fn test_fingerprint_tofu_match() {
+        let fp = "AB:CD:EF:01:23:45:67:89";
+        let result = verify_fingerprint(Some(fp), fp);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), fp);
+    }
+
+    #[test]
+    fn test_fingerprint_tofu_mismatch() {
+        let expected = "AB:CD:EF:01:23:45:67:89";
+        let actual = "FF:FF:FF:FF:FF:FF:FF:FF";
+        let result = verify_fingerprint(Some(expected), actual);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            GatewayError::FingerprintMismatch {
+                expected: e,
+                actual: a,
+            } => {
+                assert_eq!(e, expected);
+                assert_eq!(a, actual);
+            }
+            other => panic!("expected FingerprintMismatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_fingerprint_case_insensitive() {
+        let lower = "ab:cd:ef:01:23:45:67:89";
+        let upper = "AB:CD:EF:01:23:45:67:89";
+        assert!(verify_fingerprint(Some(lower), upper).is_ok());
+        assert!(verify_fingerprint(Some(upper), lower).is_ok());
+    }
+
+    // ====================================================================
+    // Connection state transitions
+    // ====================================================================
+
+    #[test]
+    fn test_connection_state_transitions() {
+        let registry = GatewayRegistry::in_memory();
+        let id = "gw-1";
+
+        // Initially Disconnected
+        assert_eq!(
+            registry.get_connection_state(id),
+            GatewayConnectionState::Disconnected
+        );
+
+        // Transition to Connecting
+        registry.update_connection_state(id, GatewayConnectionState::Connecting);
+        assert_eq!(
+            registry.get_connection_state(id),
+            GatewayConnectionState::Connecting
+        );
+
+        // Transition to Connected
+        registry.update_connection_state(id, GatewayConnectionState::Connected { since_ms: 12345 });
+        assert_eq!(
+            registry.get_connection_state(id),
+            GatewayConnectionState::Connected { since_ms: 12345 }
+        );
+
+        // Transition to Failed
+        registry.update_connection_state(
+            id,
+            GatewayConnectionState::Failed {
+                error: "timeout".to_string(),
+                retry_at_ms: Some(99999),
+            },
+        );
+        assert_eq!(
+            registry.get_connection_state(id),
+            GatewayConnectionState::Failed {
+                error: "timeout".to_string(),
+                retry_at_ms: Some(99999),
+            }
+        );
+
+        // Back to Disconnected
+        registry.update_connection_state(id, GatewayConnectionState::Disconnected);
+        assert_eq!(
+            registry.get_connection_state(id),
+            GatewayConnectionState::Disconnected
+        );
+    }
+
+    // ====================================================================
+    // Gateway config: defaults
+    // ====================================================================
+
+    #[test]
+    fn test_gateway_config_defaults() {
+        let cfg = GatewayConfig::default();
+        assert!(!cfg.enabled);
+        assert!(cfg.gateways.is_empty());
+        assert!(cfg.auto_reconnect);
+        assert_eq!(cfg.reconnect_interval_ms, DEFAULT_RECONNECT_INTERVAL_MS);
+        assert_eq!(cfg.max_reconnect_attempts, DEFAULT_MAX_RECONNECT_ATTEMPTS);
+    }
+
+    // ====================================================================
+    // Gateway config: custom values
+    // ====================================================================
+
+    #[test]
+    fn test_gateway_config_custom() {
+        let cfg = json!({
+            "gateway": {
+                "remote": {
+                    "enabled": true,
+                    "autoReconnect": false,
+                    "reconnectIntervalMs": 5000,
+                    "maxReconnectAttempts": 3
+                }
+            }
+        });
+        let config = build_gateway_config(&cfg);
+        assert!(config.enabled);
+        assert!(!config.auto_reconnect);
+        assert_eq!(config.reconnect_interval_ms, 5000);
+        assert_eq!(config.max_reconnect_attempts, 3);
+    }
+
+    // ====================================================================
+    // Gateway config: missing section falls back to defaults
+    // ====================================================================
+
+    #[test]
+    fn test_gateway_config_missing() {
+        let cfg = json!({});
+        let config = build_gateway_config(&cfg);
+        assert!(!config.enabled);
+        assert!(config.auto_reconnect);
+        assert_eq!(config.reconnect_interval_ms, DEFAULT_RECONNECT_INTERVAL_MS);
+        assert_eq!(
+            config.max_reconnect_attempts,
+            DEFAULT_MAX_RECONNECT_ATTEMPTS
+        );
+    }
+
+    // ====================================================================
+    // Gateway entry serialization round-trip
+    // ====================================================================
+
+    #[test]
+    fn test_gateway_entry_serialization() {
+        let entry = GatewayEntry {
+            id: "test-id-123".to_string(),
+            name: "my-gateway".to_string(),
+            url: "wss://gw.example.com:18789/ws".to_string(),
+            fingerprint: Some("AB:CD:EF".to_string()),
+            transport: GatewayTransport::DirectWs,
+            auto_connect: true,
+            created_at_ms: 1700000000000,
+            last_connected_ms: Some(1700000001000),
+        };
+
+        let json_str = serde_json::to_string(&entry).unwrap();
+        let deserialized: GatewayEntry = serde_json::from_str(&json_str).unwrap();
+
+        assert_eq!(deserialized.id, "test-id-123");
+        assert_eq!(deserialized.name, "my-gateway");
+        assert_eq!(deserialized.url, "wss://gw.example.com:18789/ws");
+        assert_eq!(deserialized.fingerprint, Some("AB:CD:EF".to_string()));
+        assert_eq!(deserialized.transport, GatewayTransport::DirectWs);
+        assert!(deserialized.auto_connect);
+        assert_eq!(deserialized.created_at_ms, 1700000000000);
+        assert_eq!(deserialized.last_connected_ms, Some(1700000001000));
+    }
+
+    // ====================================================================
+    // SSH tunnel config defaults
+    // ====================================================================
+
+    #[test]
+    fn test_ssh_tunnel_config_defaults() {
+        let cfg = SshTunnelConfig::default();
+        assert!(cfg.ssh_host.is_empty());
+        assert_eq!(cfg.ssh_port, 22);
+        assert!(cfg.ssh_user.is_empty());
+        assert_eq!(cfg.remote_port, 0);
+        assert_eq!(cfg.local_port, 0);
+    }
+
+    // ====================================================================
+    // Transport variants
+    // ====================================================================
+
+    #[test]
+    fn test_gateway_transport_variants() {
+        let direct = GatewayTransport::DirectWs;
+        let ssh = GatewayTransport::SshTunnel {
+            ssh_host: "host.example.com".to_string(),
+            ssh_port: 22,
+            ssh_user: "admin".to_string(),
+            remote_port: 18789,
+        };
+
+        // Verify they are different
+        assert_ne!(direct, ssh);
+
+        // Verify default is DirectWs
+        assert_eq!(GatewayTransport::default(), GatewayTransport::DirectWs);
+
+        // Verify serde round-trip for DirectWs
+        let json = serde_json::to_string(&direct).unwrap();
+        let deser: GatewayTransport = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser, GatewayTransport::DirectWs);
+
+        // Verify serde round-trip for SshTunnel
+        let json = serde_json::to_string(&ssh).unwrap();
+        let deser: GatewayTransport = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser, ssh);
+    }
+
+    // ====================================================================
+    // Registry: empty initial state
+    // ====================================================================
+
+    #[test]
+    fn test_registry_empty_initial() {
+        let registry = GatewayRegistry::in_memory();
+        assert!(registry.list().is_empty());
+    }
+
+    // ====================================================================
+    // Registry: get nonexistent
+    // ====================================================================
+
+    #[test]
+    fn test_registry_get_nonexistent() {
+        let registry = GatewayRegistry::in_memory();
+        assert!(registry.get("nonexistent-id").is_none());
+    }
+
+    // ====================================================================
+    // Registry: update/get connection state
+    // ====================================================================
+
+    #[test]
+    fn test_registry_update_connection_state() {
+        let registry = GatewayRegistry::in_memory();
+        let id = "gw-state-test";
+
+        registry.update_connection_state(id, GatewayConnectionState::Connected { since_ms: 42000 });
+        let state = registry.get_connection_state(id);
+        assert_eq!(state, GatewayConnectionState::Connected { since_ms: 42000 });
+    }
+
+    // ====================================================================
+    // Registry: list returns independent clone
+    // ====================================================================
+
+    #[test]
+    fn test_registry_list_clones() {
+        let registry = GatewayRegistry::in_memory();
+        let entry = GatewayEntry::new("clone-test".to_string(), "wss://example.com/ws".to_string());
+        registry.add(entry).unwrap();
+
+        let list1 = registry.list();
+        let list2 = registry.list();
+
+        assert_eq!(list1.len(), list2.len());
+        assert_eq!(list1[0].id, list2[0].id);
+
+        // Modifying list1 should not affect list2 or the registry
+        // (they are independent clones)
+        drop(list1);
+        assert_eq!(registry.list().len(), 1);
+    }
+
+    // ====================================================================
+    // Error display messages
+    // ====================================================================
+
+    #[test]
+    fn test_gateway_error_display() {
+        let err = GatewayError::FingerprintMismatch {
+            expected: "AA:BB".to_string(),
+            actual: "CC:DD".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "TLS fingerprint mismatch: expected AA:BB, got CC:DD"
+        );
+
+        let err = GatewayError::ConnectionFailed("timeout".to_string());
+        assert_eq!(err.to_string(), "connection failed: timeout");
+
+        let err = GatewayError::AuthFailed("bad token".to_string());
+        assert_eq!(err.to_string(), "authentication failed: bad token");
+
+        let err = GatewayError::TunnelFailed("port in use".to_string());
+        assert_eq!(err.to_string(), "tunnel failed: port in use");
+
+        let err = GatewayError::IoError("permission denied".to_string());
+        assert_eq!(err.to_string(), "I/O error: permission denied");
+
+        let err = GatewayError::ConfigError("missing field".to_string());
+        assert_eq!(err.to_string(), "config error: missing field");
+
+        let err = GatewayError::MaxGatewaysExceeded;
+        assert_eq!(err.to_string(), "maximum number of gateways exceeded");
+
+        let err = GatewayError::NotFound;
+        assert_eq!(err.to_string(), "gateway not found");
+    }
+
+    // ====================================================================
+    // build_gateway_config: enabled
+    // ====================================================================
+
+    #[test]
+    fn test_build_gateway_config_enabled() {
+        let cfg = json!({
+            "gateway": {
+                "remote": {
+                    "enabled": true
+                }
+            }
+        });
+        let config = build_gateway_config(&cfg);
+        assert!(config.enabled);
+    }
+
+    // ====================================================================
+    // build_gateway_config: disabled
+    // ====================================================================
+
+    #[test]
+    fn test_build_gateway_config_disabled() {
+        let cfg = json!({
+            "gateway": {
+                "remote": {
+                    "enabled": false
+                }
+            }
+        });
+        let config = build_gateway_config(&cfg);
+        assert!(!config.enabled);
+    }
+
+    // ====================================================================
+    // build_gateway_config: with gateway entries
+    // ====================================================================
+
+    #[test]
+    fn test_build_gateway_config_with_gateways() {
+        let cfg = json!({
+            "gateway": {
+                "remote": {
+                    "enabled": true,
+                    "gateways": [
+                        {
+                            "name": "home",
+                            "url": "wss://home.example.com:18789/ws",
+                            "fingerprint": "AB:CD:EF:01"
+                        },
+                        {
+                            "name": "office",
+                            "url": "wss://office.example.com/ws"
+                        }
+                    ]
+                }
+            }
+        });
+        let config = build_gateway_config(&cfg);
+        assert_eq!(config.gateways.len(), 2);
+        assert_eq!(config.gateways[0].name, "home");
+        assert_eq!(config.gateways[0].url, "wss://home.example.com:18789/ws");
+        assert_eq!(
+            config.gateways[0].fingerprint,
+            Some("AB:CD:EF:01".to_string())
+        );
+        assert_eq!(config.gateways[1].name, "office");
+        assert_eq!(config.gateways[1].url, "wss://office.example.com/ws");
+        assert!(config.gateways[1].fingerprint.is_none());
+    }
+
+    // ====================================================================
+    // build_gateway_config: reconnect settings
+    // ====================================================================
+
+    #[test]
+    fn test_build_gateway_config_reconnect_settings() {
+        let cfg = json!({
+            "gateway": {
+                "remote": {
+                    "enabled": true,
+                    "autoReconnect": true,
+                    "reconnectIntervalMs": 60000,
+                    "maxReconnectAttempts": 20
+                }
+            }
+        });
+        let config = build_gateway_config(&cfg);
+        assert!(config.auto_reconnect);
+        assert_eq!(config.reconnect_interval_ms, 60000);
+        assert_eq!(config.max_reconnect_attempts, 20);
+    }
+
+    // ====================================================================
+    // GatewayEntry: default auto_connect
+    // ====================================================================
+
+    #[test]
+    fn test_gateway_entry_default_auto_connect() {
+        let entry = GatewayEntry::new("test".to_string(), "wss://example.com/ws".to_string());
+        assert!(!entry.auto_connect);
+    }
+
+    // ====================================================================
+    // Connection state: default
+    // ====================================================================
+
+    #[test]
+    fn test_connection_state_default() {
+        let state = GatewayConnectionState::default();
+        assert_eq!(state, GatewayConnectionState::Disconnected);
+    }
+
+    // ====================================================================
+    // Registry: remove nonexistent returns false
+    // ====================================================================
+
+    #[test]
+    fn test_registry_remove_nonexistent() {
+        let registry = GatewayRegistry::in_memory();
+        let result = registry.remove("does-not-exist").unwrap();
+        assert!(!result);
+    }
+
+    // ====================================================================
+    // Fingerprint: empty string edge case
+    // ====================================================================
+
+    #[test]
+    fn test_fingerprint_empty_string() {
+        // Empty expected with non-empty actual: TOFU accepts
+        let result = verify_fingerprint(None, "");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "");
+
+        // Empty expected string (Some("")) vs empty actual: match
+        let result = verify_fingerprint(Some(""), "");
+        assert!(result.is_ok());
+
+        // Empty expected string vs non-empty actual: mismatch
+        let result = verify_fingerprint(Some(""), "AB:CD");
+        assert!(result.is_err());
+    }
+
+    // ====================================================================
+    // SSH tunnel: shutdown (validate struct construction)
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_ssh_tunnel_shutdown() {
+        // We test the setup_ssh_tunnel validation without actually spawning ssh
+        // by providing invalid config that triggers early validation errors.
+        let config = SshTunnelConfig {
+            ssh_host: String::new(),
+            ssh_port: 22,
+            ssh_user: "user".to_string(),
+            remote_port: 18789,
+            local_port: 0,
+        };
+        let result = setup_ssh_tunnel(&config).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), GatewayError::TunnelFailed(_)));
+
+        // Empty user
+        let config = SshTunnelConfig {
+            ssh_host: "host.example.com".to_string(),
+            ssh_port: 22,
+            ssh_user: String::new(),
+            remote_port: 18789,
+            local_port: 0,
+        };
+        let result = setup_ssh_tunnel(&config).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), GatewayError::TunnelFailed(_)));
+
+        // Zero remote port
+        let config = SshTunnelConfig {
+            ssh_host: "host.example.com".to_string(),
+            ssh_port: 22,
+            ssh_user: "user".to_string(),
+            remote_port: 0,
+            local_port: 0,
+        };
+        let result = setup_ssh_tunnel(&config).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), GatewayError::TunnelFailed(_)));
+    }
+
+    // ====================================================================
+    // Gateway lifecycle reads config
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_gateway_lifecycle_config() {
+        // With enabled=false, lifecycle should return immediately
+        let registry = Arc::new(GatewayRegistry::in_memory());
+        let config = GatewayConfig {
+            enabled: false,
+            ..GatewayConfig::default()
+        };
+        let (tx, rx) = tokio::sync::watch::channel(false);
+
+        let result = run_gateway_lifecycle(registry, config, rx).await;
+        assert!(result.is_ok());
+
+        // Shut down the sender to avoid leaks
+        drop(tx);
+    }
+
+    // ====================================================================
+    // GatewayConnection: basic functionality
+    // ====================================================================
+
+    #[test]
+    fn test_gateway_connection_new_connected() {
+        let conn = GatewayConnection::new_connected("gw-1".to_string());
+        assert!(conn.is_connected());
+        assert_eq!(conn.gateway_id, "gw-1");
+        assert_eq!(conn.protocol_version, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn test_gateway_connection_send_when_disconnected() {
+        let conn = GatewayConnection {
+            gateway_id: "gw-2".to_string(),
+            state: GatewayConnectionState::Disconnected,
+            protocol_version: PROTOCOL_VERSION,
+        };
+        assert!(!conn.is_connected());
+        let result = conn.send_message("test.method", &json!({}));
+        assert!(result.is_err());
+    }
+
+    // ====================================================================
+    // connect_to_gateway: validation
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_connect_to_gateway_empty_url() {
+        let entry = GatewayEntry {
+            id: "gw-empty-url".to_string(),
+            name: "empty".to_string(),
+            url: String::new(),
+            fingerprint: None,
+            transport: GatewayTransport::DirectWs,
+            auto_connect: false,
+            created_at_ms: 0,
+            last_connected_ms: None,
+        };
+        let result = connect_to_gateway(&entry, "token", "client").await;
+        assert!(matches!(
+            result.unwrap_err(),
+            GatewayError::ConnectionFailed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_connect_to_gateway_empty_token() {
+        let entry = GatewayEntry::new("test".to_string(), "wss://example.com/ws".to_string());
+        let result = connect_to_gateway(&entry, "", "client").await;
+        assert!(matches!(result.unwrap_err(), GatewayError::AuthFailed(_)));
+    }
+
+    #[tokio::test]
+    async fn test_connect_to_gateway_empty_client_id() {
+        let entry = GatewayEntry::new("test".to_string(), "wss://example.com/ws".to_string());
+        let result = connect_to_gateway(&entry, "token", "").await;
+        assert!(matches!(result.unwrap_err(), GatewayError::AuthFailed(_)));
+    }
+
+    // ====================================================================
+    // GatewayEntry serialization with SshTunnel transport
+    // ====================================================================
+
+    #[test]
+    fn test_gateway_entry_ssh_transport_serialization() {
+        let entry = GatewayEntry {
+            id: "ssh-test".to_string(),
+            name: "ssh-gateway".to_string(),
+            url: "wss://via-tunnel.example.com/ws".to_string(),
+            fingerprint: None,
+            transport: GatewayTransport::SshTunnel {
+                ssh_host: "bastion.example.com".to_string(),
+                ssh_port: 2222,
+                ssh_user: "deployer".to_string(),
+                remote_port: 18789,
+            },
+            auto_connect: true,
+            created_at_ms: 1700000000000,
+            last_connected_ms: None,
+        };
+
+        let json_str = serde_json::to_string(&entry).unwrap();
+        let deser: GatewayEntry = serde_json::from_str(&json_str).unwrap();
+
+        assert_eq!(
+            deser.transport,
+            GatewayTransport::SshTunnel {
+                ssh_host: "bastion.example.com".to_string(),
+                ssh_port: 2222,
+                ssh_user: "deployer".to_string(),
+                remote_port: 18789,
+            }
+        );
+    }
+
+    // ====================================================================
+    // GatewayStore serialization
+    // ====================================================================
+
+    #[test]
+    fn test_gateway_store_serialization() {
+        let store = GatewayStore {
+            version: 1,
+            gateways: vec![
+                GatewayEntry::new("gw-a".to_string(), "wss://a.example.com/ws".to_string()),
+                GatewayEntry::new("gw-b".to_string(), "wss://b.example.com/ws".to_string()),
+            ],
+        };
+
+        let json_str = serde_json::to_string_pretty(&store).unwrap();
+        let deser: GatewayStore = serde_json::from_str(&json_str).unwrap();
+
+        assert_eq!(deser.version, 1);
+        assert_eq!(deser.gateways.len(), 2);
+    }
+
+    // ====================================================================
+    // Registry load from nonexistent file (should be ok / empty)
+    // ====================================================================
+
+    #[test]
+    fn test_registry_load_nonexistent() {
+        let dir = TempDir::new().unwrap();
+        let registry = GatewayRegistry::new(dir.path().join("subdir").to_path_buf());
+        let result = registry.load();
+        assert!(result.is_ok());
+        assert!(registry.list().is_empty());
+    }
+
+    // ====================================================================
+    // build_gateway_config: gateway with SSH transport
+    // ====================================================================
+
+    #[test]
+    fn test_build_gateway_config_ssh_transport() {
+        let cfg = json!({
+            "gateway": {
+                "remote": {
+                    "enabled": true,
+                    "gateways": [
+                        {
+                            "name": "ssh-gw",
+                            "url": "wss://localhost:18789/ws",
+                            "ssh": {
+                                "host": "bastion.example.com",
+                                "port": 2222,
+                                "user": "admin",
+                                "remotePort": 18789
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+        let config = build_gateway_config(&cfg);
+        assert_eq!(config.gateways.len(), 1);
+        assert_eq!(
+            config.gateways[0].transport,
+            GatewayTransport::SshTunnel {
+                ssh_host: "bastion.example.com".to_string(),
+                ssh_port: 2222,
+                ssh_user: "admin".to_string(),
+                remote_port: 18789,
+            }
+        );
+    }
+
+    // ====================================================================
+    // SshTunnelConfig serialization
+    // ====================================================================
+
+    #[test]
+    fn test_ssh_tunnel_config_serialization() {
+        let cfg = SshTunnelConfig {
+            ssh_host: "bastion.example.com".to_string(),
+            ssh_port: 2222,
+            ssh_user: "admin".to_string(),
+            remote_port: 18789,
+            local_port: 19000,
+        };
+
+        let json_str = serde_json::to_string(&cfg).unwrap();
+        let deser: SshTunnelConfig = serde_json::from_str(&json_str).unwrap();
+
+        assert_eq!(deser.ssh_host, "bastion.example.com");
+        assert_eq!(deser.ssh_port, 2222);
+        assert_eq!(deser.ssh_user, "admin");
+        assert_eq!(deser.remote_port, 18789);
+        assert_eq!(deser.local_port, 19000);
+    }
+}

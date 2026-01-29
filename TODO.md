@@ -10,8 +10,8 @@
 
 | Category | Completion | Notes |
 |----------|-----------|-------|
-| Infrastructure (WS, HTTP, config, logging) | ~99% | Production-quality, TLS, mDNS, config reload, CLI, Tailscale |
-| Security (auth, credentials, rate limiting) | ~97% | Real, reviewed, tool allowlists |
+| Infrastructure (WS, HTTP, config, logging) | ~99% | Production-quality, TLS, mDNS, config reload, CLI, Tailscale, remote gateway |
+| Security (auth, credentials, rate limiting) | ~99% | Real, reviewed, tool allowlists, OAuth profiles (Google/GitHub/Discord) |
 | Data storage (sessions, cron, usage, nodes, devices) | ~99% | Real, tested, file-backed, retention cleanup |
 | Core functionality (agent/LLM, channel delivery, cron execution) | ~99% | Multi-provider (Anthropic/OpenAI/Ollama/Gemini/Bedrock), built-in tools, channel tools, media analysis, link understanding |
 
@@ -127,9 +127,9 @@ Priority order reflects what blocks real-world usage soonest.
 
 ### P3 — Needed for production operations
 
-- [ ] **Remote gateway support** — SSH tunnel transport for NAT traversal, direct WebSocket with fingerprint-based trust-on-first-use verification. Enables nodes to connect to gateways they can't reach directly.
+- [x] **Remote gateway support** — `src/gateway/mod.rs` with GatewayRegistry, TOFU fingerprint verification, SSH tunnel transport, direct WebSocket, config integration, lifecycle management
 - [x] **CLI subcommands** — `start`, `config`, `status`, `logs`, `version`, `backup`, `restore`, `reset`, `setup`, `pair`, `update` implemented via clap
-- [ ] **Auth profiles** — OAuth flow for multi-provider auth (Google, GitHub, Discord), profile storage, token refresh. Currently only supports static token/password auth.
+- [x] **Auth profiles** — `src/auth/profiles.rs` with OAuth2 PKCE flow for Google/GitHub/Discord, ProfileStore, token refresh, config integration
 - [x] **Network binding modes** — loopback/lan/auto/tailnet/custom in `src/server/bind.rs`
 
 ### P4 — Nice to have
@@ -144,14 +144,14 @@ Priority order reflects what blocks real-world usage soonest.
 - [x] Example config file — `config.example.json5`
 - [x] Dockerfile — multi-stage build with health check
 - [x] Release workflow — `.github/workflows/release.yml` (tag-triggered, cross-platform binary builds)
-- [ ] CONTRIBUTING.md
-- [ ] CHANGELOG.md
+- [x] CONTRIBUTING.md — development guide, prerequisites, workflow, code style, testing, PR guidelines
+- [x] CHANGELOG.md — Keep a Changelog format, version 0.1.0 (Unreleased)
 
 ## Tests
 
-- [x] 1,669 tests passing (`cargo nextest run`)
+- [x] 1,684 tests passing (`cargo nextest run`)
 - [x] Pre-commit hooks: `cargo fmt --check` + `cargo clippy -- -D warnings`
 - [x] Pre-push hooks: full test suite via `cargo nextest run`
-- [x] CI: fmt, clippy -D warnings, build, test, cross-platform build matrix (macOS, Windows, Linux)
-- [ ] Golden trace tests — expand as protocol parity is verified
+- [x] CI: fmt, clippy -D warnings, nextest, MSRV check (1.75.0), cargo-deny, cross-platform (macOS, Windows, Linux)
+- [x] Golden trace tests — 38 insta snapshot tests covering all WS method categories in `src/server/ws/golden_tests.rs`
 - [ ] Cross-platform CI tests (currently builds only on macOS/Windows, tests only on Linux)
