@@ -3,6 +3,12 @@
 //! Manages device pairing state machine (request -> pending -> approved/rejected),
 //! token verification, and device authentication.
 
+#[cfg(feature = "macos-integration")]
+pub mod macos;
+
+#[cfg(feature = "macos-integration")]
+pub use macos::*;
+
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
