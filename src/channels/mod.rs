@@ -3,8 +3,10 @@
 //! Provides channel registry for tracking active messaging channels
 //! and their connection states.
 
+pub mod line;
 pub mod telegram;
 
+pub use line::*;
 pub use telegram::*;
 
 use parking_lot::RwLock;
