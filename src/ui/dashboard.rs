@@ -167,7 +167,7 @@ async fn logs_handler() -> Json<ApiResponse<Vec<String>>> {
 /// Start dashboard server
 pub async fn start_dashboard(
     config: DashboardConfig,
-    _state: DashboardState,
+    state: DashboardState,
 ) -> Result<(), DashboardError> {
     if !config.enabled {
         return Err(DashboardError::NotConfigured);
@@ -182,7 +182,8 @@ pub async fn start_dashboard(
         .route("/api/status", get(status_handler))
         .route("/api/channels", get(channels_handler))
         .route("/api/metrics", get(metrics_handler))
-        .route("/api/logs", get(logs_handler));
+        .route("/api/logs", get(logs_handler))
+        .with_state(state);
 
     tracing::info!(address = %addr, "Starting dashboard server");
 
