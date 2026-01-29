@@ -1259,10 +1259,14 @@ impl SessionStore {
 
         {
             let file = File::create(&temp_path)?;
-            let writer = BufWriter::new(file);
-            serde_json::to_writer_pretty(writer, &archived)?;
+            let mut writer = BufWriter::new(file);
+            serde_json::to_writer_pretty(&mut writer, &archived)?;
+            writer.flush()?;
+            writer
+                .into_inner()
+                .map_err(|e| std::io::Error::other(e.to_string()))?
+                .sync_all()?;
         }
-        File::open(&temp_path)?.sync_all()?;
 
         // Atomic rename
         fs::rename(&temp_path, &archive_path)?;
@@ -1551,13 +1555,17 @@ impl SessionStore {
         let meta_path = self.session_meta_path(&session.id)?;
         let temp_path = meta_path.with_extension("json.tmp");
 
-        // Write to temp file first
+        // Write to temp file first, then sync
         {
             let file = File::create(&temp_path)?;
-            let writer = BufWriter::new(file);
-            serde_json::to_writer_pretty(writer, session)?;
+            let mut writer = BufWriter::new(file);
+            serde_json::to_writer_pretty(&mut writer, session)?;
+            writer.flush()?;
+            writer
+                .into_inner()
+                .map_err(|e| std::io::Error::other(e.to_string()))?
+                .sync_all()?;
         }
-        File::open(&temp_path)?.sync_all()?;
 
         // Atomic rename
         fs::rename(&temp_path, &meta_path)?;
