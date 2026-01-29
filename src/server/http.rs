@@ -638,6 +638,7 @@ async fn hooks_agent_handler(
         .unwrap_or_default()
         .as_millis() as u64;
 
+    let cancel_token = tokio_util::sync::CancellationToken::new();
     let run = crate::server::ws::AgentRun {
         run_id: run_id.clone(),
         session_key: session.session_key.clone(),
@@ -648,6 +649,7 @@ async fn hooks_agent_handler(
         created_at: now,
         started_at: None,
         completed_at: None,
+        cancel_token: cancel_token.clone(),
         waiters: Vec::new(),
     };
 
@@ -672,6 +674,7 @@ async fn hooks_agent_handler(
             config,
             ws,
             provider,
+            cancel_token,
         );
         debug!(
             "Agent job dispatched: message='{}', channel='{}', runId='{}'",

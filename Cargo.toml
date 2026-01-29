@@ -33,6 +33,7 @@ parking_lot = "0.12"
 base64 = "0.22"
 ed25519-dalek = { version = "2", features = ["std"] }
 futures-util = "0.3"
+tokio-util = "0.7"
 async-stream = "0.3"
 async-trait = "0.1"
 bytes = "1"

@@ -25,6 +25,7 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 use super::super::*;
 
@@ -76,6 +77,8 @@ pub struct AgentRun {
     pub started_at: Option<u64>,
     /// When the run completed (Unix ms)
     pub completed_at: Option<u64>,
+    /// Token that signals cancellation to the running executor task.
+    pub cancel_token: CancellationToken,
     /// Waiters for this run to complete
     pub(crate) waiters: Vec<oneshot::Sender<AgentRunResult>>,
 }
@@ -209,9 +212,9 @@ impl AgentRunRegistry {
     }
 
     /// Mark a run as cancelled
-    // TODO: wire cancellation token into executor
     pub fn mark_cancelled(&mut self, run_id: &str) -> bool {
         if let Some(run) = self.runs.get_mut(run_id) {
+            run.cancel_token.cancel();
             run.status = AgentRunStatus::Cancelled;
             run.completed_at = Some(now_ms());
 
@@ -1412,6 +1415,7 @@ pub(super) fn handle_agent(
         })?;
 
     // Create the agent run
+    let cancel_token = CancellationToken::new();
     let run = AgentRun {
         run_id: idempotency_key.to_string(),
         session_key: session.session_key.clone(),
@@ -1422,6 +1426,7 @@ pub(super) fn handle_agent(
         created_at: now_ms(),
         started_at: None,
         completed_at: None,
+        cancel_token: cancel_token.clone(),
         waiters: Vec::new(),
     };
 
@@ -1458,6 +1463,7 @@ pub(super) fn handle_agent(
             config,
             state.clone(),
             provider,
+            cancel_token,
         );
         "accepted"
     } else {
@@ -1757,6 +1763,7 @@ pub(super) fn handle_chat_send(
     // If agent triggering is enabled, queue the agent run
     let (run_id, status) = if trigger_agent {
         // Create the agent run
+        let cancel_token = CancellationToken::new();
         let run = AgentRun {
             run_id: idempotency_key.to_string(),
             session_key: session.session_key.clone(),
@@ -1767,6 +1774,7 @@ pub(super) fn handle_chat_send(
             created_at: now_ms(),
             started_at: None,
             completed_at: None,
+            cancel_token: cancel_token.clone(),
             waiters: Vec::new(),
         };
 
@@ -1791,6 +1799,7 @@ pub(super) fn handle_chat_send(
                 config,
                 state.clone(),
                 provider,
+                cancel_token,
             );
             "accepted"
         } else {
@@ -1936,6 +1945,7 @@ mod tests {
             created_at: now_ms(),
             started_at: None,
             completed_at: None,
+            cancel_token: CancellationToken::new(),
             waiters: Vec::new(),
         }
     }

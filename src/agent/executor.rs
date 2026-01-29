@@ -14,6 +14,7 @@ use crate::agent::tools::{self, ToolCallResult};
 use crate::agent::{AgentConfig, AgentError};
 use crate::server::ws::{broadcast_agent_event, broadcast_chat_event, WsServerState};
 use crate::sessions::{ChatMessage, MessageRole};
+use tokio_util::sync::CancellationToken;
 
 /// Execute an agent run to completion.
 ///
@@ -25,6 +26,7 @@ pub async fn execute_run(
     config: AgentConfig,
     state: Arc<WsServerState>,
     provider: Arc<dyn LlmProvider>,
+    cancel_token: CancellationToken,
 ) -> Result<(), AgentError> {
     // Sequence counter for broadcast events
     let seq = AtomicU64::new(0);
@@ -64,7 +66,7 @@ pub async fn execute_run(
 
     for _turn in 0..config.max_turns {
         // Check cancellation
-        if is_cancelled(&state, &run_id) {
+        if cancel_token.is_cancelled() {
             broadcast_agent_event(&state, &run_id, next_seq(), "cancelled", json!({}));
             return Err(AgentError::Cancelled);
         }
@@ -101,12 +103,19 @@ pub async fn execute_run(
         let mut stop_reason = StopReason::EndTurn;
         let mut turn_usage = TokenUsage::default();
 
-        while let Some(event) = rx.recv().await {
-            // Check cancellation during streaming
-            if is_cancelled(&state, &run_id) {
-                broadcast_agent_event(&state, &run_id, next_seq(), "cancelled", json!({}));
-                return Err(AgentError::Cancelled);
-            }
+        loop {
+            let event = tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    broadcast_agent_event(&state, &run_id, next_seq(), "cancelled", json!({}));
+                    return Err(AgentError::Cancelled);
+                }
+                event = rx.recv() => {
+                    match event {
+                        Some(e) => e,
+                        None => break,
+                    }
+                }
+            };
 
             match event {
                 StreamEvent::TextDelta { text } => {
@@ -334,15 +343,6 @@ pub async fn execute_run(
     Ok(())
 }
 
-/// Check if a run has been cancelled.
-fn is_cancelled(state: &WsServerState, run_id: &str) -> bool {
-    let registry = state.agent_run_registry.lock();
-    registry
-        .get(run_id)
-        .map(|run| run.status == crate::server::ws::AgentRunStatus::Cancelled)
-        .unwrap_or(false)
-}
-
 /// Rough cost estimate per model. Returns USD.
 fn estimate_cost(model: &str, input_tokens: u64, output_tokens: u64) -> f64 {
     let (input_rate, output_rate) = if model.contains("opus") {
@@ -368,6 +368,7 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::Arc;
     use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
 
     /// Mock LLM provider that returns canned responses.
     struct MockProvider {
@@ -501,6 +502,7 @@ mod tests {
                 created_at: now,
                 started_at: None,
                 completed_at: None,
+                cancel_token: CancellationToken::new(),
                 waiters: Vec::new(),
             });
         }
@@ -526,6 +528,7 @@ mod tests {
             config,
             state.clone(),
             provider,
+            CancellationToken::new(),
         )
         .await;
         assert!(result.is_ok(), "execute_run failed: {:?}", result.err());
@@ -557,6 +560,7 @@ mod tests {
             config,
             state.clone(),
             provider,
+            CancellationToken::new(),
         )
         .await;
         // Should complete without error — the loop simply exits after max_turns
@@ -612,6 +616,7 @@ mod tests {
             config,
             state.clone(),
             provider,
+            CancellationToken::new(),
         )
         .await;
         assert!(result.is_ok(), "execute_run failed: {:?}", result.err());
@@ -648,6 +653,7 @@ mod tests {
             config,
             state.clone(),
             provider,
+            CancellationToken::new(),
         )
         .await;
         assert!(result.is_ok(), "execute_run failed: {:?}", result.err());
