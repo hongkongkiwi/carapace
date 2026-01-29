@@ -673,40 +673,51 @@ impl CronScheduler {
 
 ## Implementation Order
 
-### Phase A: Agent Executor (Blocker 1)
+### Phase A: Agent Executor (Blocker 1) — COMPLETE
 
-| Step | Task | Files | Depends On |
-|------|------|-------|------------|
-| A1 | LLM types (`StreamEvent`, `CompletionRequest`, `LlmMessage`) | `src/agent/provider.rs` | — |
-| A2 | `LlmProvider` trait | `src/agent/provider.rs` | A1 |
-| A3 | Anthropic SSE streaming client | `src/agent/provider.rs` | A2, `reqwest` |
-| A4 | Context builder (history → LLM messages) | `src/agent/context.rs` | A1 |
-| A5 | Tool dispatch with exec approval | `src/agent/tools.rs` | A2 |
-| A6 | Agent executor core loop | `src/agent/executor.rs` | A3, A4, A5 |
-| A7 | `spawn_run()` entry point | `src/agent/mod.rs` | A6 |
-| A8 | Add `LlmProvider` to `WsServerState` | `src/server/ws/mod.rs` | A7 |
-| A9 | Wire `handle_agent` → `spawn_run()` | `src/server/ws/handlers/sessions.rs` | A8 |
-| A10 | Wire `handle_chat_send` → `spawn_run()` | `src/server/ws/handlers/sessions.rs` | A8 |
+| Step | Task | Files | Depends On | Status |
+|------|------|-------|------------|--------|
+| A1 | LLM types (`StreamEvent`, `CompletionRequest`, `LlmMessage`) | `src/agent/provider.rs` | — | DONE |
+| A2 | `LlmProvider` trait | `src/agent/provider.rs` | A1 | DONE |
+| A3 | Anthropic SSE streaming client | `src/agent/anthropic.rs` | A2, `reqwest` | DONE |
+| A4 | Context builder (history → LLM messages) | `src/agent/context.rs` | A1 | DONE |
+| A5 | Tool dispatch with exec approval | `src/agent/tools.rs` | A2 | DONE |
+| A6 | Agent executor core loop | `src/agent/executor.rs` | A3, A4, A5 | DONE |
+| A7 | `spawn_run()` entry point | `src/agent/mod.rs` | A6 | DONE |
+| A8 | Add `LlmProvider` to `WsServerState` | `src/server/ws/mod.rs` | A7 | DONE |
+| A9 | Wire `handle_agent` → `spawn_run()` | `src/server/ws/handlers/sessions.rs` | A8 | DONE |
+| A10 | Wire `handle_chat_send` → `spawn_run()` | `src/server/ws/handlers/sessions.rs` | A8 | DONE |
 
-### Phase B: Channel Delivery (Blocker 2) — can start after A7
+### Phase B: Channel Delivery (Blocker 2) — COMPLETE
 
-| Step | Task | Files | Depends On |
-|------|------|-------|------------|
-| B1 | Add `Notify` to `MessagePipeline` | `src/messages/outbound.rs` | — |
-| B2 | Delivery worker loop | `src/messages/delivery.rs` | B1 |
-| B3 | Webhook channel implementation | `src/channels/webhook.rs` | — |
-| B4 | Register webhook channel from config | startup code | B3 |
-| B5 | Spawn delivery worker at startup | `src/server/ws/mod.rs` | B2, B4 |
-| B6 | Wire hooks/agent → `spawn_run()` | `src/hooks/handler.rs` | A7 |
+| Step | Task | Files | Depends On | Status |
+|------|------|-------|------------|--------|
+| B1 | Add `Notify` to `MessagePipeline` | `src/messages/outbound.rs` | — | DONE |
+| B2 | Delivery worker loop | `src/messages/delivery.rs` | B1 | DONE |
+| B3 | Webhook channel implementation | `src/channels/webhook.rs` | — | DONE |
+| B4 | Register webhook channel from config | startup code | B3 | DONE (on-demand via plugin registry) |
+| B5 | Spawn delivery worker at startup | `src/main.rs` | B2, B4 | DONE |
+| B6 | Wire hooks/agent → `spawn_run()` | `src/server/http.rs` | A7 | DONE |
 
-### Phase C: Cron Execution (Blocker 3) — can start after A7
+### Phase C: Cron Execution (Blocker 3) — COMPLETE
 
-| Step | Task | Files | Depends On |
-|------|------|-------|------------|
-| C1 | Add `get_due_job_ids()` | `src/cron/mod.rs` | — |
-| C2 | Update `run()` to return payload | `src/cron/mod.rs` | — |
-| C3 | Add `mark_run_finished()` | `src/cron/mod.rs` | — |
-| C4 | Payload executor | `src/cron/executor.rs` | A7 |
-| C5 | Background tick loop | `src/cron/tick.rs` | C1, C4 |
-| C6 | Spawn tick loop at startup | `src/server/ws/mod.rs` | C5 |
-| C7 | Update `handle_cron_run` | `src/server/ws/handlers/cron.rs` | C2, C4 |
+| Step | Task | Files | Depends On | Status |
+|------|------|-------|------------|--------|
+| C1 | Add `get_due_job_ids()` | `src/cron/mod.rs` | — | DONE |
+| C2 | Update `run()` to return payload | `src/cron/mod.rs` | — | DONE |
+| C3 | Add `mark_run_finished()` | `src/cron/mod.rs` | — | DONE |
+| C4 | Payload executor | `src/cron/executor.rs` | A7 | DONE |
+| C5 | Background tick loop | `src/cron/tick.rs` | C1, C4 | DONE |
+| C6 | Spawn tick loop at startup | `src/main.rs` | C5 | DONE |
+| C7 | Update `handle_cron_run` | `src/server/ws/handlers/cron.rs` | C2, C4 | DONE |
+
+### Server Startup Harness — DONE
+
+| Task | Files | Status |
+|------|-------|--------|
+| `main.rs` with tokio runtime, config loading, HTTP+WS bind | `src/main.rs` | DONE |
+| `build_http_config()` from JSON config | `src/server/http.rs` | DONE |
+| `WsServerState` accessors for `message_pipeline`, `channel_registry` | `src/server/ws/mod.rs` | DONE |
+| `resolve_state_dir` made `pub(crate)` | `src/server/ws/mod.rs` | DONE |
+| State directory creation (`~/.moltbot`, `~/.moltbot/sessions`) | `src/main.rs` | DONE |
+| Graceful shutdown via `watch::channel` + `ctrl_c` signal | `src/main.rs` | DONE |

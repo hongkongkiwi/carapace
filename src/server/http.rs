@@ -43,6 +43,7 @@ use crate::hooks::handler::{
 };
 use crate::hooks::registry::{HookMappingContext, HookMappingResult, HookRegistry};
 use crate::plugins::tools::{ToolInvokeContext, ToolInvokeResult, ToolsRegistry};
+use crate::server::ws::WsServerState;
 
 /// Default max body size for hooks (256KB)
 pub const DEFAULT_MAX_BODY_BYTES: usize = 262144;
@@ -106,6 +107,94 @@ impl Default for HttpConfig {
     }
 }
 
+/// Build an `HttpConfig` from the loaded JSON configuration.
+///
+/// Maps gateway.* keys from config and checks environment variables
+/// (MOLTBOT_GATEWAY_TOKEN, MOLTBOT_GATEWAY_PASSWORD) with env taking precedence.
+pub fn build_http_config(cfg: &Value) -> HttpConfig {
+    let gateway = cfg.get("gateway").and_then(|v| v.as_object());
+
+    let hooks_obj = gateway
+        .and_then(|g| g.get("hooks"))
+        .and_then(|v| v.as_object());
+    let auth_obj = gateway
+        .and_then(|g| g.get("auth"))
+        .and_then(|v| v.as_object());
+    let control_ui_obj = gateway
+        .and_then(|g| g.get("controlUi"))
+        .and_then(|v| v.as_object());
+    let openai_obj = gateway
+        .and_then(|g| g.get("openai"))
+        .and_then(|v| v.as_object());
+    let control_obj = gateway
+        .and_then(|g| g.get("control"))
+        .and_then(|v| v.as_object());
+
+    let hooks_enabled = hooks_obj
+        .and_then(|h| h.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let hooks_token = hooks_obj
+        .and_then(|h| h.get("token"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    // Auth: env vars take precedence over config
+    let cfg_token = auth_obj
+        .and_then(|a| a.get("token"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let cfg_password = auth_obj
+        .and_then(|a| a.get("password"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let gateway_token = std::env::var("MOLTBOT_GATEWAY_TOKEN").ok().or(cfg_token);
+    let gateway_password = std::env::var("MOLTBOT_GATEWAY_PASSWORD")
+        .ok()
+        .or(cfg_password);
+
+    let control_ui_enabled = control_ui_obj
+        .and_then(|c| c.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let control_ui_dist_path = control_ui_obj
+        .and_then(|c| c.get("path"))
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("dist/control-ui"));
+
+    let openai_chat_completions_enabled = openai_obj
+        .and_then(|o| o.get("chatCompletions"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let openai_responses_enabled = openai_obj
+        .and_then(|o| o.get("responses"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let control_endpoints_enabled = control_obj
+        .and_then(|c| c.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    HttpConfig {
+        hooks_token,
+        hooks_enabled,
+        gateway_token,
+        gateway_password,
+        control_ui_enabled,
+        control_ui_dist_path,
+        openai_chat_completions_enabled,
+        openai_responses_enabled,
+        control_endpoints_enabled,
+        ..Default::default()
+    }
+}
+
 /// Shared state for HTTP handlers
 #[derive(Clone)]
 pub struct AppState {
@@ -118,6 +207,8 @@ pub struct AppState {
     pub channel_registry: Arc<ChannelRegistry>,
     /// Gateway start time (Unix timestamp)
     pub start_time: i64,
+    /// WebSocket server state (for agent dispatch from hooks)
+    pub ws_state: Option<Arc<WsServerState>>,
 }
 
 /// Middleware configuration for the HTTP server
@@ -192,6 +283,7 @@ pub fn create_router_with_middleware(
         Arc::new(HookRegistry::new()),
         Arc::new(ToolsRegistry::new()),
         Arc::new(ChannelRegistry::new()),
+        None,
     )
 }
 
@@ -202,6 +294,7 @@ pub fn create_router_with_state(
     hook_registry: Arc<HookRegistry>,
     tools_registry: Arc<ToolsRegistry>,
     channel_registry: Arc<ChannelRegistry>,
+    ws_state: Option<Arc<WsServerState>>,
 ) -> Router {
     let start_time = chrono::Utc::now().timestamp();
 
@@ -211,6 +304,7 @@ pub fn create_router_with_state(
         tools_registry,
         channel_registry: channel_registry.clone(),
         start_time,
+        ws_state,
     };
 
     let mut router: Router<AppState> = Router::new();
@@ -483,19 +577,111 @@ async fn hooks_agent_handler(
     };
 
     // Validate request
-    match validate_agent_request(&req, &state.config.valid_channels) {
-        Ok(validated) => {
-            // Generate run ID
-            let run_id = Uuid::new_v4().to_string();
-            // In real implementation, dispatch agent job here
+    let validated = match validate_agent_request(&req, &state.config.valid_channels) {
+        Ok(v) => v,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(AgentResponse::error(&e))).into_response();
+        }
+    };
+
+    let run_id = Uuid::new_v4().to_string();
+
+    // Dispatch agent run if WsServerState is available
+    let ws = match &state.ws_state {
+        Some(ws) => ws.clone(),
+        None => {
             debug!(
-                "Agent job: message='{}', channel='{}', runId='{}'",
+                "Agent job accepted (no runtime): message='{}', channel='{}', runId='{}'",
                 validated.message, validated.channel, run_id
             );
-            (StatusCode::ACCEPTED, Json(AgentResponse::success(run_id))).into_response()
+            return (StatusCode::ACCEPTED, Json(AgentResponse::success(run_id))).into_response();
         }
-        Err(e) => (StatusCode::BAD_REQUEST, Json(AgentResponse::error(&e))).into_response(),
+    };
+
+    // Append user message to session
+    let session_key = &validated.session_key;
+    let metadata = crate::sessions::SessionMetadata {
+        channel: Some(validated.channel.clone()),
+        ..Default::default()
+    };
+    let session = match ws
+        .session_store()
+        .get_or_create_session(session_key, metadata)
+    {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(AgentResponse::error(&format!("session error: {}", e))),
+            )
+                .into_response();
+        }
+    };
+
+    if let Err(e) = ws
+        .session_store()
+        .append_message(crate::sessions::ChatMessage::user(
+            session.id.clone(),
+            &validated.message,
+        ))
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(AgentResponse::error(&format!("session write error: {}", e))),
+        )
+            .into_response();
     }
+
+    // Register the agent run
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let run = crate::server::ws::AgentRun {
+        run_id: run_id.clone(),
+        session_key: session.session_key.clone(),
+        status: crate::server::ws::AgentRunStatus::Queued,
+        message: validated.message.clone(),
+        response: String::new(),
+        error: None,
+        created_at: now,
+        started_at: None,
+        completed_at: None,
+        waiters: Vec::new(),
+    };
+
+    {
+        let mut registry = ws.agent_run_registry.lock();
+        registry.register(run);
+    }
+
+    // Spawn agent executor if LLM provider is configured
+    if let Some(provider) = ws.llm_provider().cloned() {
+        let config = crate::agent::AgentConfig {
+            model: validated
+                .model
+                .clone()
+                .unwrap_or_else(|| crate::agent::DEFAULT_MODEL.to_string()),
+            deliver: validated.deliver,
+            ..Default::default()
+        };
+        crate::agent::spawn_run(
+            run_id.clone(),
+            session.session_key.clone(),
+            config,
+            ws,
+            provider,
+        );
+        debug!(
+            "Agent job dispatched: message='{}', channel='{}', runId='{}'",
+            validated.message, validated.channel, run_id
+        );
+    } else {
+        debug!("Agent job queued (no LLM provider): runId='{}'", run_id);
+    }
+
+    (StatusCode::ACCEPTED, Json(AgentResponse::success(run_id))).into_response()
 }
 
 /// POST /hooks/<mapping> - Custom hook mappings
