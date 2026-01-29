@@ -19,6 +19,11 @@ use crate::server::ws::{broadcast_agent_event, broadcast_chat_event, WsServerSta
 /// This is a safety net above the reqwest-level timeout (300s) to catch hangs
 /// in stream processing or channel backpressure.
 const TURN_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Maximum time to wait for the next chunk in the SSE stream.
+/// If the provider stalls without sending any data for this long,
+/// we treat it as a timeout and abort the turn.
+const STREAM_CHUNK_TIMEOUT: Duration = Duration::from_secs(90);
 use crate::sessions::{ChatMessage, MessageRole};
 use tokio_util::sync::CancellationToken;
 
@@ -124,10 +129,22 @@ pub async fn execute_run(
                     broadcast_agent_event(&state, &run_id, next_seq(), "cancelled", json!({}));
                     return Err(AgentError::Cancelled);
                 }
-                event = rx.recv() => {
-                    match event {
-                        Some(e) => e,
-                        None => break,
+                result = tokio::time::timeout(STREAM_CHUNK_TIMEOUT, rx.recv()) => {
+                    match result {
+                        Ok(Some(e)) => e,
+                        Ok(None) => break, // stream ended
+                        Err(_) => {
+                            // No chunk received within timeout — stalled stream
+                            tracing::error!(
+                                run_id = %run_id,
+                                timeout_secs = STREAM_CHUNK_TIMEOUT.as_secs(),
+                                "LLM stream stalled — no data received within chunk timeout"
+                            );
+                            return Err(AgentError::Provider(format!(
+                                "LLM stream stalled — no data received for {}s",
+                                STREAM_CHUNK_TIMEOUT.as_secs()
+                            )));
+                        }
                     }
                 }
             };
@@ -203,8 +220,8 @@ pub async fn execute_run(
                         None,
                         None,
                     );
-                    // Log the full unsanitized error server-side
-                    tracing::error!(run_id = %run_id, error = %message, "LLM provider error");
+                    // Log the sanitized error — logs are accessible via logs.tail
+                    tracing::error!(run_id = %run_id, error = %safe_message, "LLM provider error");
                     return Err(AgentError::Provider(safe_message));
                 }
             }
@@ -222,9 +239,14 @@ pub async fn execute_run(
         total_output_tokens += turn_usage.output_tokens;
 
         // Record usage via the usage tracker
+        let provider_name = if crate::agent::openai::is_openai_model(&config.model) {
+            "openai"
+        } else {
+            "anthropic"
+        };
         crate::server::ws::record_usage(
             &session_key,
-            "anthropic",
+            provider_name,
             turn_usage.input_tokens,
             turn_usage.output_tokens,
             estimate_cost(

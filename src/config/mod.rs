@@ -3,6 +3,8 @@
 //! Handles JSON5 configuration with includes, environment variable substitution,
 //! and caching. Matches moltbot's format for drop-in compatibility.
 
+pub mod defaults;
+
 use parking_lot::RwLock;
 use regex::Regex;
 use serde_json::Value;
@@ -104,6 +106,9 @@ fn get_cache_ttl() -> Option<Duration> {
 
 /// Load and parse the configuration file with caching.
 /// Returns empty object `{}` if file doesn't exist.
+///
+/// The returned value has all config defaults applied so that missing
+/// sections/fields have production-ready values.
 pub fn load_config() -> Result<Value, ConfigError> {
     let path = get_config_path();
 
@@ -132,11 +137,16 @@ pub fn load_config() -> Result<Value, ConfigError> {
     Ok(config)
 }
 
-/// Load config without using the cache
+/// Load config without using the cache.
+///
+/// After parsing, include resolution, and env var substitution, this applies
+/// config defaults so that missing sections/fields have sensible values.
 pub fn load_config_uncached(path: &Path) -> Result<Value, ConfigError> {
-    // Return empty object if file doesn't exist
+    // Return empty object with defaults if file doesn't exist
     if !path.exists() {
-        return Ok(Value::Object(serde_json::Map::new()));
+        let mut empty = Value::Object(serde_json::Map::new());
+        defaults::apply_defaults(&mut empty);
+        return Ok(empty);
     }
 
     // Read and parse the config file
@@ -154,6 +164,10 @@ pub fn load_config_uncached(path: &Path) -> Result<Value, ConfigError> {
 
     // Apply environment variable substitution
     substitute_env_vars(&mut value)?;
+
+    // Apply config defaults (fill in missing sections/fields with
+    // production-ready values — mirrors clawdbot's apply* pipeline).
+    defaults::apply_defaults(&mut value);
 
     Ok(value)
 }
@@ -703,12 +717,20 @@ mod tests {
     }
 
     #[test]
-    fn test_config_not_exists_returns_empty() {
+    fn test_config_not_exists_returns_defaults() {
         let path = PathBuf::from("/nonexistent/path/config.json");
         let result = load_config_uncached(&path).unwrap();
 
         assert!(result.is_object());
-        assert!(result.as_object().unwrap().is_empty());
+        // When config file doesn't exist, defaults are applied so the object
+        // is non-empty and contains the essential sections.
+        let obj = result.as_object().unwrap();
+        assert!(!obj.is_empty(), "missing config should return defaults");
+        assert!(obj.contains_key("gateway"), "should have gateway defaults");
+        assert_eq!(result["gateway"]["port"], 18789);
+        assert_eq!(result["gateway"]["bind"], "loopback");
+        assert!(obj.contains_key("logging"), "should have logging defaults");
+        assert_eq!(result["logging"]["level"], "info");
     }
 
     #[test]

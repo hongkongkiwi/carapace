@@ -6,6 +6,7 @@
 pub mod anthropic;
 pub mod context;
 pub mod executor;
+pub mod openai;
 pub mod provider;
 pub mod tools;
 

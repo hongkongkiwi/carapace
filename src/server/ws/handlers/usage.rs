@@ -333,8 +333,19 @@ pub fn record_usage(
 ) {
     let mut state = USAGE_STATE.write();
 
+    // Sync enabled state from config if still at default (false).
+    // This ensures record_usage doesn't silently drop data when
+    // config says tracking is enabled but in-memory state wasn't initialized.
     if !state.enabled {
-        return;
+        let config_enabled = config::load_config()
+            .ok()
+            .and_then(|cfg| cfg.get("usage")?.get("enabled")?.as_bool())
+            .unwrap_or(true);
+        if config_enabled {
+            state.enabled = true;
+        } else {
+            return;
+        }
     }
 
     let now = now_ms();

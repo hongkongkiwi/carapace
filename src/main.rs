@@ -4,10 +4,12 @@
 mod agent;
 mod auth;
 mod channels;
+mod cli;
 mod config;
 mod credentials;
 mod cron;
 mod devices;
+mod discovery;
 mod exec;
 mod hooks;
 mod logging;
@@ -17,6 +19,7 @@ mod nodes;
 mod plugins;
 mod server;
 mod sessions;
+mod tls;
 mod usage;
 
 use std::net::SocketAddr;
@@ -25,11 +28,43 @@ use std::time::Duration;
 
 use axum::routing::get;
 use axum::Router;
+use clap::Parser;
 use serde_json::Value;
 use tracing::{error, info, warn};
 
+use cli::{Cli, Command, ConfigCommand};
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        // No subcommand or explicit `start` both launch the server.
+        None | Some(Command::Start) => run_server().await,
+
+        Some(Command::Config(sub)) => {
+            match sub {
+                ConfigCommand::Show => cli::handle_config_show()?,
+                ConfigCommand::Get { key } => cli::handle_config_get(&key)?,
+                ConfigCommand::Set { key, value } => cli::handle_config_set(&key, &value)?,
+                ConfigCommand::Path => cli::handle_config_path(),
+            }
+            Ok(())
+        }
+
+        Some(Command::Status { port, host }) => cli::handle_status(&host, port).await,
+
+        Some(Command::Logs { lines, port, host }) => cli::handle_logs(&host, port, lines).await,
+
+        Some(Command::Version) => {
+            cli::handle_version();
+            Ok(())
+        }
+    }
+}
+
+/// Run the gateway server (the original `main` logic).
+async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Initialize logging
     let log_config = if std::env::var("MOLTBOT_DEV").is_ok() {
         logging::LogConfig::development()
@@ -67,51 +102,103 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 5. Build WsServerState (persistent, with device/node registries)
     let ws_state = server::ws::build_ws_state_from_config().await?;
 
-    // 6. Configure LLM provider
-    let api_key = std::env::var("ANTHROPIC_API_KEY").ok().or_else(|| {
+    // 6. Configure LLM providers (Anthropic + OpenAI)
+    // 6a. Anthropic provider
+    let anthropic_api_key = std::env::var("ANTHROPIC_API_KEY").ok().or_else(|| {
         cfg.get("anthropic")
             .and_then(|v| v.get("apiKey"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     });
 
-    let base_url = std::env::var("ANTHROPIC_BASE_URL").ok().or_else(|| {
+    let anthropic_base_url = std::env::var("ANTHROPIC_BASE_URL").ok().or_else(|| {
         cfg.get("anthropic")
             .and_then(|v| v.get("baseUrl"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     });
 
-    let ws_state = if let Some(key) = api_key {
-        match agent::anthropic::AnthropicProvider::new(key) {
+    let anthropic_provider: Option<Arc<dyn agent::LlmProvider>> =
+        if let Some(key) = anthropic_api_key {
+            match agent::anthropic::AnthropicProvider::new(key) {
+                Ok(provider) => {
+                    let provider = if let Some(url) = anthropic_base_url {
+                        match provider.with_base_url(url) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                warn!("Invalid ANTHROPIC_BASE_URL: {}", e);
+                                return Err(e.into());
+                            }
+                        }
+                    } else {
+                        provider
+                    };
+                    info!("LLM provider configured: Anthropic");
+                    Some(Arc::new(provider))
+                }
+                Err(e) => {
+                    warn!("Failed to configure Anthropic provider: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+    // 6b. OpenAI provider
+    let openai_api_key = std::env::var("OPENAI_API_KEY").ok().or_else(|| {
+        cfg.get("openai")
+            .and_then(|v| v.get("apiKey"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+
+    let openai_base_url = std::env::var("OPENAI_BASE_URL").ok().or_else(|| {
+        cfg.get("openai")
+            .and_then(|v| v.get("baseUrl"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+
+    let openai_provider: Option<Arc<dyn agent::LlmProvider>> = if let Some(key) = openai_api_key {
+        match agent::openai::OpenAiProvider::new(key) {
             Ok(provider) => {
-                let provider = if let Some(url) = base_url {
+                let provider = if let Some(url) = openai_base_url {
                     match provider.with_base_url(url) {
                         Ok(p) => p,
                         Err(e) => {
-                            warn!("Invalid ANTHROPIC_BASE_URL: {}", e);
+                            warn!("Invalid OPENAI_BASE_URL: {}", e);
                             return Err(e.into());
                         }
                     }
                 } else {
                     provider
                 };
-                info!("LLM provider configured (Anthropic)");
-                let inner = Arc::try_unwrap(ws_state)
-                    .expect("WsServerState Arc should have single owner at startup");
-                Arc::new(inner.with_llm_provider(Arc::new(provider)))
+                info!("LLM provider configured: OpenAI");
+                Some(Arc::new(provider))
             }
             Err(e) => {
-                warn!("Failed to configure LLM provider: {}", e);
-                ws_state
+                warn!("Failed to configure OpenAI provider: {}", e);
+                None
             }
         }
     } else {
-        info!("No LLM provider configured (set ANTHROPIC_API_KEY to enable)");
+        None
+    };
+
+    // 6c. Build multi-provider dispatcher
+    let multi_provider = agent::provider::MultiProvider::new(anthropic_provider, openai_provider);
+
+    let ws_state = if multi_provider.has_any_provider() {
+        let inner = Arc::try_unwrap(ws_state)
+            .expect("WsServerState Arc should have single owner at startup");
+        Arc::new(inner.with_llm_provider(Arc::new(multi_provider)))
+    } else {
+        info!("No LLM provider configured (set ANTHROPIC_API_KEY and/or OPENAI_API_KEY to enable)");
         ws_state
     };
 
-    // 6b. Register built-in console channel (for testing/demo)
+    // 6d. Register built-in console channel (for testing/demo)
     let ws_state = {
         let plugin_reg = Arc::new(plugins::PluginRegistry::new());
         plugin_reg.register_channel(
@@ -169,9 +256,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shutdown_rx.clone(),
     ));
 
-    // 11. Startup banner
+    // 11. Parse TLS configuration
+    let tls_config = tls::parse_tls_config(&cfg);
+    let tls_setup = if tls_config.enabled {
+        match tls::setup_tls(&tls_config) {
+            Ok(result) => {
+                info!("TLS enabled");
+                info!("TLS certificate: {}", result.cert_path.display());
+                info!("TLS fingerprint (SHA-256): {}", result.fingerprint);
+                Some(result)
+            }
+            Err(e) => {
+                error!("Failed to set up TLS: {}", e);
+                return Err(e.into());
+            }
+        }
+    } else {
+        None
+    };
+
+    // 12. Start mDNS discovery (after we know the port and TLS state)
+    let discovery_config = discovery::build_discovery_config(&cfg);
+    if discovery_config.mode.is_enabled() {
+        let tls_fingerprint = tls_setup.as_ref().map(|t| t.fingerprint.clone());
+        let device_name = discovery::resolve_service_name(&discovery_config);
+        let discovery_props = discovery::ServiceProperties {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            fingerprint: tls_fingerprint,
+            device_name,
+        };
+        tokio::spawn(discovery::run_mdns_lifecycle(
+            discovery_config.clone(),
+            port,
+            discovery_props,
+            shutdown_rx.clone(),
+        ));
+    }
+
+    // 13. Startup banner
     info!("Carapace gateway v{}", env!("CARGO_PKG_VERSION"));
-    info!("Listening on {}", resolved.description);
+    let protocol = if tls_setup.is_some() { "https" } else { "http" };
+    info!(
+        "Listening on {} ({protocol}://{})",
+        resolved.description, resolved.address
+    );
     info!("State directory: {}", state_dir.display());
     if ws_state.llm_provider().is_some() {
         info!("LLM: enabled");
@@ -182,16 +310,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cron_count > 0 {
         info!("Cron jobs loaded: {}", cron_count);
     }
+    if discovery_config.mode.is_enabled() {
+        info!("mDNS discovery: {:?}", discovery_config.mode);
+    }
 
-    // 12. Start server with graceful shutdown
-    let listener = tokio::net::TcpListener::bind(resolved.address).await?;
+    // 14. Start server with graceful shutdown
+    if let Some(tls_result) = tls_setup {
+        // TLS-enabled server using axum-server with rustls
+        let rustls_config =
+            axum_server::tls_rustls::RustlsConfig::from_config(tls_result.server_config);
+        let addr = resolved.address;
 
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal(shutdown_tx, ws_state.clone()))
-    .await?;
+        axum_server::bind_rustls(addr, rustls_config)
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+            .await?;
+    } else {
+        // Plain TCP server (no TLS)
+        let listener = tokio::net::TcpListener::bind(resolved.address).await?;
+
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal(shutdown_tx, ws_state.clone()))
+        .await?;
+    }
 
     info!("Gateway shut down");
     Ok(())

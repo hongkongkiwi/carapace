@@ -9,10 +9,12 @@
 pub mod agent;
 pub mod auth;
 pub mod channels;
+pub mod cli;
 pub mod config;
 pub mod credentials;
 pub mod cron;
 pub mod devices;
+pub mod discovery;
 pub mod exec;
 pub mod hooks;
 pub mod logging;
@@ -22,4 +24,5 @@ pub mod nodes;
 pub mod plugins;
 pub mod server;
 pub mod sessions;
+pub mod tls;
 pub mod usage;

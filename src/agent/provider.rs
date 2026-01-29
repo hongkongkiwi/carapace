@@ -107,3 +107,110 @@ pub trait LlmProvider: Send + Sync {
         request: CompletionRequest,
     ) -> Result<mpsc::Receiver<StreamEvent>, AgentError>;
 }
+
+/// A provider that dispatches to either Anthropic or OpenAI based on the
+/// model identifier in the request.
+///
+/// This allows the system to hold a single `Arc<dyn LlmProvider>` while
+/// supporting multiple backend providers transparently.
+pub struct MultiProvider {
+    anthropic: Option<std::sync::Arc<dyn LlmProvider>>,
+    openai: Option<std::sync::Arc<dyn LlmProvider>>,
+}
+
+impl std::fmt::Debug for MultiProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MultiProvider")
+            .field("anthropic", &self.anthropic.is_some())
+            .field("openai", &self.openai.is_some())
+            .finish()
+    }
+}
+
+impl MultiProvider {
+    /// Create a new multi-provider dispatcher.
+    ///
+    /// At least one provider should be configured; otherwise all requests
+    /// will fail.
+    pub fn new(
+        anthropic: Option<std::sync::Arc<dyn LlmProvider>>,
+        openai: Option<std::sync::Arc<dyn LlmProvider>>,
+    ) -> Self {
+        Self { anthropic, openai }
+    }
+
+    /// Returns `true` if at least one provider is configured.
+    pub fn has_any_provider(&self) -> bool {
+        self.anthropic.is_some() || self.openai.is_some()
+    }
+
+    /// Select the appropriate backend provider for the given model.
+    fn select_provider(&self, model: &str) -> Result<&dyn LlmProvider, AgentError> {
+        if crate::agent::openai::is_openai_model(model) {
+            self.openai.as_deref().ok_or_else(|| {
+                AgentError::Provider(format!(
+                    "model \"{model}\" requires OpenAI provider, but no OPENAI_API_KEY is configured"
+                ))
+            })
+        } else {
+            // Default to Anthropic for claude-* and unknown models
+            self.anthropic.as_deref().ok_or_else(|| {
+                AgentError::Provider(format!(
+                    "model \"{model}\" requires Anthropic provider, but no ANTHROPIC_API_KEY is configured"
+                ))
+            })
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for MultiProvider {
+    async fn complete(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
+        let provider = self.select_provider(&request.model)?;
+        provider.complete(request).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_multi_provider_has_any_provider() {
+        let empty = MultiProvider::new(None, None);
+        assert!(!empty.has_any_provider());
+
+        // We can't easily create real providers without API keys, but we can
+        // test the logic with the struct fields directly.
+    }
+
+    #[test]
+    fn test_multi_provider_select_anthropic_model() {
+        let provider = MultiProvider::new(None, None);
+        let err = provider.select_provider("claude-sonnet-4-20250514");
+        assert!(err.is_err());
+        let msg = match err {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected error"),
+        };
+        assert!(
+            msg.contains("Anthropic"),
+            "expected Anthropic in error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_multi_provider_select_openai_model() {
+        let provider = MultiProvider::new(None, None);
+        let err = provider.select_provider("gpt-4o");
+        assert!(err.is_err());
+        let msg = match err {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected error"),
+        };
+        assert!(msg.contains("OpenAI"), "expected OpenAI in error: {msg}");
+    }
+}
