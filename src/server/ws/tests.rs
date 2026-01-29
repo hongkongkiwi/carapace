@@ -54,23 +54,24 @@ async fn test_handle_node_invoke_enforces_allowlist() {
         device_id: Some("node-1".to_string()),
     };
     state.register_connection(&node_conn, tx, None);
-    let mut registry = state.node_registry.lock();
-    registry.register(NodeSession {
-        node_id: "node-1".to_string(),
-        conn_id: "conn-1".to_string(),
-        display_name: None,
-        platform: Some("test".to_string()),
-        version: Some("1.0".to_string()),
-        device_family: None,
-        model_identifier: None,
-        remote_ip: None,
-        caps: vec![],
-        commands: HashSet::from(["system.run".to_string()]),
-        permissions: None,
-        path_env: None,
-        connected_at_ms: now_ms(),
-    });
-    drop(registry);
+    {
+        let mut registry = state.node_registry.lock();
+        registry.register(NodeSession {
+            node_id: "node-1".to_string(),
+            conn_id: "conn-1".to_string(),
+            display_name: None,
+            platform: Some("test".to_string()),
+            version: Some("1.0".to_string()),
+            device_family: None,
+            model_identifier: None,
+            remote_ip: None,
+            caps: vec![],
+            commands: HashSet::from(["system.run".to_string()]),
+            permissions: None,
+            path_env: None,
+            connected_at_ms: now_ms(),
+        });
+    }
 
     let outcome = state
         .node_pairing
@@ -545,37 +546,37 @@ fn test_operator_wildcard_scope() {
 fn test_scope_satisfies() {
     // Exact match
     assert!(scope_satisfies(
-        &vec!["operator.write".to_string()],
+        &["operator.write".to_string()],
         "operator.write"
     ));
     assert!(!scope_satisfies(
-        &vec!["operator.read".to_string()],
+        &["operator.read".to_string()],
         "operator.write"
     ));
 
     // Wildcard
     assert!(scope_satisfies(
-        &vec!["operator.*".to_string()],
+        &["operator.*".to_string()],
         "operator.pairing"
     ));
     assert!(scope_satisfies(
-        &vec!["operator.*".to_string()],
+        &["operator.*".to_string()],
         "operator.admin"
     ));
 
     // Admin covers all
     assert!(scope_satisfies(
-        &vec!["operator.admin".to_string()],
+        &["operator.admin".to_string()],
         "operator.pairing"
     ));
     assert!(scope_satisfies(
-        &vec!["operator.admin".to_string()],
+        &["operator.admin".to_string()],
         "operator.approvals"
     ));
 
     // Write covers read
     assert!(scope_satisfies(
-        &vec!["operator.write".to_string()],
+        &["operator.write".to_string()],
         "operator.read"
     ));
 }
@@ -1176,7 +1177,7 @@ fn test_presence_broadcast_on_connect() {
     assert_eq!(event["event"], "presence");
     assert!(event["seq"].as_u64().is_some());
     assert!(event["stateVersion"]["presence"].as_u64().unwrap() >= 1);
-    assert!(event["payload"]["presence"].as_array().unwrap().len() >= 1);
+    assert!(!event["payload"]["presence"].as_array().unwrap().is_empty());
 
     // Register second connection
     let (tx2, _rx2) = mpsc::unbounded_channel();

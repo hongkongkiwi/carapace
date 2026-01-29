@@ -752,7 +752,7 @@ pub enum CronRunMode {
 }
 
 impl CronRunMode {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse_mode(s: &str) -> Option<Self> {
         match s {
             "due" => Some(Self::Due),
             "force" => Some(Self::Force),
@@ -1228,9 +1228,9 @@ mod tests {
 
     #[test]
     fn test_cron_run_mode_from_str() {
-        assert_eq!(CronRunMode::from_str("due"), Some(CronRunMode::Due));
-        assert_eq!(CronRunMode::from_str("force"), Some(CronRunMode::Force));
-        assert_eq!(CronRunMode::from_str("invalid"), None);
+        assert_eq!(CronRunMode::parse_mode("due"), Some(CronRunMode::Due));
+        assert_eq!(CronRunMode::parse_mode("force"), Some(CronRunMode::Force));
+        assert_eq!(CronRunMode::parse_mode("invalid"), None);
     }
 
     #[test]

@@ -1,20 +1,20 @@
 #!/bin/bash
-# Pre-push hook: run tests before pushing
-
-set -e
+# Pre-push hook: run tests before pushing.
+# Install via: just setup-hooks
 
 echo "Running tests before push..."
 
 # Use nextest if available, otherwise cargo test
 if command -v cargo-nextest &> /dev/null; then
-    cargo nextest run
+    if ! cargo nextest run; then
+        echo "❌ Tests failed. Fix failing tests before pushing."
+        exit 1
+    fi
 else
-    cargo test
-fi
-
-if [ $? -ne 0 ]; then
-    echo "❌ Tests failed. Fix failing tests before pushing."
-    exit 1
+    if ! cargo test; then
+        echo "❌ Tests failed. Fix failing tests before pushing."
+        exit 1
+    fi
 fi
 
 echo "✓ All tests passed, pushing..."

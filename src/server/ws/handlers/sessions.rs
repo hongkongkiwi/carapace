@@ -462,7 +462,7 @@ pub(super) fn handle_sessions_list(
     let active_minutes = params
         .and_then(|v| v.get("activeMinutes"))
         .and_then(|v| v.as_i64())
-        .map(|v| v.max(1) as i64);
+        .map(|v| v.max(1));
     let label_filter = params
         .and_then(|v| v.get("label"))
         .and_then(|v| v.as_str())
@@ -1741,7 +1741,7 @@ pub(super) fn handle_chat_send(
     // Emit chat event for the user message
     broadcast_chat_event(
         &state,
-        &idempotency_key,
+        idempotency_key,
         &session.session_key,
         0, // First event in this run
         "delta",
@@ -2331,7 +2331,7 @@ mod tests {
             let session = state
                 .session_store
                 .create_session(
-                    &format!("agent-{}", i),
+                    format!("agent-{}", i),
                     sessions::SessionMetadata {
                         name: Some(format!("Session {}", i)),
                         ..Default::default()

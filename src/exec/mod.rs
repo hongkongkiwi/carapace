@@ -25,7 +25,7 @@ pub enum ExecApprovalDecision {
 }
 
 impl ExecApprovalDecision {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse_decision(s: &str) -> Option<Self> {
         match s {
             "allow-once" => Some(Self::AllowOnce),
             "allow-always" => Some(Self::AllowAlways),
@@ -273,18 +273,18 @@ mod tests {
     #[test]
     fn test_exec_approval_decision_from_str() {
         assert_eq!(
-            ExecApprovalDecision::from_str("allow-once"),
+            ExecApprovalDecision::parse_decision("allow-once"),
             Some(ExecApprovalDecision::AllowOnce)
         );
         assert_eq!(
-            ExecApprovalDecision::from_str("allow-always"),
+            ExecApprovalDecision::parse_decision("allow-always"),
             Some(ExecApprovalDecision::AllowAlways)
         );
         assert_eq!(
-            ExecApprovalDecision::from_str("deny"),
+            ExecApprovalDecision::parse_decision("deny"),
             Some(ExecApprovalDecision::Deny)
         );
-        assert_eq!(ExecApprovalDecision::from_str("invalid"), None);
+        assert_eq!(ExecApprovalDecision::parse_decision("invalid"), None);
     }
 
     #[test]

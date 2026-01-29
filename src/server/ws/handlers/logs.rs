@@ -3,7 +3,7 @@
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -32,20 +32,20 @@ fn resolve_log_file_path() -> PathBuf {
     resolve_state_dir().join("logs").join("moltbot.log")
 }
 
-fn resolve_log_file(path: &PathBuf) -> PathBuf {
+fn resolve_log_file(path: &Path) -> PathBuf {
     if path.exists() {
-        return path.clone();
+        return path.to_path_buf();
     }
     static ROLLING_RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"^moltbot-\d{4}-\d{2}-\d{2}\.log$").unwrap());
     let file_name = path.file_name().and_then(|v| v.to_str()).unwrap_or("");
     if !ROLLING_RE.is_match(file_name) {
-        return path.clone();
+        return path.to_path_buf();
     }
     let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(_) => return path.clone(),
+        Err(_) => return path.to_path_buf(),
     };
     let mut newest: Option<(PathBuf, std::time::SystemTime)> = None;
     for entry in entries.flatten() {
@@ -66,7 +66,9 @@ fn resolve_log_file(path: &PathBuf) -> PathBuf {
             }
         }
     }
-    newest.map(|(path, _)| path).unwrap_or_else(|| path.clone())
+    newest
+        .map(|(path, _)| path)
+        .unwrap_or_else(|| path.to_path_buf())
 }
 
 fn read_log_slice(
