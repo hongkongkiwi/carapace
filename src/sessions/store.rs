@@ -41,6 +41,8 @@ pub enum SessionStoreError {
     NotArchived(String),
     #[error("Archive not found: {0}")]
     ArchiveNotFound(String),
+    #[error("Invalid user ID: {0}")]
+    InvalidUserId(String),
 }
 
 impl From<std::io::Error> for SessionStoreError {
@@ -822,6 +824,11 @@ impl SessionStore {
     /// Returns all sessions and their chat histories for the given user_id
     /// as a portable JSON value.
     pub fn export_user_data(&self, user_id: &str) -> Result<serde_json::Value, SessionStoreError> {
+        if user_id.trim().is_empty() {
+            return Err(SessionStoreError::InvalidUserId(
+                "userId must not be empty or whitespace-only".to_string(),
+            ));
+        }
         let filter = SessionFilter::new().with_user_id(user_id);
         let sessions = self.list_sessions(filter)?;
 
@@ -862,6 +869,11 @@ impl SessionStore {
     /// Uses best-effort: logs individual failures and continues.
     /// Returns the number of sessions successfully deleted.
     pub fn purge_user_data(&self, user_id: &str) -> Result<(usize, usize), SessionStoreError> {
+        if user_id.trim().is_empty() {
+            return Err(SessionStoreError::InvalidUserId(
+                "userId must not be empty or whitespace-only".to_string(),
+            ));
+        }
         let filter = SessionFilter::new().with_user_id(user_id);
         let sessions = self.list_sessions(filter)?;
         let total = sessions.len();
@@ -1137,6 +1149,7 @@ impl SessionStore {
             }
 
             writer.flush()?;
+            writer.get_ref().sync_all()?;
         }
 
         // Atomic rename
@@ -1258,8 +1271,13 @@ impl SessionStore {
 
         {
             let file = File::create(&temp_path)?;
-            let writer = BufWriter::new(file);
-            serde_json::to_writer_pretty(writer, &archived)?;
+            let mut writer = BufWriter::new(file);
+            serde_json::to_writer_pretty(&mut writer, &archived)?;
+            writer.flush()?;
+            writer
+                .into_inner()
+                .map_err(|e| std::io::Error::other(e.to_string()))?
+                .sync_all()?;
         }
 
         // Atomic rename
@@ -1549,11 +1567,16 @@ impl SessionStore {
         let meta_path = self.session_meta_path(&session.id)?;
         let temp_path = meta_path.with_extension("json.tmp");
 
-        // Write to temp file first
+        // Write to temp file first, then sync
         {
             let file = File::create(&temp_path)?;
-            let writer = BufWriter::new(file);
-            serde_json::to_writer_pretty(writer, session)?;
+            let mut writer = BufWriter::new(file);
+            serde_json::to_writer_pretty(&mut writer, session)?;
+            writer.flush()?;
+            writer
+                .into_inner()
+                .map_err(|e| std::io::Error::other(e.to_string()))?
+                .sync_all()?;
         }
 
         // Atomic rename
@@ -2970,5 +2993,37 @@ mod tests {
             deleted, total,
             "all sessions should be successfully deleted"
         );
+    }
+
+    #[test]
+    fn test_export_user_data_rejects_empty_user_id() {
+        let (store, _temp) = create_test_store();
+        let result = store.export_user_data("");
+        assert!(result.is_err());
+        assert!(matches!(result, Err(SessionStoreError::InvalidUserId(_))));
+    }
+
+    #[test]
+    fn test_export_user_data_rejects_whitespace_user_id() {
+        let (store, _temp) = create_test_store();
+        let result = store.export_user_data("   ");
+        assert!(result.is_err());
+        assert!(matches!(result, Err(SessionStoreError::InvalidUserId(_))));
+    }
+
+    #[test]
+    fn test_purge_user_data_rejects_empty_user_id() {
+        let (store, _temp) = create_test_store();
+        let result = store.purge_user_data("");
+        assert!(result.is_err());
+        assert!(matches!(result, Err(SessionStoreError::InvalidUserId(_))));
+    }
+
+    #[test]
+    fn test_purge_user_data_rejects_whitespace_user_id() {
+        let (store, _temp) = create_test_store();
+        let result = store.purge_user_data("  \t  ");
+        assert!(result.is_err());
+        assert!(matches!(result, Err(SessionStoreError::InvalidUserId(_))));
     }
 }

@@ -119,11 +119,23 @@ mod tests {
     use super::*;
     use crate::cron::CronPayload;
     use crate::server::ws::{WsServerConfig, WsServerState};
+    use crate::sessions;
     use std::sync::Arc;
+
+    /// Create a WsServerState backed by a temp directory so tests work on all
+    /// platforms (including Windows CI where writing to ~/.moltbot may fail).
+    fn make_test_state() -> (Arc<WsServerState>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(sessions::SessionStore::with_base_path(
+            tmp.path().join("sessions"),
+        ));
+        let state = WsServerState::new(WsServerConfig::default()).with_session_store(store);
+        (Arc::new(state), tmp)
+    }
 
     #[tokio::test]
     async fn test_execute_system_event() {
-        let state = Arc::new(WsServerState::new(WsServerConfig::default()));
+        let (state, _tmp) = make_test_state();
 
         let payload = CronPayload::SystemEvent {
             text: "test cron event".to_string(),
@@ -137,7 +149,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_agent_turn_no_provider() {
         // Without an LLM provider, agent turn should fail
-        let state = Arc::new(WsServerState::new(WsServerConfig::default()));
+        let (state, _tmp) = make_test_state();
 
         let payload = CronPayload::AgentTurn {
             message: "do something".to_string(),

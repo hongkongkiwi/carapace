@@ -2216,3 +2216,248 @@ fn test_node_describe_merges_paired_metadata_with_live_data() {
     assert_eq!(result["connected"], true);
     assert_eq!(result["paired"], true);
 }
+
+#[tokio::test]
+async fn test_shutdown_watch_channel_propagates() {
+    let (tx, mut rx) = tokio::sync::watch::channel(false);
+
+    // Initially not shut down
+    assert!(!*rx.borrow());
+
+    // Simulate shutdown signal
+    tx.send(true).unwrap();
+
+    // Receiver should observe the change
+    rx.changed().await.unwrap();
+    assert!(*rx.borrow());
+}
+
+#[tokio::test]
+async fn test_shutdown_watch_channel_multiple_receivers() {
+    let (tx, rx1) = tokio::sync::watch::channel(false);
+    let mut rx2 = rx1.clone();
+    let mut rx3 = rx1.clone();
+
+    // All receivers start as false
+    assert!(!*rx1.borrow());
+    assert!(!*rx2.borrow());
+    assert!(!*rx3.borrow());
+
+    // Trigger shutdown
+    tx.send(true).unwrap();
+
+    // All receivers see the update
+    rx2.changed().await.unwrap();
+    rx3.changed().await.unwrap();
+    assert!(*rx2.borrow());
+    assert!(*rx3.borrow());
+}
+
+#[test]
+fn test_broadcast_shutdown_notifies_connected_clients() {
+    let state = Arc::new(WsServerState::new(WsServerConfig::default()));
+
+    // Register a mock connection
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let conn = ConnectionContext {
+        conn_id: "conn-shutdown-test".to_string(),
+        role: "operator".to_string(),
+        scopes: vec![],
+        client: ClientInfo {
+            id: "test".to_string(),
+            version: "1.0".to_string(),
+            platform: "test".to_string(),
+            mode: "test".to_string(),
+            display_name: None,
+            device_family: None,
+            model_identifier: None,
+            instance_id: None,
+        },
+        device_id: None,
+    };
+    state.register_connection(&conn, tx, None);
+
+    // Drain any messages sent during registration (e.g. presence broadcast)
+    while rx.try_recv().is_ok() {}
+
+    // Broadcast shutdown
+    broadcast_shutdown(&state, "SIGTERM", None);
+
+    // The connected client should receive a shutdown event frame
+    let msg = rx
+        .try_recv()
+        .expect("should have received shutdown message");
+    let text = match msg {
+        Message::Text(t) => t,
+        other => panic!("expected text message, got {:?}", other),
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed["event"], "shutdown");
+    assert_eq!(parsed["payload"]["reason"], "SIGTERM");
+}
+
+#[test]
+fn test_broadcast_sends_identical_bytes_to_all_connections() {
+    let state = WsServerState::new(WsServerConfig::default());
+
+    // Register three operator connections
+    let (tx1, mut rx1) = mpsc::unbounded_channel();
+    let (tx2, mut rx2) = mpsc::unbounded_channel();
+    let (tx3, mut rx3) = mpsc::unbounded_channel();
+
+    let conn1 = make_conn_with_id("operator", vec![], "conn-1");
+    let conn2 = make_conn_with_id("operator", vec![], "conn-2");
+    let conn3 = make_conn_with_id("operator", vec![], "conn-3");
+
+    state.register_connection(&conn1, tx1, None);
+    state.register_connection(&conn2, tx2, None);
+    state.register_connection(&conn3, tx3, None);
+
+    // Drain all presence broadcasts from registration
+    while rx1.try_recv().is_ok() {}
+    while rx2.try_recv().is_ok() {}
+    while rx3.try_recv().is_ok() {}
+
+    // Broadcast a general event
+    broadcast_event(
+        &state,
+        "agent",
+        json!({"runId": "run-1", "seq": 1, "stream": "text", "data": {"text": "Hello!"}}),
+    );
+
+    let msg1 = rx1.try_recv().expect("conn-1 should receive broadcast");
+    let msg2 = rx2.try_recv().expect("conn-2 should receive broadcast");
+    let msg3 = rx3.try_recv().expect("conn-3 should receive broadcast");
+
+    // Extract text from each message
+    let text1 = match msg1 {
+        Message::Text(t) => t,
+        other => panic!("expected text message, got {:?}", other),
+    };
+    let text2 = match msg2 {
+        Message::Text(t) => t,
+        other => panic!("expected text message, got {:?}", other),
+    };
+    let text3 = match msg3 {
+        Message::Text(t) => t,
+        other => panic!("expected text message, got {:?}", other),
+    };
+
+    // All three connections must receive byte-identical JSON strings.
+    // This verifies that broadcast serializes once and clones the string,
+    // rather than re-serializing per connection (which could produce
+    // different key orderings or whitespace).
+    assert_eq!(
+        text1, text2,
+        "conn-1 and conn-2 should receive identical bytes"
+    );
+    assert_eq!(
+        text2, text3,
+        "conn-2 and conn-3 should receive identical bytes"
+    );
+
+    // Sanity: verify the content is valid JSON with expected fields
+    let parsed: Value = serde_json::from_str(&text1).unwrap();
+    assert_eq!(parsed["type"], "event");
+    assert_eq!(parsed["event"], "agent");
+    assert_eq!(parsed["payload"]["runId"], "run-1");
+
+    // Also verify shutdown broadcast sends identical bytes (different code path)
+    while rx1.try_recv().is_ok() {}
+    while rx2.try_recv().is_ok() {}
+    while rx3.try_recv().is_ok() {}
+
+    broadcast_shutdown(&state, "update", Some(3000));
+
+    let s1 = match rx1.try_recv().unwrap() {
+        Message::Text(t) => t,
+        other => panic!("expected text, got {:?}", other),
+    };
+    let s2 = match rx2.try_recv().unwrap() {
+        Message::Text(t) => t,
+        other => panic!("expected text, got {:?}", other),
+    };
+    let s3 = match rx3.try_recv().unwrap() {
+        Message::Text(t) => t,
+        other => panic!("expected text, got {:?}", other),
+    };
+
+    assert_eq!(
+        s1, s2,
+        "shutdown bytes must be identical across connections"
+    );
+    assert_eq!(
+        s2, s3,
+        "shutdown bytes must be identical across connections"
+    );
+
+    // Also verify voicewake broadcast (sends to all including nodes)
+    let (tx_node, mut rx_node) = mpsc::unbounded_channel();
+    let node_conn = make_conn_with_id("node", vec![], "node-conn");
+    state.register_connection(&node_conn, tx_node, None);
+
+    while rx1.try_recv().is_ok() {}
+    while rx_node.try_recv().is_ok() {}
+
+    broadcast_voicewake_changed(&state, vec!["hey claude".to_string()]);
+
+    let v1 = match rx1.try_recv().unwrap() {
+        Message::Text(t) => t,
+        other => panic!("expected text, got {:?}", other),
+    };
+    let v_node = match rx_node.try_recv().unwrap() {
+        Message::Text(t) => t,
+        other => panic!("expected text, got {:?}", other),
+    };
+
+    assert_eq!(
+        v1, v_node,
+        "voicewake broadcast bytes must be identical for operator and node"
+    );
+}
+
+#[test]
+fn test_every_gateway_method_has_explicit_role_assignment() {
+    // Methods that are explicitly assigned "admin" in get_method_required_role.
+    // If a method returns "admin" but is NOT in this list, it means the method
+    // is falling through to the default `_ => "admin"` arm, which is a bug —
+    // it should be explicitly listed.
+    let explicit_admin_methods: std::collections::HashSet<&str> = [
+        "device.pair.approve",
+        "device.pair.reject",
+        "device.token.rotate",
+        "device.token.revoke",
+        "node.pair.request",
+        "node.pair.approve",
+        "node.pair.reject",
+        "node.pair.verify",
+        "node.rename",
+        "exec.approvals.set",
+        "exec.approvals.node.set",
+        "exec.approval.request",
+        "exec.approval.resolve",
+        "sessions.export_user",
+        "sessions.purge_user",
+        "system-event",
+    ]
+    .into_iter()
+    .collect();
+
+    // Node-only methods are dispatched before role checks, so they
+    // legitimately have no explicit role assignment.
+    let node_only: std::collections::HashSet<&str> = NODE_ONLY_METHODS.iter().copied().collect();
+
+    for method in &GATEWAY_METHODS {
+        if node_only.contains(method) {
+            continue;
+        }
+        let role = get_method_required_role(method);
+        assert!(
+            role == "read" || role == "write" || explicit_admin_methods.contains(method),
+            "GATEWAY_METHODS entry '{}' returns role '{}' via default fallthrough — \
+             add it to an explicit arm in get_method_required_role()",
+            method,
+            role,
+        );
+    }
+}

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use super::super::*;
 use super::config::{map_validation_issues, read_config_snapshot, write_config_file};
+use crate::plugins::capabilities::SsrfProtection;
 
 /// WASM binary magic bytes: `\0asm`
 const WASM_MAGIC: [u8; 4] = [0x00, 0x61, 0x73, 0x6D];
@@ -20,11 +21,13 @@ const SKILL_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 /// Name of the skills manifest file stored alongside WASM binaries.
 const SKILLS_MANIFEST_FILE: &str = "skills-manifest.json";
 
-fn ensure_object(value: &mut Value) -> &mut serde_json::Map<String, Value> {
+fn ensure_object(value: &mut Value) -> Result<&mut serde_json::Map<String, Value>, ErrorShape> {
     if !value.is_object() {
         *value = Value::Object(serde_json::Map::new());
     }
-    value.as_object_mut().expect("value is object")
+    value
+        .as_object_mut()
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "expected JSON object value", None))
 }
 
 fn resolve_workspace_dir(cfg: &Value) -> PathBuf {
@@ -126,8 +129,26 @@ fn validate_url(raw: &str) -> Result<url::Url, ErrorShape> {
 fn read_skills_manifest(skills_dir: &Path) -> Value {
     let manifest_path = skills_dir.join(SKILLS_MANIFEST_FILE);
     match std::fs::read_to_string(&manifest_path) {
-        Ok(contents) => serde_json::from_str(&contents).unwrap_or_else(|_| json!({})),
-        Err(_) => json!({}),
+        Ok(contents) => serde_json::from_str(&contents).unwrap_or_else(|e| {
+            tracing::warn!(
+                path = %manifest_path.display(),
+                error = %e,
+                "skills manifest JSON is corrupt, falling back to empty object"
+            );
+            json!({})
+        }),
+        Err(e) => {
+            // Only warn if the file exists but could not be read (permission error, etc.).
+            // A missing file is expected on first run and not worth logging.
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    path = %manifest_path.display(),
+                    error = %e,
+                    "failed to read skills manifest, falling back to empty object"
+                );
+            }
+            json!({})
+        }
     }
 }
 
@@ -174,6 +195,13 @@ fn write_skills_manifest(skills_dir: &Path, manifest: &Value) -> Result<(), Erro
                 None,
             )
         })?;
+        file.sync_all().map_err(|e| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("failed to sync skills manifest: {}", e),
+                None,
+            )
+        })?;
     }
     std::fs::rename(&tmp_path, &manifest_path).map_err(|e| {
         error_shape(
@@ -192,6 +220,15 @@ fn download_skill_wasm(
     skills_dir: &Path,
     file_name: &str,
 ) -> Result<PathBuf, ErrorShape> {
+    // Validate URL against SSRF attacks (blocks localhost, private IPs, metadata endpoints)
+    SsrfProtection::validate_url(url.as_str()).map_err(|e| {
+        error_shape(
+            ERROR_INVALID_REQUEST,
+            &format!("skill download URL blocked by SSRF protection: {}", e),
+            None,
+        )
+    })?;
+
     std::fs::create_dir_all(skills_dir).map_err(|e| {
         error_shape(
             ERROR_UNAVAILABLE,
@@ -274,6 +311,13 @@ fn download_skill_wasm(
             error_shape(
                 ERROR_UNAVAILABLE,
                 &format!("failed to write skill binary: {}", e),
+                None,
+            )
+        })?;
+        file.sync_all().map_err(|e| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("failed to sync skill binary: {}", e),
                 None,
             )
         })?;
@@ -406,11 +450,11 @@ fn handle_skills_install_inner(
 
     // Record metadata in the skills manifest
     let mut manifest = read_skills_manifest(skills_dir);
-    let manifest_obj = ensure_object(&mut manifest);
+    let manifest_obj = ensure_object(&mut manifest)?;
     let entry = manifest_obj
         .entry(name.to_string())
         .or_insert_with(|| json!({}));
-    let entry_obj = ensure_object(entry);
+    let entry_obj = ensure_object(entry)?;
     entry_obj.insert("name".to_string(), Value::String(name.to_string()));
     if let Some(ref v) = version {
         entry_obj.insert("version".to_string(), Value::String(v.clone()));
@@ -432,15 +476,15 @@ fn handle_skills_install_inner(
 
     // Also record the skill in the main config (preserving existing behaviour)
     let mut config_value = read_config_snapshot().config;
-    let root = ensure_object(&mut config_value);
+    let root = ensure_object(&mut config_value)?;
     let skills = root.entry("skills").or_insert_with(|| json!({}));
-    let skills_obj = ensure_object(skills);
+    let skills_obj = ensure_object(skills)?;
     let entries = skills_obj.entry("entries").or_insert_with(|| json!({}));
-    let entries_obj = ensure_object(entries);
+    let entries_obj = ensure_object(entries)?;
     let cfg_entry = entries_obj
         .entry(name.to_string())
         .or_insert_with(|| json!({}));
-    let cfg_entry_obj = ensure_object(cfg_entry);
+    let cfg_entry_obj = ensure_object(cfg_entry)?;
     cfg_entry_obj.insert("enabled".to_string(), Value::Bool(true));
     cfg_entry_obj.insert("name".to_string(), Value::String(name.to_string()));
     cfg_entry_obj.insert(
@@ -535,11 +579,11 @@ fn handle_skills_update_inner(
     let updated_at = now_ms();
 
     // Update the manifest entry
-    let manifest_obj = ensure_object(&mut manifest);
+    let manifest_obj = ensure_object(&mut manifest)?;
     let entry = manifest_obj
         .entry(name.to_string())
         .or_insert_with(|| json!({}));
-    let entry_obj = ensure_object(entry);
+    let entry_obj = ensure_object(entry)?;
     entry_obj.insert("name".to_string(), Value::String(name.to_string()));
     if let Some(ref v) = version {
         entry_obj.insert("version".to_string(), Value::String(v.clone()));
@@ -745,6 +789,70 @@ mod tests {
     fn test_validate_url_invalid() {
         let err = validate_url("not a url at all").unwrap_err();
         assert!(err.message.contains("invalid url"));
+    }
+
+    // ---- SSRF protection tests for skill downloads ----
+
+    #[test]
+    fn test_download_skill_ssrf_public_url_passes_validation() {
+        // A public URL should pass SSRF validation (will fail later at the network level,
+        // but the SSRF check itself should not reject it).
+        let dir = TempDir::new().unwrap();
+        let url = url::Url::parse("https://example.com/skills/my-skill.wasm").unwrap();
+        let result = download_skill_wasm(&url, dir.path(), "test.wasm");
+        // Should fail with a network error, NOT an SSRF error
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            !err.message.contains("SSRF"),
+            "public URL should not be blocked by SSRF protection, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_download_skill_ssrf_rejects_localhost() {
+        let dir = TempDir::new().unwrap();
+        let url = url::Url::parse("http://localhost/evil.wasm").unwrap();
+        let result = download_skill_wasm(&url, dir.path(), "test.wasm");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(
+            err.message.contains("SSRF"),
+            "localhost should be blocked by SSRF protection, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_download_skill_ssrf_rejects_metadata_endpoint() {
+        let dir = TempDir::new().unwrap();
+        let url = url::Url::parse("http://169.254.169.254/latest/meta-data/").unwrap();
+        let result = download_skill_wasm(&url, dir.path(), "test.wasm");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(
+            err.message.contains("SSRF"),
+            "metadata endpoint should be blocked by SSRF protection, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_download_skill_ssrf_rejects_internal_ip() {
+        let dir = TempDir::new().unwrap();
+        let url = url::Url::parse("http://10.0.0.1/internal-skill.wasm").unwrap();
+        let result = download_skill_wasm(&url, dir.path(), "test.wasm");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(
+            err.message.contains("SSRF"),
+            "internal IP should be blocked by SSRF protection, got: {}",
+            err.message
+        );
     }
 
     // ---- Manifest read/write tests ----
@@ -966,19 +1074,74 @@ mod tests {
         assert!(err.message.contains("unsupported url scheme"));
     }
 
+    // ---- ensure_object tests ----
+
+    #[test]
+    fn test_ensure_object_with_object_value() {
+        let mut value = json!({"key": "val"});
+        let obj = ensure_object(&mut value).unwrap();
+        assert_eq!(obj.get("key").unwrap(), "val");
+    }
+
+    #[test]
+    fn test_ensure_object_with_non_object_resets_to_empty() {
+        // A non-object value (e.g. a string) should be replaced with an empty object
+        let mut value = json!("not an object");
+        let obj = ensure_object(&mut value).unwrap();
+        assert!(obj.is_empty());
+        assert!(value.is_object());
+    }
+
+    #[test]
+    fn test_ensure_object_with_null_resets_to_empty() {
+        let mut value = Value::Null;
+        let obj = ensure_object(&mut value).unwrap();
+        assert!(obj.is_empty());
+        assert!(value.is_object());
+    }
+
+    #[test]
+    fn test_ensure_object_with_array_resets_to_empty() {
+        let mut value = json!([1, 2, 3]);
+        let obj = ensure_object(&mut value).unwrap();
+        assert!(obj.is_empty());
+        assert!(value.is_object());
+    }
+
+    // ---- read_skills_manifest logging tests ----
+
+    #[test]
+    fn test_read_skills_manifest_corrupt_json_returns_empty() {
+        // Corrupt JSON should fall back to empty object (and log a warning)
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(SKILLS_MANIFEST_FILE), b"not json {{{{").unwrap();
+        let manifest = read_skills_manifest(dir.path());
+        assert_eq!(manifest, json!({}));
+    }
+
+    #[test]
+    fn test_read_skills_manifest_empty_file_returns_empty() {
+        // An empty file is invalid JSON and should fall back gracefully
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(SKILLS_MANIFEST_FILE), b"").unwrap();
+        let manifest = read_skills_manifest(dir.path());
+        assert_eq!(manifest, json!({}));
+    }
+
     // ---- download_skill_wasm tests ----
 
     #[test]
     fn test_download_skill_wasm_connection_refused() {
-        // Attempting to download from a port that is not listening
+        // 127.0.0.1 is now blocked by SSRF protection before any network request is made
         let dir = TempDir::new().unwrap();
         let url = url::Url::parse("http://127.0.0.1:1/nonexistent.wasm").unwrap();
         let result = download_skill_wasm(&url, dir.path(), "test.wasm");
         assert!(result.is_err());
         let err = result.unwrap_err();
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
         assert!(
-            err.message.contains("failed to download skill"),
-            "unexpected error message: {}",
+            err.message.contains("SSRF"),
+            "127.0.0.1 should be blocked by SSRF protection, got: {}",
             err.message
         );
     }

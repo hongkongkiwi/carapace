@@ -250,7 +250,7 @@ pub(super) fn handle_send(
 
     let queued = state
         .message_pipeline
-        .queue(outbound.clone(), ctx)
+        .queue_with_idempotency(outbound.clone(), ctx, Some(idempotency_key))
         .map_err(|e| error_shape(ERROR_UNAVAILABLE, &format!("queue failed: {}", e), None))?;
 
     // Node returns {runId, messageId, channel} plus optional delivery result fields
@@ -260,7 +260,7 @@ pub(super) fn handle_send(
 
     let mut response = json!({
         "runId": idempotency_key,
-        "messageId": outbound.id.0,
+        "messageId": queued.message_id.0,
         "channel": outbound.channel_id
     });
 
@@ -916,5 +916,66 @@ mod tests {
 
         // When no channel is specified, defaults to "default"
         assert_eq!(result["channel"], "default");
+    }
+
+    #[test]
+    fn test_handle_send_idempotency_deduplication() {
+        let state = WsServerState::new(WsServerConfig::default());
+        let conn = make_test_conn();
+
+        // First send with idempotency key
+        let params = json!({
+            "to": "user123",
+            "message": "hello",
+            "idempotencyKey": "dedup-key-001",
+            "channel": "default"
+        });
+        let result1 = handle_send(&state, Some(&params), &conn).unwrap();
+        let message_id_1 = result1["messageId"].as_str().unwrap().to_string();
+
+        // Second send with same idempotency key
+        let params2 = json!({
+            "to": "user123",
+            "message": "hello again",
+            "idempotencyKey": "dedup-key-001",
+            "channel": "default"
+        });
+        let result2 = handle_send(&state, Some(&params2), &conn).unwrap();
+        let message_id_2 = result2["messageId"].as_str().unwrap().to_string();
+
+        // Same idempotency key should return the same message ID
+        assert_eq!(message_id_1, message_id_2);
+
+        // Only one message should exist in the pipeline
+        assert_eq!(state.message_pipeline.queue_size("default"), 1);
+    }
+
+    #[test]
+    fn test_handle_send_different_idempotency_keys_create_separate() {
+        let state = WsServerState::new(WsServerConfig::default());
+        let conn = make_test_conn();
+
+        let params1 = json!({
+            "to": "user123",
+            "message": "hello",
+            "idempotencyKey": "key-a",
+            "channel": "default"
+        });
+        let result1 = handle_send(&state, Some(&params1), &conn).unwrap();
+
+        let params2 = json!({
+            "to": "user123",
+            "message": "hello",
+            "idempotencyKey": "key-b",
+            "channel": "default"
+        });
+        let result2 = handle_send(&state, Some(&params2), &conn).unwrap();
+
+        // Different idempotency keys should create different messages
+        assert_ne!(
+            result1["messageId"].as_str().unwrap(),
+            result2["messageId"].as_str().unwrap()
+        );
+        assert_eq!(state.message_pipeline.queue_size("default"), 2);
     }
 }

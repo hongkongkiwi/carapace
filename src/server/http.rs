@@ -489,7 +489,7 @@ async fn health_handler(State(state): State<AppState>) -> Response {
         Json(json!({
             "status": "ok",
             "version": env!("CARGO_PKG_VERSION"),
-            "uptime_seconds": uptime,
+            "uptimeSeconds": uptime,
         })),
     )
         .into_response()
@@ -820,18 +820,18 @@ async fn hooks_mapping_handler(
 fn check_hooks_auth(config: &HttpConfig, headers: &HeaderMap, uri: &Uri) -> Option<Response> {
     let configured_token = match &config.hooks_token {
         Some(t) if !t.is_empty() => t,
-        _ => return Some((StatusCode::UNAUTHORIZED, "Unauthorized").into_response()),
+        _ => return Some(unauthorized_response()),
     };
 
     match extract_hooks_token(headers, uri) {
         Some((token, _deprecated)) => {
             if !validate_hooks_token(&token, configured_token) {
-                Some((StatusCode::UNAUTHORIZED, "Unauthorized").into_response())
+                Some(unauthorized_response())
             } else {
                 None
             }
         }
-        None => Some((StatusCode::UNAUTHORIZED, "Unauthorized").into_response()),
+        None => Some(unauthorized_response()),
     }
 }
 
@@ -1702,6 +1702,6 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "ok");
         assert!(json["version"].as_str().is_some());
-        assert!(json["uptime_seconds"].as_i64().is_some());
+        assert!(json["uptimeSeconds"].as_i64().is_some());
     }
 }

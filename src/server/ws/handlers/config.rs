@@ -170,6 +170,8 @@ pub(crate) fn persist_config_file(path: &PathBuf, config_value: &Value) -> Resul
             .map_err(|err| format!("failed to write config: {}", err))?;
         file.write_all(b"\n")
             .map_err(|err| format!("failed to write config: {}", err))?;
+        file.sync_all()
+            .map_err(|err| format!("failed to sync config: {}", err))?;
     }
     fs::rename(&tmp_path, path).map_err(|err| format!("failed to replace config: {}", err))?;
 

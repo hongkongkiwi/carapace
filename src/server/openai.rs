@@ -116,9 +116,9 @@ pub struct ChatChoice {
 /// Token usage statistics
 #[derive(Debug, Serialize)]
 pub struct ChatUsage {
-    pub prompt_tokens: i32,
-    pub completion_tokens: i32,
-    pub total_tokens: i32,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
 }
 
 /// Chat completion chunk for streaming
@@ -160,6 +160,8 @@ pub struct OpenAiError {
 pub struct OpenAiErrorBody {
     pub message: String,
     pub r#type: String,
+    pub param: Option<String>,
+    pub code: Option<String>,
 }
 
 impl OpenAiError {
@@ -168,6 +170,8 @@ impl OpenAiError {
             error: OpenAiErrorBody {
                 message: message.into(),
                 r#type: "invalid_request_error".to_string(),
+                param: None,
+                code: None,
             },
         }
     }
@@ -177,6 +181,8 @@ impl OpenAiError {
             error: OpenAiErrorBody {
                 message: "Unauthorized".to_string(),
                 r#type: "unauthorized".to_string(),
+                param: None,
+                code: None,
             },
         }
     }
@@ -186,6 +192,8 @@ impl OpenAiError {
             error: OpenAiErrorBody {
                 message: message.into(),
                 r#type: "api_error".to_string(),
+                param: None,
+                code: None,
             },
         }
     }
@@ -429,7 +437,10 @@ async fn stream_llm_provider(
                     break;
                 }
                 StreamEvent::Error { message } => {
-                    // Send error as a chunk with content, then stop
+                    // Log the error server-side; do not embed it in assistant text.
+                    tracing::error!(error = %message, "streaming LLM error");
+
+                    // Send a final chunk with empty content and finish_reason "stop"
                     let error_chunk = ChatCompletionChunk {
                         id: response_id.clone(),
                         object: "chat.completion.chunk".to_string(),
@@ -439,7 +450,7 @@ async fn stream_llm_provider(
                             index: 0,
                             delta: ChunkDelta {
                                 role: None,
-                                content: Some(format!("[Error: {}]", message)),
+                                content: None,
                             },
                             finish_reason: Some("stop".to_string()),
                         }],
@@ -583,9 +594,9 @@ pub async fn chat_completions_handler(
                     finish_reason: "stop".to_string(),
                 }],
                 usage: ChatUsage {
-                    prompt_tokens: usage.input_tokens as i32,
-                    completion_tokens: usage.output_tokens as i32,
-                    total_tokens: (usage.input_tokens + usage.output_tokens) as i32,
+                    prompt_tokens: usage.input_tokens,
+                    completion_tokens: usage.output_tokens,
+                    total_tokens: usage.input_tokens + usage.output_tokens,
                 },
             };
             (StatusCode::OK, Json(response)).into_response()
@@ -755,9 +766,9 @@ pub struct OutputContent {
 /// Usage for OpenResponses
 #[derive(Debug, Serialize)]
 pub struct ResponsesUsage {
-    pub input_tokens: i32,
-    pub output_tokens: i32,
-    pub total_tokens: i32,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
 }
 
 /// Error in OpenResponses
@@ -775,6 +786,56 @@ fn has_user_message(input: &ResponsesInput) -> bool {
             .iter()
             .any(|item| matches!(item, ResponsesInputItem::Message { role, .. } if role == "user")),
     }
+}
+
+/// Convert OpenResponses input to `ChatMessage` list so we can reuse
+/// `convert_to_llm_messages`.
+///
+/// - `ResponsesInput::Text(s)` becomes a single user message.
+/// - `ResponsesInput::Items` maps Message items to ChatMessages (function call
+///   items are ignored for now).
+/// - If `instructions` is provided it is prepended as a system message.
+fn responses_input_to_chat_messages(
+    input: &ResponsesInput,
+    instructions: Option<&str>,
+) -> Vec<ChatMessage> {
+    let mut msgs = Vec::new();
+
+    if let Some(instr) = instructions {
+        msgs.push(ChatMessage {
+            role: "system".to_string(),
+            content: ChatContent::Text(instr.to_string()),
+            name: None,
+        });
+    }
+
+    match input {
+        ResponsesInput::Text(text) => {
+            msgs.push(ChatMessage {
+                role: "user".to_string(),
+                content: ChatContent::Text(text.clone()),
+                name: None,
+            });
+        }
+        ResponsesInput::Items(items) => {
+            for item in items {
+                match item {
+                    ResponsesInputItem::Message { role, content } => {
+                        msgs.push(ChatMessage {
+                            role: role.clone(),
+                            content: content.clone(),
+                            name: None,
+                        });
+                    }
+                    // Function call items are not converted to LLM messages
+                    ResponsesInputItem::FunctionCall { .. }
+                    | ResponsesInputItem::FunctionCallOutput { .. } => {}
+                }
+            }
+        }
+    }
+
+    msgs
 }
 
 /// POST /v1/responses handler
@@ -858,43 +919,82 @@ pub async fn responses_handler(
         }
     }
 
-    // Generate response
+    // Generate response IDs and timestamp
     let response_id = format!("resp_{}", Uuid::new_v4().simple());
     let msg_id = format!("msg_{}", Uuid::new_v4().simple());
     let created_at = chrono::Utc::now().timestamp();
 
-    // Mock response
-    let mock_response = "I'm Moltbot, your AI assistant.";
-
-    if req.stream {
-        // Streaming would be implemented here
-        // For now, return non-streaming
-    }
-
-    let response = ResponsesResponse {
-        id: response_id,
-        object: "response".to_string(),
-        created_at,
-        status: "completed".to_string(),
-        model: req.model,
-        output: vec![ResponsesOutputItem::Message {
-            id: msg_id,
-            role: "assistant".to_string(),
-            content: vec![OutputContent {
-                r#type: "output_text".to_string(),
-                text: mock_response.to_string(),
-            }],
-            status: "completed".to_string(),
-        }],
-        usage: ResponsesUsage {
-            input_tokens: 0,
-            output_tokens: 0,
-            total_tokens: 0,
-        },
-        error: None,
+    // Require an LLM provider
+    let provider = match &state.llm_provider {
+        Some(p) => p.clone(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(OpenAiError::api_error(
+                    "No LLM provider configured. Set ANTHROPIC_API_KEY to enable.",
+                )),
+            )
+                .into_response();
+        }
     };
 
-    (StatusCode::OK, Json(response)).into_response()
+    // Convert OpenResponses input to ChatMessages, then to LLM messages
+    let chat_messages = responses_input_to_chat_messages(&req.input, req.instructions.as_deref());
+    let (system, llm_messages) = convert_to_llm_messages(&chat_messages);
+
+    if llm_messages.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(OpenAiError::invalid_request(
+                "No user or assistant messages found after filtering system messages.",
+            )),
+        )
+            .into_response();
+    }
+
+    // Resolve the model name, mapping moltbot aliases to the default
+    let model = if req.model == "moltbot"
+        || req.model.starts_with("moltbot:")
+        || req.model.starts_with("agent:")
+    {
+        crate::agent::DEFAULT_MODEL.to_string()
+    } else {
+        req.model.clone()
+    };
+
+    // Non-streaming: call the LLM provider and collect the result
+    match call_llm_provider(&*provider, &model, system, llm_messages).await {
+        Ok((text, usage)) => {
+            let response = ResponsesResponse {
+                id: response_id,
+                object: "response".to_string(),
+                created_at,
+                status: "completed".to_string(),
+                model,
+                output: vec![ResponsesOutputItem::Message {
+                    id: msg_id,
+                    role: "assistant".to_string(),
+                    content: vec![OutputContent {
+                        r#type: "output_text".to_string(),
+                        text,
+                    }],
+                    status: "completed".to_string(),
+                }],
+                usage: ResponsesUsage {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    total_tokens: usage.input_tokens + usage.output_tokens,
+                },
+                error: None,
+            };
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(OpenAiError::api_error(err)),
+        )
+            .into_response(),
+    }
 }
 
 #[cfg(test)]
@@ -988,6 +1088,37 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("chat.completion"));
         assert!(json.contains("chatcmpl_test"));
+    }
+
+    #[test]
+    fn test_chat_usage_large_token_values_not_truncated() {
+        // Values above i32::MAX (2^31 - 1 = 2_147_483_647) must not be truncated
+        let large: u64 = 5_000_000_000;
+        let usage = ChatUsage {
+            prompt_tokens: large,
+            completion_tokens: large,
+            total_tokens: large * 2,
+        };
+        let json = serde_json::to_string(&usage).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["prompt_tokens"].as_u64().unwrap(), large);
+        assert_eq!(parsed["completion_tokens"].as_u64().unwrap(), large);
+        assert_eq!(parsed["total_tokens"].as_u64().unwrap(), large * 2);
+    }
+
+    #[test]
+    fn test_responses_usage_large_token_values_not_truncated() {
+        let large: u64 = 5_000_000_000;
+        let usage = ResponsesUsage {
+            input_tokens: large,
+            output_tokens: large,
+            total_tokens: large * 2,
+        };
+        let json = serde_json::to_string(&usage).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["input_tokens"].as_u64().unwrap(), large);
+        assert_eq!(parsed["output_tokens"].as_u64().unwrap(), large);
+        assert_eq!(parsed["total_tokens"].as_u64().unwrap(), large * 2);
     }
 
     #[test]
@@ -1498,5 +1629,336 @@ mod tests {
 
         // Should fail because there's no user message
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ============== responses_input_to_chat_messages Tests ==============
+
+    #[test]
+    fn test_responses_input_text_to_chat_messages() {
+        let input = ResponsesInput::Text("Hello there".to_string());
+        let msgs = responses_input_to_chat_messages(&input, None);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[0].content.to_text(), "Hello there");
+    }
+
+    #[test]
+    fn test_responses_input_text_with_instructions() {
+        let input = ResponsesInput::Text("Hello".to_string());
+        let msgs = responses_input_to_chat_messages(&input, Some("Be concise"));
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, "system");
+        assert_eq!(msgs[0].content.to_text(), "Be concise");
+        assert_eq!(msgs[1].role, "user");
+        assert_eq!(msgs[1].content.to_text(), "Hello");
+    }
+
+    #[test]
+    fn test_responses_input_items_to_chat_messages() {
+        let input = ResponsesInput::Items(vec![
+            ResponsesInputItem::Message {
+                role: "user".to_string(),
+                content: ChatContent::Text("Hi".to_string()),
+            },
+            ResponsesInputItem::Message {
+                role: "assistant".to_string(),
+                content: ChatContent::Text("Hello!".to_string()),
+            },
+            ResponsesInputItem::Message {
+                role: "user".to_string(),
+                content: ChatContent::Text("How are you?".to_string()),
+            },
+        ]);
+        let msgs = responses_input_to_chat_messages(&input, None);
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[1].role, "assistant");
+        assert_eq!(msgs[2].role, "user");
+    }
+
+    #[test]
+    fn test_responses_input_items_skips_function_calls() {
+        let input = ResponsesInput::Items(vec![
+            ResponsesInputItem::Message {
+                role: "user".to_string(),
+                content: ChatContent::Text("Hi".to_string()),
+            },
+            ResponsesInputItem::FunctionCall {
+                name: "get_weather".to_string(),
+                arguments: "{}".to_string(),
+            },
+            ResponsesInputItem::FunctionCallOutput {
+                call_id: "call_1".to_string(),
+                output: "sunny".to_string(),
+            },
+        ]);
+        let msgs = responses_input_to_chat_messages(&input, None);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "user");
+    }
+
+    // ============== OpenResponses handler integration tests ==============
+
+    #[tokio::test]
+    async fn test_responses_no_provider_returns_503() {
+        let state = OpenAiState {
+            responses_enabled: true,
+            llm_provider: None,
+            gateway_token: Some("test-token".to_string()),
+            ..Default::default()
+        };
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "moltbot",
+            "input": "Hello"
+        }))
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer test-token".parse().unwrap());
+
+        let response =
+            responses_handler(State(state), headers, axum::body::Bytes::from(body)).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(parsed["error"]["type"], "api_error");
+        assert!(parsed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("No LLM provider configured"));
+    }
+
+    #[tokio::test]
+    async fn test_responses_with_provider_text_input() {
+        let provider = Arc::new(MockLlmProvider::text_response("LLM response", 80, 20));
+        let state = OpenAiState {
+            responses_enabled: true,
+            llm_provider: Some(provider),
+            gateway_token: Some("test-token".to_string()),
+            ..Default::default()
+        };
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "moltbot",
+            "input": "Hello"
+        }))
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer test-token".parse().unwrap());
+
+        let response =
+            responses_handler(State(state), headers, axum::body::Bytes::from(body)).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        assert_eq!(parsed["object"], "response");
+        assert_eq!(parsed["status"], "completed");
+        assert!(parsed["id"].as_str().unwrap().starts_with("resp_"));
+        assert_eq!(parsed["model"], crate::agent::DEFAULT_MODEL);
+        assert_eq!(parsed["output"][0]["type"], "message");
+        assert_eq!(parsed["output"][0]["role"], "assistant");
+        assert_eq!(parsed["output"][0]["content"][0]["type"], "output_text");
+        assert_eq!(parsed["output"][0]["content"][0]["text"], "LLM response");
+        assert_eq!(parsed["usage"]["input_tokens"], 80);
+        assert_eq!(parsed["usage"]["output_tokens"], 20);
+        assert_eq!(parsed["usage"]["total_tokens"], 100);
+    }
+
+    #[tokio::test]
+    async fn test_responses_with_provider_items_input() {
+        let provider = Arc::new(MockLlmProvider::text_response("Items response", 60, 15));
+        let state = OpenAiState {
+            responses_enabled: true,
+            llm_provider: Some(provider),
+            gateway_token: Some("test-token".to_string()),
+            ..Default::default()
+        };
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "custom-model",
+            "input": [
+                {"type": "message", "role": "user", "content": "Hello"}
+            ]
+        }))
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer test-token".parse().unwrap());
+
+        let response =
+            responses_handler(State(state), headers, axum::body::Bytes::from(body)).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        assert_eq!(parsed["output"][0]["content"][0]["text"], "Items response");
+        // custom-model should be passed through as-is (not remapped)
+        assert_eq!(parsed["model"], "custom-model");
+    }
+
+    #[tokio::test]
+    async fn test_responses_with_instructions() {
+        let provider = Arc::new(MockLlmProvider::text_response("With instructions", 90, 30));
+        let state = OpenAiState {
+            responses_enabled: true,
+            llm_provider: Some(provider),
+            gateway_token: Some("test-token".to_string()),
+            ..Default::default()
+        };
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "moltbot",
+            "input": "Hello",
+            "instructions": "Be very helpful"
+        }))
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer test-token".parse().unwrap());
+
+        let response =
+            responses_handler(State(state), headers, axum::body::Bytes::from(body)).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        assert_eq!(
+            parsed["output"][0]["content"][0]["text"],
+            "With instructions"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_responses_no_user_message_returns_400() {
+        let provider = Arc::new(MockLlmProvider::text_response("should not reach", 0, 0));
+        let state = OpenAiState {
+            responses_enabled: true,
+            llm_provider: Some(provider),
+            gateway_token: Some("test-token".to_string()),
+            ..Default::default()
+        };
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "moltbot",
+            "input": [
+                {"type": "message", "role": "system", "content": "Be helpful"}
+            ]
+        }))
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer test-token".parse().unwrap());
+
+        let response =
+            responses_handler(State(state), headers, axum::body::Bytes::from(body)).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_responses_only_system_via_instructions_returns_400() {
+        let provider = Arc::new(MockLlmProvider::text_response("should not reach", 0, 0));
+        let state = OpenAiState {
+            responses_enabled: true,
+            llm_provider: Some(provider),
+            gateway_token: Some("test-token".to_string()),
+            ..Default::default()
+        };
+
+        // Items list has only system messages; instructions also provided.
+        // has_user_message check catches this first, returning 400.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "moltbot",
+            "input": [
+                {"type": "message", "role": "system", "content": "System only"}
+            ],
+            "instructions": "Extra system"
+        }))
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer test-token".parse().unwrap());
+
+        let response =
+            responses_handler(State(state), headers, axum::body::Bytes::from(body)).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_responses_provider_error_returns_500() {
+        let provider = Arc::new(MockLlmProvider::error_response("Service overloaded"));
+        let state = OpenAiState {
+            responses_enabled: true,
+            llm_provider: Some(provider),
+            gateway_token: Some("test-token".to_string()),
+            ..Default::default()
+        };
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "moltbot",
+            "input": "Hello"
+        }))
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer test-token".parse().unwrap());
+
+        let response =
+            responses_handler(State(state), headers, axum::body::Bytes::from(body)).await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(parsed["error"]["type"], "api_error");
+        assert!(parsed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Service overloaded"));
+    }
+
+    #[tokio::test]
+    async fn test_responses_disabled_returns_404() {
+        let state = OpenAiState {
+            responses_enabled: false,
+            gateway_token: Some("test-token".to_string()),
+            ..Default::default()
+        };
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "moltbot",
+            "input": "Hello"
+        }))
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer test-token".parse().unwrap());
+
+        let response =
+            responses_handler(State(state), headers, axum::body::Bytes::from(body)).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

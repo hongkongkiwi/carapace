@@ -340,6 +340,7 @@ pub struct PresenceEntry {
 
 /// Cached health snapshot
 #[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HealthSnapshot {
     pub ts: u64,
     pub status: String,
@@ -775,6 +776,11 @@ impl WsServerState {
             state_version: Some(state_version),
         };
 
+        let serialized = match serde_json::to_string(&frame) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
         let mut conns = self.connections.lock();
         let mut dead = Vec::new();
         for (conn_id, conn) in conns.iter() {
@@ -782,7 +788,7 @@ impl WsServerState {
             if conn.role == "node" {
                 continue;
             }
-            if send_json(&conn.tx, &frame).is_err() {
+            if send_text(&conn.tx, serialized.clone()).is_err() {
                 dead.push(conn_id.clone());
             }
         }
@@ -801,13 +807,18 @@ impl WsServerState {
             state_version: Some(state_version),
         };
 
+        let serialized = match serde_json::to_string(&frame) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
         let mut conns = self.connections.lock();
         let mut dead = Vec::new();
         for (conn_id, conn) in conns.iter() {
             if conn.role == "node" {
                 continue;
             }
-            if send_json(&conn.tx, &frame).is_err() {
+            if send_text(&conn.tx, serialized.clone()).is_err() {
                 dead.push(conn_id.clone());
             }
         }
@@ -1204,6 +1215,7 @@ pub(crate) struct StateVersion {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct HelloOkPayload {
     #[serde(rename = "type")]
     payload_type: &'static str,
@@ -1219,6 +1231,7 @@ struct HelloOkPayload {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ServerInfo {
     version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1234,12 +1247,11 @@ struct Features {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct Snapshot {
     presence: Vec<Value>,
     health: Value,
-    #[serde(rename = "stateVersion")]
     state_version: StateVersion,
-    #[serde(rename = "uptimeMs")]
     uptime_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     config_path: Option<String>,
@@ -2228,6 +2240,12 @@ fn send_json<T: Serialize>(tx: &mpsc::UnboundedSender<Message>, payload: &T) -> 
     tx.send(Message::Text(text)).map_err(|_| ())
 }
 
+/// Send a pre-serialized JSON string as a WebSocket text message.
+/// Used by broadcast paths to avoid re-serializing the same frame per connection.
+fn send_text(tx: &mpsc::UnboundedSender<Message>, text: String) -> Result<(), ()> {
+    tx.send(Message::Text(text)).map_err(|_| ())
+}
+
 fn send_event_to_connection(
     state: &WsServerState,
     conn_id: &str,
@@ -2271,6 +2289,10 @@ fn broadcast_event(state: &WsServerState, event: &str, payload: Value) {
         seq: Some(state.next_event_seq()),
         state_version: None,
     };
+    let serialized = match serde_json::to_string(&frame) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
     let required_scope = event_required_scope(event);
     let mut conns = state.connections.lock();
     let mut dead = Vec::new();
@@ -2283,7 +2305,7 @@ fn broadcast_event(state: &WsServerState, event: &str, payload: Value) {
                 continue;
             }
         }
-        if send_json(&conn.tx, &frame).is_err() {
+        if send_text(&conn.tx, serialized.clone()).is_err() {
             dead.push(conn_id.clone());
         }
     }
@@ -2418,10 +2440,14 @@ pub fn broadcast_voicewake_changed(state: &WsServerState, triggers: Vec<String>)
         seq: Some(state.next_event_seq()),
         state_version: None,
     };
+    let serialized = match serde_json::to_string(&frame) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
     let mut conns = state.connections.lock();
     let mut dead = Vec::new();
     for (conn_id, conn) in conns.iter() {
-        if send_json(&conn.tx, &frame).is_err() {
+        if send_text(&conn.tx, serialized.clone()).is_err() {
             dead.push(conn_id.clone());
         }
     }
@@ -2505,10 +2531,14 @@ pub fn broadcast_shutdown(state: &WsServerState, reason: &str, restart_expected_
         seq: Some(state.next_event_seq()),
         state_version: None,
     };
+    let serialized = match serde_json::to_string(&frame) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
     // Shutdown goes to all connections
     let conns = state.connections.lock();
     for conn in conns.values() {
-        let _ = send_json(&conn.tx, &frame);
+        let _ = send_text(&conn.tx, serialized.clone());
     }
 }
 

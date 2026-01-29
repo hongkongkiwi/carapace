@@ -70,12 +70,17 @@ fn read_exec_approvals_snapshot() -> ExecApprovalsSnapshot {
                 file,
             }
         }
-        Err(_) => ExecApprovalsSnapshot {
-            path: path_str,
-            exists: false,
-            hash: None,
-            file: json!({ "mode": "ask", "rules": [] }),
-        },
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %path_str, error = %e, "failed to read exec approvals file");
+            }
+            ExecApprovalsSnapshot {
+                path: path_str,
+                exists: false,
+                hash: None,
+                file: json!({ "mode": "ask", "rules": [] }),
+            }
+        }
     }
 }
 
@@ -113,6 +118,13 @@ fn write_exec_approvals_file(path: &PathBuf, file_value: &Value) -> Result<Strin
             error_shape(
                 ERROR_UNAVAILABLE,
                 &format!("failed to write exec approvals: {}", err),
+                None,
+            )
+        })?;
+        file.sync_all().map_err(|err| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("failed to sync exec approvals: {}", err),
                 None,
             )
         })?;
