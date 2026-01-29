@@ -826,12 +826,25 @@ impl SessionStore {
         let sessions = self.list_sessions(filter)?;
 
         let mut exported = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
         for session in &sessions {
-            let history = self.get_history(&session.id, None, None)?;
-            exported.push(serde_json::json!({
-                "session": session,
-                "messages": history,
-            }));
+            match self.get_history(&session.id, None, None) {
+                Ok(history) => {
+                    exported.push(serde_json::json!({
+                        "session": session,
+                        "messages": history,
+                    }));
+                }
+                Err(e) => {
+                    warn!(
+                        session_id = %session.id,
+                        user_id = %user_id,
+                        error = %e,
+                        "failed to export session history during user data export"
+                    );
+                    warnings.push(format!("failed to export session {}: {}", session.id, e));
+                }
+            }
         }
 
         Ok(serde_json::json!({
@@ -839,6 +852,7 @@ impl SessionStore {
             "exported_at": chrono::Utc::now().to_rfc3339(),
             "session_count": exported.len(),
             "sessions": exported,
+            "warnings": warnings,
         }))
     }
 
@@ -847,9 +861,10 @@ impl SessionStore {
     /// Deletes all sessions and their histories for the given user_id.
     /// Uses best-effort: logs individual failures and continues.
     /// Returns the number of sessions successfully deleted.
-    pub fn purge_user_data(&self, user_id: &str) -> Result<usize, SessionStoreError> {
+    pub fn purge_user_data(&self, user_id: &str) -> Result<(usize, usize), SessionStoreError> {
         let filter = SessionFilter::new().with_user_id(user_id);
         let sessions = self.list_sessions(filter)?;
+        let total = sessions.len();
         let mut deleted = 0;
 
         for session in &sessions {
@@ -865,7 +880,7 @@ impl SessionStore {
             }
         }
 
-        Ok(deleted)
+        Ok((deleted, total))
     }
 
     /// Delete sessions that have not been updated within the given retention period.
@@ -2785,5 +2800,175 @@ mod tests {
             result,
             Err(SessionStoreError::InvalidSessionKey(_))
         ));
+    }
+
+    // ==================== Export / Purge User Data Tests ====================
+
+    #[test]
+    fn test_export_user_data_empty() {
+        let (store, _temp) = create_test_store();
+
+        let result = store.export_user_data("nonexistent-user").unwrap();
+
+        assert_eq!(result["user_id"], "nonexistent-user");
+        assert_eq!(result["session_count"], 0);
+        assert!(result["sessions"].as_array().unwrap().is_empty());
+        assert!(result["warnings"].as_array().unwrap().is_empty());
+        assert!(result["exported_at"].as_str().is_some());
+    }
+
+    #[test]
+    fn test_export_user_data_with_sessions() {
+        let (store, _temp) = create_test_store();
+
+        // Create two sessions for user-1
+        let s1 = store
+            .create_session(
+                "agent-1",
+                SessionMetadata {
+                    user_id: Some("user-1".into()),
+                    channel: Some("telegram".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let s2 = store
+            .create_session(
+                "agent-1",
+                SessionMetadata {
+                    user_id: Some("user-1".into()),
+                    channel: Some("discord".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        // Add messages to both sessions
+        store
+            .append_message(ChatMessage::user(&s1.id, "Hello from session 1"))
+            .unwrap();
+        store
+            .append_message(ChatMessage::assistant(&s1.id, "Hi there!"))
+            .unwrap();
+        store
+            .append_message(ChatMessage::user(&s2.id, "Hello from session 2"))
+            .unwrap();
+
+        let result = store.export_user_data("user-1").unwrap();
+
+        assert_eq!(result["user_id"], "user-1");
+        assert_eq!(result["session_count"], 2);
+
+        let sessions = result["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 2);
+
+        // Verify each exported session has both "session" and "messages" keys
+        for exported in sessions {
+            assert!(exported["session"].is_object());
+            assert!(exported["messages"].is_array());
+        }
+
+        assert!(result["warnings"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_purge_user_data_empty() {
+        let (store, _temp) = create_test_store();
+
+        let (deleted, total) = store.purge_user_data("nonexistent-user").unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn test_purge_user_data_deletes_user_sessions() {
+        let (store, _temp) = create_test_store();
+
+        // Create sessions for user-1
+        let s1 = store
+            .create_session(
+                "agent-1",
+                SessionMetadata {
+                    user_id: Some("user-1".into()),
+                    channel: Some("telegram".into()),
+                    chat_id: Some("u1-chat1".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .create_session(
+                "agent-1",
+                SessionMetadata {
+                    user_id: Some("user-1".into()),
+                    channel: Some("discord".into()),
+                    chat_id: Some("u1-chat2".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        // Create session for user-2
+        let s3 = store
+            .create_session(
+                "agent-1",
+                SessionMetadata {
+                    user_id: Some("user-2".into()),
+                    channel: Some("telegram".into()),
+                    chat_id: Some("u2-chat1".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        // Add messages
+        store
+            .append_message(ChatMessage::user(&s1.id, "Hello"))
+            .unwrap();
+
+        // Purge user-1
+        let (deleted, total) = store.purge_user_data("user-1").unwrap();
+        assert_eq!(deleted, 2);
+        assert_eq!(total, 2);
+
+        // Verify user-1 sessions are gone
+        let user1_sessions = store
+            .list_sessions(SessionFilter::new().with_user_id("user-1"))
+            .unwrap();
+        assert!(user1_sessions.is_empty());
+
+        // Verify user-2 sessions are still intact
+        let user2_sessions = store
+            .list_sessions(SessionFilter::new().with_user_id("user-2"))
+            .unwrap();
+        assert_eq!(user2_sessions.len(), 1);
+        assert_eq!(user2_sessions[0].id, s3.id);
+    }
+
+    #[test]
+    fn test_purge_user_data_returns_total() {
+        let (store, _temp) = create_test_store();
+
+        // Create 3 sessions for user-1
+        for i in 0..3 {
+            store
+                .create_session(
+                    "agent-1",
+                    SessionMetadata {
+                        user_id: Some("user-1".into()),
+                        channel: Some(format!("ch-{}", i)),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+
+        let (deleted, total) = store.purge_user_data("user-1").unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(
+            deleted, total,
+            "all sessions should be successfully deleted"
+        );
     }
 }
