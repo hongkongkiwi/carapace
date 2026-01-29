@@ -26,7 +26,7 @@ use std::time::Duration;
 use axum::routing::get;
 use axum::Router;
 use serde_json::Value;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -182,15 +182,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal(shutdown_tx))
+    .with_graceful_shutdown(shutdown_signal(shutdown_tx, ws_state.clone()))
     .await?;
 
     info!("Gateway shut down");
     Ok(())
 }
 
-async fn shutdown_signal(tx: tokio::sync::watch::Sender<bool>) {
-    tokio::signal::ctrl_c().await.ok();
-    info!("Shutdown signal received");
+async fn shutdown_signal(
+    tx: tokio::sync::watch::Sender<bool>,
+    ws_state: Arc<server::ws::WsServerState>,
+) {
+    let reason = await_shutdown_trigger().await;
+    info!("Shutdown signal received ({})", reason);
+
+    // Notify background tasks to stop
     let _ = tx.send(true);
+
+    // Broadcast shutdown event to all connected WebSocket clients
+    server::ws::broadcast_shutdown(&ws_state, reason, None);
+
+    // Flush dirty sessions to disk
+    if let Err(e) = ws_state.session_store().flush_all() {
+        error!("Failed to flush session store during shutdown: {}", e);
+    }
+
+    // Brief grace period for in-flight operations to complete
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    info!("Graceful shutdown complete");
+}
+
+/// Wait for either Ctrl+C or SIGTERM (Unix only) and return a label for logging.
+#[cfg(unix)]
+async fn await_shutdown_trigger() -> &'static str {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => "ctrl-c",
+        _ = sigterm.recv() => "SIGTERM",
+    }
+}
+
+/// On non-Unix platforms, only Ctrl+C is available.
+#[cfg(not(unix))]
+async fn await_shutdown_trigger() -> &'static str {
+    tokio::signal::ctrl_c()
+        .await
+        .expect("failed to install Ctrl+C handler");
+    "ctrl-c"
 }

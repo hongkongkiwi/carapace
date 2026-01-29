@@ -121,6 +121,13 @@ fn write_exec_approvals_file(path: &PathBuf, file_value: &Value) -> Result<Strin
                 None,
             )
         })?;
+        file.sync_all().map_err(|err| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("failed to sync exec approvals: {}", err),
+                None,
+            )
+        })?;
     }
     if let Err(err) = fs::rename(&tmp_path, path) {
         return Err(error_shape(

@@ -194,6 +194,13 @@ fn write_skills_manifest(skills_dir: &Path, manifest: &Value) -> Result<(), Erro
                 None,
             )
         })?;
+        file.sync_all().map_err(|e| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("failed to sync skills manifest: {}", e),
+                None,
+            )
+        })?;
     }
     std::fs::rename(&tmp_path, &manifest_path).map_err(|e| {
         error_shape(
@@ -294,6 +301,13 @@ fn download_skill_wasm(
             error_shape(
                 ERROR_UNAVAILABLE,
                 &format!("failed to write skill binary: {}", e),
+                None,
+            )
+        })?;
+        file.sync_all().map_err(|e| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("failed to sync skill binary: {}", e),
                 None,
             )
         })?;

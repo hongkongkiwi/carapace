@@ -1137,6 +1137,7 @@ impl SessionStore {
             }
 
             writer.flush()?;
+            writer.get_ref().sync_all()?;
         }
 
         // Atomic rename
@@ -1261,6 +1262,7 @@ impl SessionStore {
             let writer = BufWriter::new(file);
             serde_json::to_writer_pretty(writer, &archived)?;
         }
+        File::open(&temp_path)?.sync_all()?;
 
         // Atomic rename
         fs::rename(&temp_path, &archive_path)?;
@@ -1555,6 +1557,7 @@ impl SessionStore {
             let writer = BufWriter::new(file);
             serde_json::to_writer_pretty(writer, session)?;
         }
+        File::open(&temp_path)?.sync_all()?;
 
         // Atomic rename
         fs::rename(&temp_path, &meta_path)?;

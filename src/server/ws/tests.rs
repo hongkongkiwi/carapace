@@ -2216,3 +2216,82 @@ fn test_node_describe_merges_paired_metadata_with_live_data() {
     assert_eq!(result["connected"], true);
     assert_eq!(result["paired"], true);
 }
+
+#[tokio::test]
+async fn test_shutdown_watch_channel_propagates() {
+    let (tx, mut rx) = tokio::sync::watch::channel(false);
+
+    // Initially not shut down
+    assert!(!*rx.borrow());
+
+    // Simulate shutdown signal
+    tx.send(true).unwrap();
+
+    // Receiver should observe the change
+    rx.changed().await.unwrap();
+    assert!(*rx.borrow());
+}
+
+#[tokio::test]
+async fn test_shutdown_watch_channel_multiple_receivers() {
+    let (tx, rx1) = tokio::sync::watch::channel(false);
+    let mut rx2 = rx1.clone();
+    let mut rx3 = rx1.clone();
+
+    // All receivers start as false
+    assert!(!*rx1.borrow());
+    assert!(!*rx2.borrow());
+    assert!(!*rx3.borrow());
+
+    // Trigger shutdown
+    tx.send(true).unwrap();
+
+    // All receivers see the update
+    rx2.changed().await.unwrap();
+    rx3.changed().await.unwrap();
+    assert!(*rx2.borrow());
+    assert!(*rx3.borrow());
+}
+
+#[test]
+fn test_broadcast_shutdown_notifies_connected_clients() {
+    let state = Arc::new(WsServerState::new(WsServerConfig::default()));
+
+    // Register a mock connection
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let conn = ConnectionContext {
+        conn_id: "conn-shutdown-test".to_string(),
+        role: "operator".to_string(),
+        scopes: vec![],
+        client: ClientInfo {
+            id: "test".to_string(),
+            version: "1.0".to_string(),
+            platform: "test".to_string(),
+            mode: "test".to_string(),
+            display_name: None,
+            device_family: None,
+            model_identifier: None,
+            instance_id: None,
+        },
+        device_id: None,
+    };
+    state.register_connection(&conn, tx, None);
+
+    // Drain any messages sent during registration (e.g. presence broadcast)
+    while rx.try_recv().is_ok() {}
+
+    // Broadcast shutdown
+    broadcast_shutdown(&state, "SIGTERM", None);
+
+    // The connected client should receive a shutdown event frame
+    let msg = rx
+        .try_recv()
+        .expect("should have received shutdown message");
+    let text = match msg {
+        Message::Text(t) => t,
+        other => panic!("expected text message, got {:?}", other),
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed["event"], "shutdown");
+    assert_eq!(parsed["payload"]["reason"], "SIGTERM");
+}
