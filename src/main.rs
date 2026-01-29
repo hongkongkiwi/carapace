@@ -66,7 +66,7 @@ enum Commands {
 
         /// Bind address (host:port)
         #[arg(short, long, default_value = DEFAULT_BIND)]
-        bind: String,
+        bind: SocketAddr,
 
         /// Enable development mode (localhost-only, no auth required)
         #[arg(long)]
@@ -276,7 +276,7 @@ async fn main() {
 
             // Start server
             if let Err(e) = start_server(
-                bind.parse().expect("Invalid bind address"),
+                bind,
                 http_config,
                 middleware_config,
                 pid_file,
@@ -566,8 +566,22 @@ fn read_pid_file(path: &Path) -> Option<u32> {
 fn is_process_running(pid: u32) -> bool {
     #[cfg(unix)]
     {
+        use std::io;
+
         // Send signal 0 to check if process exists
-        unsafe { libc::kill(pid as i32, 0) == 0 }
+        let result = unsafe { libc::kill(pid as i32, 0) };
+        if result == 0 {
+            true // Signal succeeded, process exists
+        } else {
+            let errno = io::Error::last_os_error();
+            if errno.kind() == io::ErrorKind::PermissionDenied {
+                // EPERM - process exists but we don't have permission
+                true
+            } else {
+                // Other error (e.g., ESRCH - no such process)
+                false
+            }
+        }
     }
     #[cfg(windows)]
     {
@@ -614,12 +628,14 @@ async fn start_server(
     info!("PID file written to {}", pid_file.display());
 
     // Start server with graceful shutdown
-    axum::serve(listener, app)
+    let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
-        .await?;
+        .await;
 
-    // Clean up PID file
+    // Clean up PID file regardless of serve result
     let _ = fs::remove_file(&pid_file);
+
+    serve_result?;
     info!("Gateway stopped");
 
     Ok(())

@@ -594,6 +594,7 @@ dependencies = [
  "uuid",
  "wasmtime",
  "wasmtime-wasi",
+ "windows-sys 0.52.0",
  "wit-bindgen 0.22.0",
 ]
 
