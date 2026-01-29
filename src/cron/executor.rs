@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use crate::cron::CronPayload;
 use crate::server::ws::{SystemEvent, WsServerState};
+use tokio_util::sync::CancellationToken;
 
 /// Outcome of executing a cron payload.
 #[derive(Debug)]
@@ -71,6 +72,7 @@ pub async fn execute_payload(
             };
 
             // Register the agent run
+            let cancel_token = CancellationToken::new();
             {
                 use crate::server::ws::{AgentRunRegistry, AgentRunStatus};
                 let now = std::time::SystemTime::now()
@@ -88,6 +90,7 @@ pub async fn execute_payload(
                     created_at: now,
                     started_at: None,
                     completed_at: None,
+                    cancel_token: cancel_token.clone(),
                     waiters: Vec::new(),
                 });
             }
@@ -100,6 +103,7 @@ pub async fn execute_payload(
                     config,
                     state.clone(),
                     provider.clone(),
+                    cancel_token,
                 );
             } else {
                 return Err("no LLM provider configured".to_string());

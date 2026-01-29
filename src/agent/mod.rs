@@ -14,6 +14,7 @@ use std::sync::Arc;
 use crate::server::ws::WsServerState;
 pub use executor::execute_run;
 pub use provider::{LlmProvider, StreamEvent};
+use tokio_util::sync::CancellationToken;
 
 /// Default LLM model used when none is specified.
 pub const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
@@ -86,10 +87,18 @@ pub fn spawn_run(
     config: AgentConfig,
     state: Arc<WsServerState>,
     provider: Arc<dyn LlmProvider>,
+    cancel_token: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let result =
-            execute_run(run_id.clone(), session_key, config, state.clone(), provider).await;
+        let result = execute_run(
+            run_id.clone(),
+            session_key,
+            config,
+            state.clone(),
+            provider,
+            cancel_token,
+        )
+        .await;
 
         if let Err(e) = result {
             tracing::error!(run_id = %run_id, error = %e, "agent run failed");
