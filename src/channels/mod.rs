@@ -4,7 +4,10 @@
 //! and their connection states.
 
 pub mod console;
+pub mod line;
 pub mod webhook;
+
+pub use line::*;
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
