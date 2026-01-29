@@ -65,7 +65,7 @@ enum Commands {
 
         /// Bind address (host:port)
         #[arg(short, long, default_value = DEFAULT_BIND)]
-        bind: String,
+        bind: SocketAddr,
 
         /// Enable development mode (localhost-only, no auth required)
         #[arg(long)]
@@ -275,7 +275,7 @@ async fn main() {
 
             // Start server
             if let Err(e) = start_server(
-                bind.parse().expect("Invalid bind address"),
+                bind,
                 http_config,
                 middleware_config,
                 pid_file,
@@ -297,6 +297,14 @@ async fn main() {
                     process::exit(1);
                 }
             };
+
+            // Check if process is actually running before attempting to stop
+            if !is_process_running(pid) {
+                // Stale PID file, remove it
+                let _ = fs::remove_file(&pid_file);
+                eprintln!("Error: Gateway is not running (stale PID file removed).");
+                process::exit(1);
+            }
 
             info!("Stopping gateway (PID: {})...", pid);
 
@@ -483,7 +491,7 @@ async fn main() {
                     }
                 }
 
-                ConfigCommands::Set { key, value, config } => {
+                ConfigCommands::Set { key, value, config: _ } => {
                     println!("Setting {} = {} (not yet implemented)", key, value);
                     // TODO: Implement config setting
                 }
@@ -608,17 +616,24 @@ async fn start_server(
     info!("Server listening on {}", addr);
 
     // Write PID file
+    if let Some(parent) = pid_file.parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent)?;
+        }
+    }
     let pid = std::process::id();
     fs::write(&pid_file, pid.to_string())?;
     info!("PID file written to {}", pid_file.display());
 
     // Start server with graceful shutdown
-    axum::serve(listener, app)
+    let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
-        .await?;
+        .await;
 
-    // Clean up PID file
+    // Clean up PID file regardless of serve result
     let _ = fs::remove_file(&pid_file);
+
+    serve_result?;
     info!("Gateway stopped");
 
     Ok(())
