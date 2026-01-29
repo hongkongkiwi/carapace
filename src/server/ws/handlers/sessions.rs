@@ -1021,7 +1021,8 @@ pub(super) fn handle_sessions_export_user(
             )
         })?;
 
-    Ok(json!({ "ok": true, "data": data }))
+    let warnings = data.get("warnings").cloned().unwrap_or(json!([]));
+    Ok(json!({ "ok": true, "data": data, "warnings": warnings }))
 }
 
 /// Handle sessions.purge_user — GDPR right to erasure (Art. 17)
@@ -1035,7 +1036,7 @@ pub(super) fn handle_sessions_purge_user(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "userId is required", None))?;
 
-    let count = state
+    let (deleted, total) = state
         .session_store
         .purge_user_data(user_id)
         .map_err(|err| {
@@ -1046,7 +1047,12 @@ pub(super) fn handle_sessions_purge_user(
             )
         })?;
 
-    Ok(json!({ "ok": true, "userId": user_id, "sessionsDeleted": count }))
+    Ok(json!({
+        "ok": true,
+        "userId": user_id,
+        "sessionsDeleted": deleted,
+        "sessionsTotal": total,
+    }))
 }
 
 pub(super) fn handle_sessions_compact(
@@ -2627,6 +2633,8 @@ mod tests {
         assert_eq!(exported_sessions.len(), 1);
         let messages = exported_sessions[0]["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 1);
+        assert!(result["warnings"].is_array());
+        assert_eq!(result["warnings"].as_array().unwrap().len(), 0);
     }
 
     #[test]
@@ -2653,6 +2661,7 @@ mod tests {
         let result = handle_sessions_purge_user(&state, Some(&params)).unwrap();
         assert_eq!(result["ok"], true);
         assert_eq!(result["sessionsDeleted"], 0);
+        assert_eq!(result["sessionsTotal"], 0);
     }
 
     #[test]
@@ -2682,6 +2691,7 @@ mod tests {
         let result = handle_sessions_purge_user(&state, Some(&params)).unwrap();
         assert_eq!(result["ok"], true);
         assert_eq!(result["sessionsDeleted"], 3);
+        assert_eq!(result["sessionsTotal"], 3);
 
         // Verify the other user's session is still there
         let remaining = state
