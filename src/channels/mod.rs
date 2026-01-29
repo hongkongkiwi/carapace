@@ -4,8 +4,12 @@
 //! and their connection states.
 
 pub mod telegram;
+pub mod signal;
+pub mod imessage;
 
 pub use telegram::*;
+pub use signal::*;
+pub use imessage::*;
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
