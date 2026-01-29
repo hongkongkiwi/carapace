@@ -340,6 +340,7 @@ pub struct PresenceEntry {
 
 /// Cached health snapshot
 #[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HealthSnapshot {
     pub ts: u64,
     pub status: String,
@@ -1204,6 +1205,7 @@ pub(crate) struct StateVersion {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct HelloOkPayload {
     #[serde(rename = "type")]
     payload_type: &'static str,
@@ -1219,6 +1221,7 @@ struct HelloOkPayload {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ServerInfo {
     version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1234,12 +1237,11 @@ struct Features {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct Snapshot {
     presence: Vec<Value>,
     health: Value,
-    #[serde(rename = "stateVersion")]
     state_version: StateVersion,
-    #[serde(rename = "uptimeMs")]
     uptime_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     config_path: Option<String>,

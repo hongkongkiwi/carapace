@@ -39,6 +39,7 @@ pub struct WizardManager {
 
 /// A wizard session
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WizardSession {
     /// Unique wizard ID
     pub id: String,
@@ -66,6 +67,7 @@ pub struct WizardSession {
 
 /// A single wizard step
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WizardStep {
     /// Step identifier
     pub id: String,
@@ -95,6 +97,7 @@ pub struct WizardOption {
 
 /// Validation rules for wizard inputs
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WizardValidation {
     pub min_length: Option<usize>,
     pub max_length: Option<usize>,

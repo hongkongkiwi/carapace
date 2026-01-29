@@ -657,7 +657,9 @@ impl DevicePairingRegistry {
             .insert(request.request_id.clone(), request.clone());
         drop(store);
 
-        let _ = self.save();
+        if let Err(e) = self.save() {
+            tracing::error!(error = %e, "failed to persist device registry state to disk");
+        }
         Ok(PairingRequestOutcome {
             request,
             created: true,
@@ -777,7 +779,9 @@ impl DevicePairingRegistry {
             .insert(token_entry.token_hash.clone(), token_entry);
 
         drop(store);
-        let _ = self.save();
+        if let Err(e) = self.save() {
+            tracing::error!(error = %e, "failed to persist device registry state to disk");
+        }
 
         Ok((paired_device, plain_token))
     }
@@ -803,7 +807,9 @@ impl DevicePairingRegistry {
         let result = request.clone();
         drop(store);
 
-        let _ = self.save();
+        if let Err(e) = self.save() {
+            tracing::error!(error = %e, "failed to persist device registry state to disk");
+        }
         Ok(result)
     }
 
@@ -902,7 +908,9 @@ impl DevicePairingRegistry {
         device.touch();
 
         drop(store);
-        let _ = self.save();
+        if let Err(e) = self.save() {
+            tracing::error!(error = %e, "failed to persist device registry state to disk");
+        }
         Ok(())
     }
 
@@ -922,7 +930,9 @@ impl DevicePairingRegistry {
         }
 
         drop(store);
-        let _ = self.save();
+        if let Err(e) = self.save() {
+            tracing::error!(error = %e, "failed to persist device registry state to disk");
+        }
         Ok(device)
     }
 
@@ -1033,7 +1043,9 @@ impl DevicePairingRegistry {
             .insert(token_entry.token_hash.clone(), token_entry);
 
         drop(store);
-        let _ = self.save();
+        if let Err(e) = self.save() {
+            tracing::error!(error = %e, "failed to persist device registry state to disk");
+        }
 
         Ok(IssuedDeviceToken {
             token: plain_token,
@@ -1140,7 +1152,9 @@ impl DevicePairingRegistry {
             .insert(token_entry.token_hash.clone(), token_entry);
 
         drop(store);
-        let _ = self.save();
+        if let Err(e) = self.save() {
+            tracing::error!(error = %e, "failed to persist device registry state to disk");
+        }
 
         Ok(IssuedDeviceToken {
             token: plain_token,
@@ -1171,7 +1185,9 @@ impl DevicePairingRegistry {
         }
 
         drop(store);
-        let _ = self.save();
+        if let Err(e) = self.save() {
+            tracing::error!(error = %e, "failed to persist device registry state to disk");
+        }
 
         Ok(now_ms())
     }
@@ -1193,7 +1209,9 @@ impl DevicePairingRegistry {
         }
 
         drop(store);
-        let _ = self.save();
+        if let Err(e) = self.save() {
+            tracing::error!(error = %e, "failed to persist device registry state to disk");
+        }
 
         Ok(count)
     }

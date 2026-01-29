@@ -664,7 +664,9 @@ impl NodePairingRegistry {
             .insert(request.request_id.clone(), request.clone());
         drop(store);
 
-        let _ = self.save();
+        if let Err(e) = self.save() {
+            tracing::error!(error = %e, "failed to persist node pairing state to disk");
+        }
         Ok(NodePairingOutcome {
             request,
             created: true,
@@ -763,7 +765,9 @@ impl NodePairingRegistry {
             .insert(token_entry.token_hash.clone(), token_entry);
 
         drop(store);
-        let _ = self.save();
+        if let Err(e) = self.save() {
+            tracing::error!(error = %e, "failed to persist node pairing state to disk");
+        }
 
         Ok((paired_node, plain_token))
     }
@@ -789,7 +793,9 @@ impl NodePairingRegistry {
         let result = request.clone();
         drop(store);
 
-        let _ = self.save();
+        if let Err(e) = self.save() {
+            tracing::error!(error = %e, "failed to persist node pairing state to disk");
+        }
         Ok(result)
     }
 
@@ -828,7 +834,9 @@ impl NodePairingRegistry {
         let result = node.clone();
         drop(store);
 
-        let _ = self.save();
+        if let Err(e) = self.save() {
+            tracing::error!(error = %e, "failed to persist node pairing state to disk");
+        }
         Ok(result)
     }
 
@@ -857,7 +865,9 @@ impl NodePairingRegistry {
         }
 
         drop(store);
-        let _ = self.save();
+        if let Err(e) = self.save() {
+            tracing::error!(error = %e, "failed to persist node pairing state to disk");
+        }
         Ok(node)
     }
 
@@ -927,7 +937,9 @@ impl NodePairingRegistry {
             .insert(token_entry.token_hash.clone(), token_entry);
 
         drop(store);
-        let _ = self.save();
+        if let Err(e) = self.save() {
+            tracing::error!(error = %e, "failed to persist node pairing state to disk");
+        }
 
         Ok(plain_token)
     }
@@ -949,7 +961,9 @@ impl NodePairingRegistry {
         }
 
         drop(store);
-        let _ = self.save();
+        if let Err(e) = self.save() {
+            tracing::error!(error = %e, "failed to persist node pairing state to disk");
+        }
 
         Ok(count)
     }
