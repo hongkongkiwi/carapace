@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use super::super::*;
 use super::config::{map_validation_issues, read_config_snapshot, write_config_file};
+use crate::plugins::capabilities::SsrfProtection;
 
 /// WASM binary magic bytes: `\0asm`
 const WASM_MAGIC: [u8; 4] = [0x00, 0x61, 0x73, 0x6D];
@@ -219,6 +220,15 @@ fn download_skill_wasm(
     skills_dir: &Path,
     file_name: &str,
 ) -> Result<PathBuf, ErrorShape> {
+    // Validate URL against SSRF attacks (blocks localhost, private IPs, metadata endpoints)
+    SsrfProtection::validate_url(url.as_str()).map_err(|e| {
+        error_shape(
+            ERROR_INVALID_REQUEST,
+            &format!("skill download URL blocked by SSRF protection: {}", e),
+            None,
+        )
+    })?;
+
     std::fs::create_dir_all(skills_dir).map_err(|e| {
         error_shape(
             ERROR_UNAVAILABLE,
@@ -781,6 +791,70 @@ mod tests {
         assert!(err.message.contains("invalid url"));
     }
 
+    // ---- SSRF protection tests for skill downloads ----
+
+    #[test]
+    fn test_download_skill_ssrf_public_url_passes_validation() {
+        // A public URL should pass SSRF validation (will fail later at the network level,
+        // but the SSRF check itself should not reject it).
+        let dir = TempDir::new().unwrap();
+        let url = url::Url::parse("https://example.com/skills/my-skill.wasm").unwrap();
+        let result = download_skill_wasm(&url, dir.path(), "test.wasm");
+        // Should fail with a network error, NOT an SSRF error
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            !err.message.contains("SSRF"),
+            "public URL should not be blocked by SSRF protection, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_download_skill_ssrf_rejects_localhost() {
+        let dir = TempDir::new().unwrap();
+        let url = url::Url::parse("http://localhost/evil.wasm").unwrap();
+        let result = download_skill_wasm(&url, dir.path(), "test.wasm");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(
+            err.message.contains("SSRF"),
+            "localhost should be blocked by SSRF protection, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_download_skill_ssrf_rejects_metadata_endpoint() {
+        let dir = TempDir::new().unwrap();
+        let url = url::Url::parse("http://169.254.169.254/latest/meta-data/").unwrap();
+        let result = download_skill_wasm(&url, dir.path(), "test.wasm");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(
+            err.message.contains("SSRF"),
+            "metadata endpoint should be blocked by SSRF protection, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_download_skill_ssrf_rejects_internal_ip() {
+        let dir = TempDir::new().unwrap();
+        let url = url::Url::parse("http://10.0.0.1/internal-skill.wasm").unwrap();
+        let result = download_skill_wasm(&url, dir.path(), "test.wasm");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(
+            err.message.contains("SSRF"),
+            "internal IP should be blocked by SSRF protection, got: {}",
+            err.message
+        );
+    }
+
     // ---- Manifest read/write tests ----
 
     #[test]
@@ -1058,15 +1132,16 @@ mod tests {
 
     #[test]
     fn test_download_skill_wasm_connection_refused() {
-        // Attempting to download from a port that is not listening
+        // 127.0.0.1 is now blocked by SSRF protection before any network request is made
         let dir = TempDir::new().unwrap();
         let url = url::Url::parse("http://127.0.0.1:1/nonexistent.wasm").unwrap();
         let result = download_skill_wasm(&url, dir.path(), "test.wasm");
         assert!(result.is_err());
         let err = result.unwrap_err();
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
         assert!(
-            err.message.contains("failed to download skill"),
-            "unexpected error message: {}",
+            err.message.contains("SSRF"),
+            "127.0.0.1 should be blocked by SSRF protection, got: {}",
             err.message
         );
     }

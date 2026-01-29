@@ -563,12 +563,17 @@ mod tests {
 
     #[test]
     fn test_csrf_token_expiry() {
+        // Use a zero TTL so the token is immediately expired.
+        // Avoids subtracting a large duration from Instant::now(), which panics
+        // on Windows when the result would precede the process start time.
         let token = CsrfToken {
             value: "test".to_string(),
-            created_at: Instant::now() - Duration::from_secs(7200), // 2 hours ago
-            ttl: Duration::from_secs(3600),                         // 1 hour TTL
+            created_at: Instant::now(),
+            ttl: Duration::from_secs(0), // already expired
         };
 
+        // Give a tiny delay so elapsed() > 0
+        std::thread::sleep(Duration::from_millis(1));
         assert!(token.is_expired());
     }
 

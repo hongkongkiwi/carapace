@@ -17,6 +17,9 @@ const MAX_COMPLETED_MESSAGES: usize = 10_000;
 /// TTL for completed messages (1 hour)
 const COMPLETED_MESSAGE_TTL_MS: i64 = 3600 * 1000;
 
+/// TTL for idempotency keys (24 hours)
+const IDEMPOTENCY_KEY_TTL_MS: i64 = 24 * 3600 * 1000;
+
 /// Unique identifier for a message in the pipeline
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MessageId(pub String);
@@ -407,6 +410,15 @@ pub struct ChannelStats {
     pub queue_size: usize,
 }
 
+/// Tracks an idempotency key to prevent duplicate message delivery.
+#[derive(Debug, Clone)]
+struct IdempotencyEntry {
+    /// The message ID that was created for this idempotency key
+    message_id: MessageId,
+    /// When this entry was recorded (Unix ms)
+    created_at: i64,
+}
+
 /// Message pipeline for queuing outbound messages
 ///
 /// This is a skeleton implementation - actual delivery logic
@@ -416,6 +428,8 @@ pub struct MessagePipeline {
     queues: RwLock<HashMap<String, VecDeque<QueuedMessage>>>,
     /// Message lookup by ID
     messages: RwLock<HashMap<String, QueuedMessage>>,
+    /// Idempotency key deduplication store: key -> entry
+    idempotency_keys: RwLock<HashMap<String, IdempotencyEntry>>,
     /// Maximum queue size per channel
     max_queue_size: usize,
     /// Statistics counters
@@ -431,6 +445,7 @@ impl std::fmt::Debug for MessagePipeline {
         f.debug_struct("MessagePipeline")
             .field("queues", &self.queues)
             .field("messages", &self.messages)
+            .field("idempotency_keys", &self.idempotency_keys)
             .field("max_queue_size", &self.max_queue_size)
             .field("notify", &"Notify")
             .finish()
@@ -454,6 +469,7 @@ impl MessagePipeline {
         Self {
             queues: RwLock::new(HashMap::new()),
             messages: RwLock::new(HashMap::new()),
+            idempotency_keys: RwLock::new(HashMap::new()),
             max_queue_size,
             stats_queued: AtomicU64::new(0),
             stats_sent: AtomicU64::new(0),
@@ -475,6 +491,49 @@ impl MessagePipeline {
         message: OutboundMessage,
         context: OutboundContext,
     ) -> Result<QueueResult, PipelineError> {
+        self.queue_with_idempotency(message, context, None)
+    }
+
+    /// Queue a message for delivery with an explicit idempotency key.
+    ///
+    /// If `idempotency_key` is `Some` and matches an already-queued or
+    /// delivered message within the TTL window (24 hours), the original
+    /// message's status is returned without creating a duplicate entry.
+    pub fn queue_with_idempotency(
+        &self,
+        message: OutboundMessage,
+        context: OutboundContext,
+        idempotency_key: Option<&str>,
+    ) -> Result<QueueResult, PipelineError> {
+        // Check idempotency key for deduplication
+        if let Some(key) = idempotency_key {
+            let now = now_millis();
+            let idempotency_store = self.idempotency_keys.read();
+            if let Some(entry) = idempotency_store.get(key) {
+                if now - entry.created_at < IDEMPOTENCY_KEY_TTL_MS {
+                    // Return existing message status
+                    let messages = self.messages.read();
+                    if let Some(queued) = messages.get(&entry.message_id.0) {
+                        return Ok(QueueResult {
+                            message_id: entry.message_id.clone(),
+                            status: queued.status,
+                            queue_position: None,
+                            delivery_result: None,
+                        });
+                    }
+                    // Message was cleaned up but key still present; return
+                    // the recorded message ID with a Sent status as a
+                    // best-effort indicator that the message was processed.
+                    return Ok(QueueResult {
+                        message_id: entry.message_id.clone(),
+                        status: DeliveryStatus::Sent,
+                        queue_position: None,
+                        delivery_result: None,
+                    });
+                }
+            }
+        }
+
         let channel_id = message.channel_id.clone();
         let message_id = message.id.clone();
 
@@ -502,6 +561,18 @@ impl MessagePipeline {
         {
             let mut messages = self.messages.write();
             messages.insert(message_id.0.clone(), queued);
+        }
+
+        // Record idempotency key
+        if let Some(key) = idempotency_key {
+            let mut idempotency_store = self.idempotency_keys.write();
+            idempotency_store.insert(
+                key.to_string(),
+                IdempotencyEntry {
+                    message_id: message_id.clone(),
+                    created_at: now_millis(),
+                },
+            );
         }
 
         self.stats_queued.fetch_add(1, Ordering::Relaxed);
@@ -699,7 +770,7 @@ impl MessagePipeline {
         self.cleanup_completed();
     }
 
-    /// Remove completed messages older than TTL
+    /// Remove completed messages older than TTL and expired idempotency keys.
     pub fn cleanup_completed(&self) -> usize {
         let now = now_millis();
         let cutoff = now - COMPLETED_MESSAGE_TTL_MS;
@@ -716,6 +787,11 @@ impl MessagePipeline {
             // Remove if completed and older than TTL
             msg.updated_at > cutoff
         });
+
+        // Clean up expired idempotency keys
+        let idempotency_cutoff = now - IDEMPOTENCY_KEY_TTL_MS;
+        let mut idempotency_store = self.idempotency_keys.write();
+        idempotency_store.retain(|_, entry| entry.created_at > idempotency_cutoff);
 
         before - messages.len()
     }
@@ -780,8 +856,10 @@ impl MessagePipeline {
     pub fn clear(&self) {
         let mut queues = self.queues.write();
         let mut messages = self.messages.write();
+        let mut idempotency_store = self.idempotency_keys.write();
         queues.clear();
         messages.clear();
+        idempotency_store.clear();
     }
 
     /// List all channel IDs with queued messages
@@ -1247,5 +1325,203 @@ mod tests {
         let parsed: PipelineStats = serde_json::from_str(&json).unwrap();
 
         assert_eq!(parsed.total_queued, 1);
+    }
+
+    #[test]
+    fn test_idempotency_first_send_succeeds() {
+        let pipeline = MessagePipeline::new();
+        let msg = OutboundMessage::new("telegram", MessageContent::text("Hello"));
+        let ctx = OutboundContext::new();
+
+        let result = pipeline
+            .queue_with_idempotency(msg, ctx, Some("idem-key-1"))
+            .unwrap();
+
+        assert_eq!(result.status, DeliveryStatus::Queued);
+        assert!(result.queue_position.is_some());
+        assert_eq!(pipeline.queue_size("telegram"), 1);
+    }
+
+    #[test]
+    fn test_idempotency_duplicate_returns_original() {
+        let pipeline = MessagePipeline::new();
+
+        // First send
+        let msg1 = OutboundMessage::new("telegram", MessageContent::text("Hello"));
+        let ctx1 = OutboundContext::new();
+        let result1 = pipeline
+            .queue_with_idempotency(msg1, ctx1, Some("idem-key-dup"))
+            .unwrap();
+        let original_id = result1.message_id.clone();
+
+        // Second send with same idempotency key
+        let msg2 = OutboundMessage::new("telegram", MessageContent::text("Hello again"));
+        let ctx2 = OutboundContext::new();
+        let result2 = pipeline
+            .queue_with_idempotency(msg2, ctx2, Some("idem-key-dup"))
+            .unwrap();
+
+        // Should return the original message ID, not create a new one
+        assert_eq!(result2.message_id, original_id);
+        // Should not have a queue_position (deduplication short-circuits queueing)
+        assert!(result2.queue_position.is_none());
+        // Only one message should be in the queue
+        assert_eq!(pipeline.queue_size("telegram"), 1);
+        // Total queued counter should be 1 (not 2)
+        assert_eq!(pipeline.stats().total_queued, 1);
+    }
+
+    #[test]
+    fn test_idempotency_different_keys_create_separate_messages() {
+        let pipeline = MessagePipeline::new();
+
+        let msg1 = OutboundMessage::new("telegram", MessageContent::text("First"));
+        let result1 = pipeline
+            .queue_with_idempotency(msg1, OutboundContext::new(), Some("key-a"))
+            .unwrap();
+
+        let msg2 = OutboundMessage::new("telegram", MessageContent::text("Second"));
+        let result2 = pipeline
+            .queue_with_idempotency(msg2, OutboundContext::new(), Some("key-b"))
+            .unwrap();
+
+        // Different keys should produce different message IDs
+        assert_ne!(result1.message_id, result2.message_id);
+        // Both should be queued
+        assert_eq!(pipeline.queue_size("telegram"), 2);
+        assert_eq!(pipeline.stats().total_queued, 2);
+    }
+
+    #[test]
+    fn test_idempotency_expired_key_allows_reuse() {
+        let pipeline = MessagePipeline::new();
+
+        // First send
+        let msg1 = OutboundMessage::new("telegram", MessageContent::text("Hello"));
+        let result1 = pipeline
+            .queue_with_idempotency(msg1, OutboundContext::new(), Some("expire-key"))
+            .unwrap();
+        let original_id = result1.message_id.clone();
+
+        // Manually expire the idempotency entry by backdating its created_at
+        {
+            let mut idempotency_store = pipeline.idempotency_keys.write();
+            if let Some(entry) = idempotency_store.get_mut("expire-key") {
+                // Set created_at to well beyond the TTL in the past
+                entry.created_at = now_millis() - IDEMPOTENCY_KEY_TTL_MS - 1000;
+            }
+        }
+
+        // Second send with same key should create a new message (key expired)
+        let msg2 = OutboundMessage::new("telegram", MessageContent::text("Hello again"));
+        let result2 = pipeline
+            .queue_with_idempotency(msg2, OutboundContext::new(), Some("expire-key"))
+            .unwrap();
+
+        // Should get a new message ID
+        assert_ne!(result2.message_id, original_id);
+        // Should have a queue position (was actually queued)
+        assert!(result2.queue_position.is_some());
+        // Two messages should be in the queue
+        assert_eq!(pipeline.queue_size("telegram"), 2);
+    }
+
+    #[test]
+    fn test_idempotency_no_key_always_queues() {
+        let pipeline = MessagePipeline::new();
+
+        // Queue two messages without idempotency keys
+        let msg1 = OutboundMessage::new("telegram", MessageContent::text("First"));
+        let result1 = pipeline.queue(msg1, OutboundContext::new()).unwrap();
+
+        let msg2 = OutboundMessage::new("telegram", MessageContent::text("Second"));
+        let result2 = pipeline.queue(msg2, OutboundContext::new()).unwrap();
+
+        // Both should get unique message IDs
+        assert_ne!(result1.message_id, result2.message_id);
+        assert_eq!(pipeline.queue_size("telegram"), 2);
+    }
+
+    #[test]
+    fn test_idempotency_returns_current_status_of_original() {
+        let pipeline = MessagePipeline::new();
+
+        // Queue a message
+        let msg = OutboundMessage::new("telegram", MessageContent::text("Hello"));
+        let result = pipeline
+            .queue_with_idempotency(msg, OutboundContext::new(), Some("status-key"))
+            .unwrap();
+
+        // Mark the original as sent
+        pipeline.mark_sending(&result.message_id).unwrap();
+        pipeline.mark_sent(&result.message_id).unwrap();
+
+        // Re-send with same key should return Sent status
+        let msg2 = OutboundMessage::new("telegram", MessageContent::text("Hello again"));
+        let result2 = pipeline
+            .queue_with_idempotency(msg2, OutboundContext::new(), Some("status-key"))
+            .unwrap();
+
+        assert_eq!(result2.message_id, result.message_id);
+        assert_eq!(result2.status, DeliveryStatus::Sent);
+    }
+
+    #[test]
+    fn test_idempotency_cleanup_removes_expired_keys() {
+        let pipeline = MessagePipeline::new();
+
+        // Queue a message with an idempotency key
+        let msg = OutboundMessage::new("telegram", MessageContent::text("Hello"));
+        pipeline
+            .queue_with_idempotency(msg, OutboundContext::new(), Some("cleanup-key"))
+            .unwrap();
+
+        // Verify key exists
+        {
+            let store = pipeline.idempotency_keys.read();
+            assert!(store.contains_key("cleanup-key"));
+        }
+
+        // Backdate the entry to make it expired
+        {
+            let mut store = pipeline.idempotency_keys.write();
+            if let Some(entry) = store.get_mut("cleanup-key") {
+                entry.created_at = now_millis() - IDEMPOTENCY_KEY_TTL_MS - 1000;
+            }
+        }
+
+        // Run cleanup
+        pipeline.cleanup_completed();
+
+        // Key should be removed
+        {
+            let store = pipeline.idempotency_keys.read();
+            assert!(
+                !store.contains_key("cleanup-key"),
+                "expired idempotency key should be removed by cleanup"
+            );
+        }
+    }
+
+    #[test]
+    fn test_idempotency_clear_removes_all_keys() {
+        let pipeline = MessagePipeline::new();
+
+        let msg = OutboundMessage::new("telegram", MessageContent::text("Hello"));
+        pipeline
+            .queue_with_idempotency(msg, OutboundContext::new(), Some("clear-key"))
+            .unwrap();
+
+        {
+            let store = pipeline.idempotency_keys.read();
+            assert!(!store.is_empty());
+        }
+
+        pipeline.clear();
+
+        {
+            let store = pipeline.idempotency_keys.read();
+            assert!(store.is_empty());
+        }
     }
 }

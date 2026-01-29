@@ -6,7 +6,7 @@ description = "A secure, stable Rust alternative to moltbot"
 license = "MIT"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs", "signal", "io-util"] }
 axum = { version = "0.7", features = ["ws"] }
 chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.12", features = ["rustls-tls", "stream", "json", "blocking"], default-features = false }

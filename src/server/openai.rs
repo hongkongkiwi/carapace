@@ -160,6 +160,8 @@ pub struct OpenAiError {
 pub struct OpenAiErrorBody {
     pub message: String,
     pub r#type: String,
+    pub param: Option<String>,
+    pub code: Option<String>,
 }
 
 impl OpenAiError {
@@ -168,6 +170,8 @@ impl OpenAiError {
             error: OpenAiErrorBody {
                 message: message.into(),
                 r#type: "invalid_request_error".to_string(),
+                param: None,
+                code: None,
             },
         }
     }
@@ -177,6 +181,8 @@ impl OpenAiError {
             error: OpenAiErrorBody {
                 message: "Unauthorized".to_string(),
                 r#type: "unauthorized".to_string(),
+                param: None,
+                code: None,
             },
         }
     }
@@ -186,6 +192,8 @@ impl OpenAiError {
             error: OpenAiErrorBody {
                 message: message.into(),
                 r#type: "api_error".to_string(),
+                param: None,
+                code: None,
             },
         }
     }
@@ -429,7 +437,10 @@ async fn stream_llm_provider(
                     break;
                 }
                 StreamEvent::Error { message } => {
-                    // Send error as a chunk with content, then stop
+                    // Log the error server-side; do not embed it in assistant text.
+                    tracing::error!(error = %message, "streaming LLM error");
+
+                    // Send a final chunk with empty content and finish_reason "stop"
                     let error_chunk = ChatCompletionChunk {
                         id: response_id.clone(),
                         object: "chat.completion.chunk".to_string(),
@@ -439,7 +450,7 @@ async fn stream_llm_provider(
                             index: 0,
                             delta: ChunkDelta {
                                 role: None,
-                                content: Some(format!("[Error: {}]", message)),
+                                content: None,
                             },
                             finish_reason: Some("stop".to_string()),
                         }],

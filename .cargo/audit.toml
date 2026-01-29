@@ -1,0 +1,12 @@
+# cargo-audit configuration
+# See https://github.com/rustsec/rustsec/tree/main/cargo-audit
+
+[advisories]
+# Ignored advisories — wasmtime 18.x vulnerabilities.
+# These are low-severity issues in wasmtime's WASI / sandbox layer.
+# Upgrading to wasmtime >=24 is a large semver jump; ignore until planned.
+ignore = [
+    "RUSTSEC-2025-0118",  # wasmtime: unsound shared linear memory (severity 1.8)
+    "RUSTSEC-2025-0046",  # wasmtime: fd_renumber host panic (severity 3.3)
+    "RUSTSEC-2024-0438",  # wasmtime: Windows device filename sandboxing
+]
