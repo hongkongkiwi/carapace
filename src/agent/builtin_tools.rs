@@ -30,6 +30,12 @@ pub fn builtin_tools() -> Vec<BuiltinTool> {
     ]
 }
 
+/// Return channel-specific tools for the given channel.
+/// Re-exports from channel_tools module.
+pub fn channel_specific_tools(channel: Option<&str>) -> Vec<BuiltinTool> {
+    crate::agent::channel_tools::channel_tools(channel)
+}
+
 // ---------------------------------------------------------------------------
 // current_time
 // ---------------------------------------------------------------------------

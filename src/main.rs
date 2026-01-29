@@ -19,6 +19,7 @@ mod nodes;
 mod plugins;
 mod server;
 mod sessions;
+mod tailscale;
 mod tls;
 mod usage;
 
@@ -73,6 +74,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             all,
             force,
         }) => cli::handle_reset(sessions, cron, usage, memory, all, force),
+
+        Some(Command::Setup { force }) => cli::handle_setup(force),
+
+        Some(Command::Pair { url, name, trust }) => {
+            cli::handle_pair(&url, name.as_deref(), trust).await
+        }
+
+        Some(Command::Update { check, version }) => {
+            cli::handle_update(check, version.as_deref()).await
+        }
     }
 }
 
@@ -265,20 +276,62 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // 6d. Build multi-provider dispatcher
+    // 6d. Gemini provider
+    let google_api_key = std::env::var("GOOGLE_API_KEY").ok().or_else(|| {
+        cfg.get("google")
+            .and_then(|v| v.get("apiKey"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+
+    let google_base_url = std::env::var("GOOGLE_API_BASE_URL").ok().or_else(|| {
+        cfg.get("google")
+            .and_then(|v| v.get("baseUrl"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+
+    let gemini_provider: Option<Arc<dyn agent::LlmProvider>> = if let Some(key) = google_api_key {
+        match agent::gemini::GeminiProvider::new(key) {
+            Ok(provider) => {
+                let provider = if let Some(url) = google_base_url {
+                    match provider.with_base_url(url) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            warn!("Invalid GOOGLE_API_BASE_URL: {}", e);
+                            return Err(e.into());
+                        }
+                    }
+                } else {
+                    provider
+                };
+                info!("LLM provider configured: Gemini");
+                Some(Arc::new(provider))
+            }
+            Err(e) => {
+                warn!("Failed to configure Gemini provider: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // 6e. Build multi-provider dispatcher
     let multi_provider = agent::provider::MultiProvider::new(anthropic_provider, openai_provider)
-        .with_ollama(ollama_provider);
+        .with_ollama(ollama_provider)
+        .with_gemini(gemini_provider);
 
     let ws_state = if multi_provider.has_any_provider() {
         let inner = Arc::try_unwrap(ws_state)
             .expect("WsServerState Arc should have single owner at startup");
         Arc::new(inner.with_llm_provider(Arc::new(multi_provider)))
     } else {
-        info!("No LLM provider configured (set ANTHROPIC_API_KEY, OPENAI_API_KEY, and/or configure Ollama to enable)");
+        info!("No LLM provider configured (set ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, and/or configure Ollama to enable)");
         ws_state
     };
 
-    // 6e. Register built-in console channel (for testing/demo)
+    // 6f. Register built-in console channel (for testing/demo)
     let ws_state = {
         let plugin_reg = Arc::new(plugins::PluginRegistry::new());
         plugin_reg.register_channel(
@@ -480,6 +533,18 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             discovery_props,
             shutdown_rx.clone(),
         ));
+    }
+
+    // 12b. Start Tailscale serve/funnel (if configured)
+    let tailscale_config = tailscale::build_tailscale_config(&cfg, port);
+    if tailscale_config.mode != tailscale::TailscaleMode::Off {
+        let ts_shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            match tailscale::run_tailscale_lifecycle(tailscale_config, ts_shutdown_rx).await {
+                Ok(()) => info!("Tailscale lifecycle completed"),
+                Err(e) => warn!("Tailscale lifecycle error: {}", e),
+            }
+        });
     }
 
     // 13. Startup banner

@@ -108,8 +108,8 @@ pub trait LlmProvider: Send + Sync {
     ) -> Result<mpsc::Receiver<StreamEvent>, AgentError>;
 }
 
-/// A provider that dispatches to Anthropic, OpenAI, or Ollama based on the
-/// model identifier in the request.
+/// A provider that dispatches to Anthropic, OpenAI, Ollama, Gemini, or Bedrock
+/// based on the model identifier in the request.
 ///
 /// This allows the system to hold a single `Arc<dyn LlmProvider>` while
 /// supporting multiple backend providers transparently.
@@ -117,6 +117,8 @@ pub struct MultiProvider {
     anthropic: Option<std::sync::Arc<dyn LlmProvider>>,
     openai: Option<std::sync::Arc<dyn LlmProvider>>,
     ollama: Option<std::sync::Arc<dyn LlmProvider>>,
+    gemini: Option<std::sync::Arc<dyn LlmProvider>>,
+    bedrock: Option<std::sync::Arc<dyn LlmProvider>>,
 }
 
 impl std::fmt::Debug for MultiProvider {
@@ -125,6 +127,8 @@ impl std::fmt::Debug for MultiProvider {
             .field("anthropic", &self.anthropic.is_some())
             .field("openai", &self.openai.is_some())
             .field("ollama", &self.ollama.is_some())
+            .field("gemini", &self.gemini.is_some())
+            .field("bedrock", &self.bedrock.is_some())
             .finish()
     }
 }
@@ -142,6 +146,8 @@ impl MultiProvider {
             anthropic,
             openai,
             ollama: None,
+            gemini: None,
+            bedrock: None,
         }
     }
 
@@ -151,17 +157,35 @@ impl MultiProvider {
         self
     }
 
+    /// Set the Gemini provider for Google Gemini models.
+    pub fn with_gemini(mut self, gemini: Option<std::sync::Arc<dyn LlmProvider>>) -> Self {
+        self.gemini = gemini;
+        self
+    }
+
+    /// Set the Bedrock provider for AWS Bedrock models.
+    pub fn with_bedrock(mut self, bedrock: Option<std::sync::Arc<dyn LlmProvider>>) -> Self {
+        self.bedrock = bedrock;
+        self
+    }
+
     /// Returns `true` if at least one provider is configured.
     pub fn has_any_provider(&self) -> bool {
-        self.anthropic.is_some() || self.openai.is_some() || self.ollama.is_some()
+        self.anthropic.is_some()
+            || self.openai.is_some()
+            || self.ollama.is_some()
+            || self.gemini.is_some()
+            || self.bedrock.is_some()
     }
 
     /// Select the appropriate backend provider for the given model.
     ///
     /// Dispatch order:
     /// 1. Models prefixed with `ollama:` or `ollama/` -> Ollama
-    /// 2. Models matching OpenAI patterns (gpt-*, o1-*, etc.) -> OpenAI
-    /// 3. Everything else -> Anthropic (default)
+    /// 2. Models matching Gemini patterns (gemini-*, gemini/*, models/gemini-*) -> Gemini
+    /// 3. Models matching OpenAI patterns (gpt-*, o1-*, etc.) -> OpenAI
+    /// 4. Models matching Bedrock patterns (bedrock:*, anthropic.claude-*, etc.) -> Bedrock
+    /// 5. Everything else -> Anthropic (default)
     fn select_provider(&self, model: &str) -> Result<&dyn LlmProvider, AgentError> {
         if crate::agent::ollama::is_ollama_model(model) {
             self.ollama.as_deref().ok_or_else(|| {
@@ -169,10 +193,22 @@ impl MultiProvider {
                     "model \"{model}\" requires Ollama provider, but Ollama is not configured"
                 ))
             })
+        } else if crate::agent::gemini::is_gemini_model(model) {
+            self.gemini.as_deref().ok_or_else(|| {
+                AgentError::Provider(format!(
+                    "model \"{model}\" requires Gemini provider, but no GOOGLE_API_KEY is configured"
+                ))
+            })
         } else if crate::agent::openai::is_openai_model(model) {
             self.openai.as_deref().ok_or_else(|| {
                 AgentError::Provider(format!(
                     "model \"{model}\" requires OpenAI provider, but no OPENAI_API_KEY is configured"
+                ))
+            })
+        } else if crate::agent::bedrock::is_bedrock_model(model) {
+            self.bedrock.as_deref().ok_or_else(|| {
+                AgentError::Provider(format!(
+                    "model \"{model}\" requires Bedrock provider, but no AWS credentials are configured"
                 ))
             })
         } else {
@@ -200,6 +236,18 @@ impl LlmProvider for MultiProvider {
             request.model = crate::agent::ollama::strip_ollama_prefix(&request.model).to_string();
         }
 
+        // Strip the gemini/ or models/ prefix before forwarding to the provider,
+        // so the Gemini API receives the bare model name (e.g. "gemini-2.0-flash").
+        if crate::agent::gemini::is_gemini_model(&request.model) {
+            request.model = crate::agent::gemini::strip_gemini_prefix(&request.model).to_string();
+        }
+
+        // Strip the bedrock: or bedrock/ prefix before forwarding to the provider,
+        // so the Bedrock API receives the bare model ID (e.g. "anthropic.claude-3-sonnet-20240229-v1:0").
+        if crate::agent::bedrock::is_bedrock_model(&request.model) {
+            request.model = crate::agent::bedrock::strip_bedrock_prefix(&request.model).to_string();
+        }
+
         provider.complete(request).await
     }
 }
@@ -212,9 +260,6 @@ mod tests {
     fn test_multi_provider_has_any_provider() {
         let empty = MultiProvider::new(None, None);
         assert!(!empty.has_any_provider());
-
-        // We can't easily create real providers without API keys, but we can
-        // test the logic with the struct fields directly.
     }
 
     #[test]
@@ -222,7 +267,6 @@ mod tests {
         let provider = MultiProvider::new(None, None);
         assert!(!provider.has_any_provider());
 
-        // With ollama set, has_any_provider should return true
         let ollama = crate::agent::ollama::OllamaProvider::new().unwrap();
         let provider =
             MultiProvider::new(None, None).with_ollama(Some(std::sync::Arc::new(ollama)));
@@ -285,7 +329,6 @@ mod tests {
         let ollama = crate::agent::ollama::OllamaProvider::new().unwrap();
         let provider =
             MultiProvider::new(None, None).with_ollama(Some(std::sync::Arc::new(ollama)));
-        // Should succeed (return Ok) when Ollama is configured
         let result = provider.select_provider("ollama:llama3");
         assert!(result.is_ok(), "expected Ok when Ollama is configured");
     }
@@ -298,5 +341,131 @@ mod tests {
             debug.contains("ollama"),
             "debug output should include ollama: {debug}"
         );
+    }
+
+    #[test]
+    fn test_multi_provider_select_gemini_model() {
+        let provider = MultiProvider::new(None, None);
+        let err = provider.select_provider("gemini-2.0-flash");
+        assert!(err.is_err());
+        let msg = match err {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected error"),
+        };
+        assert!(msg.contains("Gemini"), "expected Gemini in error: {msg}");
+    }
+
+    #[test]
+    fn test_multi_provider_select_gemini_slash_model() {
+        let provider = MultiProvider::new(None, None);
+        let err = provider.select_provider("gemini/gemini-2.0-flash");
+        assert!(err.is_err());
+        let msg = match err {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected error"),
+        };
+        assert!(msg.contains("Gemini"), "expected Gemini in error: {msg}");
+    }
+
+    #[test]
+    fn test_multi_provider_select_models_gemini_prefix() {
+        let provider = MultiProvider::new(None, None);
+        let err = provider.select_provider("models/gemini-1.5-pro");
+        assert!(err.is_err());
+        let msg = match err {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected error"),
+        };
+        assert!(msg.contains("Gemini"), "expected Gemini in error: {msg}");
+    }
+
+    #[test]
+    fn test_multi_provider_gemini_dispatch_succeeds_when_configured() {
+        let gemini = crate::agent::gemini::GeminiProvider::new("test-key".to_string()).unwrap();
+        let provider =
+            MultiProvider::new(None, None).with_gemini(Some(std::sync::Arc::new(gemini)));
+        let result = provider.select_provider("gemini-2.0-flash");
+        assert!(result.is_ok(), "expected Ok when Gemini is configured");
+    }
+
+    #[test]
+    fn test_multi_provider_has_any_provider_with_gemini() {
+        let gemini = crate::agent::gemini::GeminiProvider::new("test-key".to_string()).unwrap();
+        let provider =
+            MultiProvider::new(None, None).with_gemini(Some(std::sync::Arc::new(gemini)));
+        assert!(provider.has_any_provider());
+    }
+
+    #[test]
+    fn test_multi_provider_debug_includes_gemini() {
+        let provider = MultiProvider::new(None, None);
+        let debug = format!("{:?}", provider);
+        assert!(
+            debug.contains("gemini"),
+            "debug output should include gemini: {debug}"
+        );
+    }
+
+    // ==================== Bedrock routing tests ====================
+
+    #[test]
+    fn test_multi_provider_select_bedrock_model_colon_prefix() {
+        let provider = MultiProvider::new(None, None);
+        let err = provider.select_provider("bedrock:anthropic.claude-3-sonnet");
+        assert!(err.is_err());
+        let msg = match err {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected error"),
+        };
+        assert!(msg.contains("Bedrock"), "expected Bedrock in error: {msg}");
+    }
+
+    #[test]
+    fn test_multi_provider_select_bedrock_model_native_id() {
+        let provider = MultiProvider::new(None, None);
+        let err = provider.select_provider("anthropic.claude-3-sonnet-20240229-v1:0");
+        assert!(err.is_err());
+        let msg = match err {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected error"),
+        };
+        assert!(msg.contains("Bedrock"), "expected Bedrock in error: {msg}");
+    }
+
+    #[test]
+    fn test_multi_provider_bedrock_dispatch_succeeds_when_configured() {
+        let bedrock = crate::agent::bedrock::BedrockProvider::new(
+            "us-east-1".to_string(),
+            "AKID".to_string(),
+            "secret".to_string(),
+        )
+        .unwrap();
+        let provider =
+            MultiProvider::new(None, None).with_bedrock(Some(std::sync::Arc::new(bedrock)));
+        let result = provider.select_provider("bedrock:anthropic.claude-3-sonnet");
+        assert!(result.is_ok(), "expected Ok when Bedrock is configured");
+    }
+
+    #[test]
+    fn test_multi_provider_debug_includes_bedrock() {
+        let provider = MultiProvider::new(None, None);
+        let debug = format!("{:?}", provider);
+        assert!(
+            debug.contains("bedrock"),
+            "debug output should include bedrock: {debug}"
+        );
+    }
+
+    #[test]
+    fn test_multi_provider_has_any_provider_with_bedrock() {
+        let bedrock = crate::agent::bedrock::BedrockProvider::new(
+            "us-east-1".to_string(),
+            "AKID".to_string(),
+            "secret".to_string(),
+        )
+        .unwrap();
+        let provider =
+            MultiProvider::new(None, None).with_bedrock(Some(std::sync::Arc::new(bedrock)));
+        assert!(provider.has_any_provider());
     }
 }

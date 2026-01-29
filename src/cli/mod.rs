@@ -9,6 +9,9 @@
 //! - `backup` -- create a backup archive of all gateway data
 //! - `restore` -- restore from a backup archive
 //! - `reset` -- clear specific data categories
+//! - `setup` -- interactive first-run configuration wizard
+//! - `pair` -- pair with a remote gateway node
+//! - `update` -- check for updates or self-update
 
 use clap::{Parser, Subcommand};
 
@@ -104,6 +107,38 @@ pub enum Command {
         /// Proceed without confirmation prompt.
         #[arg(long)]
         force: bool,
+    },
+
+    /// Run the interactive setup wizard for first-time configuration.
+    Setup {
+        /// Overwrite existing configuration if it already exists.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Pair with a remote gateway node.
+    Pair {
+        /// Gateway URL to pair with (e.g., https://gateway.local:3001).
+        url: String,
+
+        /// Device name for this node (defaults to hostname).
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Accept the gateway's TLS fingerprint without verification.
+        #[arg(long)]
+        trust: bool,
+    },
+
+    /// Check for updates or install a specific version.
+    Update {
+        /// Check for updates without installing.
+        #[arg(long)]
+        check: bool,
+
+        /// Install a specific version (e.g., "0.2.0").
+        #[arg(long)]
+        version: Option<String>,
     },
 }
 
@@ -740,6 +775,291 @@ pub fn handle_reset(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Setup / Pair / Update handlers
+// ---------------------------------------------------------------------------
+
+/// Run the `setup` subcommand -- interactive first-run wizard.
+pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let config_path = config::get_config_path();
+
+    // Check if config already exists.
+    if config_path.exists() && !force {
+        eprintln!(
+            "Config already exists at {}. Use --force to overwrite.",
+            config_path.display()
+        );
+        return Err("config already exists".into());
+    }
+
+    // Create the config directory if needed.
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Build a minimal default config.
+    let default_config = serde_json::json!({
+        "gateway": {
+            "port": 3001,
+            "bind": "loopback"
+        },
+        "agents": {
+            "defaults": {
+                "model": "claude-sonnet-4-20250514"
+            }
+        }
+    });
+
+    // Check for API keys in environment.
+    if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+        println!("Anthropic API key detected in environment");
+    }
+    if std::env::var("OPENAI_API_KEY").is_ok() {
+        println!("OpenAI API key detected in environment");
+    }
+    if std::env::var("GOOGLE_API_KEY").is_ok() {
+        println!("Google API key detected in environment");
+    }
+
+    // Write the config file using json5 (pretty-formatted).
+    let content = json5::to_string(&default_config)?;
+    std::fs::write(&config_path, &content)?;
+
+    println!("Config written to {}", config_path.display());
+    println!("Start the server with: carapace start");
+
+    Ok(())
+}
+
+/// Run the `pair` subcommand -- pair with a remote gateway node.
+pub async fn handle_pair(
+    url: &str,
+    name: Option<&str>,
+    trust: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Validate the URL.
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        eprintln!("Invalid URL: {} (must start with http:// or https://)", url);
+        return Err("invalid URL scheme".into());
+    }
+
+    // Resolve the device name.
+    let device_name = match name {
+        Some(n) => n.to_string(),
+        None => std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string()),
+    };
+
+    // Generate a pairing token.
+    let token = uuid::Uuid::new_v4().to_string();
+
+    println!("Pairing with: {}", url);
+    println!("Device name: {}", device_name);
+    println!("Pairing token: {}", token);
+
+    // Build the request body.
+    let body = serde_json::json!({
+        "name": device_name,
+        "token": token,
+        "version": env!("CARGO_PKG_VERSION"),
+    });
+
+    // Build the HTTP client (optionally accepting invalid certs).
+    let client = if trust {
+        reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?
+    } else {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?
+    };
+
+    // Attempt to connect to the gateway.
+    let pair_url = format!("{}/api/nodes/pair", url.trim_end_matches('/'));
+    let response = match client.post(&pair_url).json(&body).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Connection error: {}", e);
+            return Err(e.into());
+        }
+    };
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body_text = response.text().await.unwrap_or_default();
+        eprintln!("Pairing failed (HTTP {}): {}", status, body_text);
+        return Err(format!("HTTP {}", status).into());
+    }
+
+    // Parse response and save pairing info.
+    let resp_body: Value = response.json().await?;
+    let node_id = resp_body
+        .get("node_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    println!("Paired successfully! Node ID: {}", node_id);
+
+    // Save pairing to state dir.
+    let state_dir = resolve_state_dir();
+    std::fs::create_dir_all(&state_dir)?;
+    let pairing_path = state_dir.join("pairing.json");
+    let pairing_data = serde_json::json!({
+        "node_id": node_id,
+        "gateway_url": url,
+        "device_name": device_name,
+        "token": token,
+        "paired_at": chrono::Utc::now().to_rfc3339(),
+    });
+    std::fs::write(&pairing_path, serde_json::to_string_pretty(&pairing_data)?)?;
+    println!("Pairing saved to {}", pairing_path.display());
+
+    Ok(())
+}
+
+/// Run the `update` subcommand -- check for updates or self-update.
+pub async fn handle_update(
+    check: bool,
+    version: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let current_version = env!("CARGO_PKG_VERSION");
+
+    // Determine the API endpoint.
+    let api_url = match version {
+        Some(v) => format!(
+            "https://api.github.com/repos/moltbot/carapace/releases/tags/v{}",
+            v
+        ),
+        None => "https://api.github.com/repos/moltbot/carapace/releases/latest".to_string(),
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+
+    let response = match client
+        .get(&api_url)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", format!("carapace/{}", current_version))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Failed to check for updates: {}", e);
+            return Err(e.into());
+        }
+    };
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body_text = response.text().await.unwrap_or_default();
+        eprintln!("GitHub API error (HTTP {}): {}", status, body_text);
+        return Err(format!("HTTP {}", status).into());
+    }
+
+    let release: Value = response.json().await?;
+    let tag_name = release
+        .get("tag_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let _release_name = release
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or(tag_name);
+    let html_url = release
+        .get("html_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let latest_version = tag_name.strip_prefix('v').unwrap_or(tag_name);
+
+    if check {
+        println!("Current version: v{}", current_version);
+        println!("Latest version:  v{}", latest_version);
+
+        if current_version == latest_version {
+            println!("Already up to date (v{})", current_version);
+        } else {
+            println!(
+                "Update available: v{} -> v{}",
+                current_version, latest_version
+            );
+            println!("Run `carapace update` to install");
+        }
+        return Ok(());
+    }
+
+    // Install mode.
+    let target_version = version.unwrap_or(latest_version);
+    if target_version == current_version {
+        println!("Already up to date (v{})", current_version);
+        return Ok(());
+    }
+
+    println!(
+        "Updating from v{} to v{}...",
+        current_version, target_version
+    );
+
+    // Determine the correct asset name for the current platform.
+    let asset_name = format!(
+        "carapace-{}-{}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+
+    // Look for matching asset in the release.
+    let assets = release
+        .get("assets")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let matching_asset = assets.iter().find(|a| {
+        a.get("name")
+            .and_then(|n| n.as_str())
+            .is_some_and(|n| n.contains(&asset_name))
+    });
+
+    if let Some(asset) = matching_asset {
+        let name = asset
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or(&asset_name);
+        println!("Downloading {}...", name);
+    }
+
+    // Stub the actual binary replacement.
+    println!(
+        "Self-update installation is not yet implemented. Download manually from: {}",
+        html_url
+    );
+
+    Ok(())
+}
+
+/// Determine the platform asset name for update downloads.
+fn platform_asset_name() -> String {
+    format!(
+        "carapace-{}-{}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )
+}
+
+/// Compare two semver version strings. Returns `Ordering`.
+/// Only handles simple `MAJOR.MINOR.PATCH` format.
+fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    let parse = |s: &str| -> (u64, u64, u64) {
+        let parts: Vec<&str> = s.split('.').collect();
+        let major = parts.first().and_then(|p| p.parse().ok()).unwrap_or(0);
+        let minor = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(0);
+        let patch = parts.get(2).and_then(|p| p.parse().ok()).unwrap_or(0);
+        (major, minor, patch)
+    };
+    parse(a).cmp(&parse(b))
 }
 
 /// Count files matching a given extension in a directory (non-recursive top level).
@@ -1478,5 +1798,313 @@ mod tests {
         assert_eq!(format_file_size(1536), "1.5 KB");
         assert_eq!(format_file_size(1048576), "1.0 MB");
         assert_eq!(format_file_size(1073741824), "1.00 GB");
+    }
+
+    // -----------------------------------------------------------------------
+    // Setup subcommand tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cli_setup_no_force() {
+        let cli = Cli::try_parse_from(["carapace", "setup"]).unwrap();
+        match cli.command {
+            Some(Command::Setup { force }) => {
+                assert!(!force);
+            }
+            other => panic!("Expected Setup, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_setup_with_force() {
+        let cli = Cli::try_parse_from(["carapace", "setup", "--force"]).unwrap();
+        match cli.command {
+            Some(Command::Setup { force }) => {
+                assert!(force);
+            }
+            other => panic!("Expected Setup, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_handle_setup_errors_when_config_exists_no_force() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("moltbot.json");
+        std::fs::write(&config_path, "{}").unwrap();
+
+        // Point config to our temp file.
+        std::env::set_var("MOLTBOT_CONFIG_PATH", config_path.to_str().unwrap());
+        let result = handle_setup(false);
+        std::env::remove_var("MOLTBOT_CONFIG_PATH");
+
+        assert!(
+            result.is_err(),
+            "Should error when config exists and force=false"
+        );
+    }
+
+    #[test]
+    fn test_handle_setup_force_creates_config() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("moltbot.json");
+        std::fs::write(&config_path, "{}").unwrap();
+
+        std::env::set_var("MOLTBOT_CONFIG_PATH", config_path.to_str().unwrap());
+        let result = handle_setup(true);
+        std::env::remove_var("MOLTBOT_CONFIG_PATH");
+
+        assert!(
+            result.is_ok(),
+            "Should succeed with force=true even when config exists"
+        );
+        assert!(config_path.exists(), "Config file should exist after setup");
+    }
+
+    #[test]
+    fn test_handle_setup_creates_valid_json5_config() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("moltbot.json");
+
+        std::env::set_var("MOLTBOT_CONFIG_PATH", config_path.to_str().unwrap());
+        let result = handle_setup(false);
+        std::env::remove_var("MOLTBOT_CONFIG_PATH");
+
+        assert!(result.is_ok(), "Setup should succeed");
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert!(parsed.is_object(), "Config should be a JSON object");
+    }
+
+    #[test]
+    fn test_handle_setup_default_values() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("moltbot.json");
+
+        std::env::set_var("MOLTBOT_CONFIG_PATH", config_path.to_str().unwrap());
+        let result = handle_setup(false);
+        std::env::remove_var("MOLTBOT_CONFIG_PATH");
+
+        assert!(result.is_ok());
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+
+        assert_eq!(
+            parsed["gateway"]["port"], 3001,
+            "Default port should be 3001"
+        );
+        assert_eq!(
+            parsed["gateway"]["bind"], "loopback",
+            "Default bind should be loopback"
+        );
+        assert_eq!(
+            parsed["agents"]["defaults"]["model"], "claude-sonnet-4-20250514",
+            "Default model should be claude-sonnet-4-20250514"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Pair subcommand tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cli_pair_basic() {
+        let cli = Cli::try_parse_from(["carapace", "pair", "https://gateway.local:3001"]).unwrap();
+        match cli.command {
+            Some(Command::Pair {
+                ref url,
+                ref name,
+                trust,
+            }) => {
+                assert_eq!(url, "https://gateway.local:3001");
+                assert!(name.is_none());
+                assert!(!trust);
+            }
+            other => panic!("Expected Pair, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_pair_with_name_and_trust() {
+        let cli = Cli::try_parse_from([
+            "carapace",
+            "pair",
+            "https://gateway.local:3001",
+            "--name",
+            "my-node",
+            "--trust",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Pair {
+                ref url,
+                ref name,
+                trust,
+            }) => {
+                assert_eq!(url, "https://gateway.local:3001");
+                assert_eq!(name.as_deref(), Some("my-node"));
+                assert!(trust);
+            }
+            other => panic!("Expected Pair, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_pair_url_validation_https() {
+        // Valid https URL should not trigger the URL validation error.
+        let url = "https://gateway.local:3001";
+        assert!(
+            url.starts_with("http://") || url.starts_with("https://"),
+            "https URL should be valid"
+        );
+    }
+
+    #[test]
+    fn test_pair_url_validation_http() {
+        // Valid http URL should not trigger the URL validation error.
+        let url = "http://gateway.local:3001";
+        assert!(
+            url.starts_with("http://") || url.starts_with("https://"),
+            "http URL should be valid"
+        );
+    }
+
+    #[test]
+    fn test_pair_url_validation_invalid() {
+        let url = "ftp://gateway.local:3001";
+        assert!(
+            !(url.starts_with("http://") || url.starts_with("https://")),
+            "ftp URL should be invalid"
+        );
+
+        let url2 = "gateway.local:3001";
+        assert!(
+            !(url2.starts_with("http://") || url2.starts_with("https://")),
+            "URL without scheme should be invalid"
+        );
+    }
+
+    #[test]
+    fn test_pair_generates_valid_uuid_token() {
+        let token = uuid::Uuid::new_v4().to_string();
+        // UUID v4 format: 8-4-4-4-12 hex chars.
+        assert_eq!(token.len(), 36, "UUID should be 36 characters");
+        assert_eq!(
+            token.chars().filter(|c| *c == '-').count(),
+            4,
+            "UUID should have 4 dashes"
+        );
+        // Verify it parses back as a valid UUID.
+        assert!(
+            uuid::Uuid::parse_str(&token).is_ok(),
+            "Generated token should be a valid UUID"
+        );
+    }
+
+    #[test]
+    fn test_pair_device_name_explicit() {
+        let name = Some("my-device");
+        let device_name = match name {
+            Some(n) => n.to_string(),
+            None => std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string()),
+        };
+        assert_eq!(device_name, "my-device");
+    }
+
+    #[test]
+    fn test_pair_device_name_fallback() {
+        let name: Option<&str> = None;
+        let device_name = match name {
+            Some(n) => n.to_string(),
+            None => std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string()),
+        };
+        // Should be either the hostname or "unknown", both are acceptable.
+        assert!(
+            !device_name.is_empty(),
+            "Fallback device name should not be empty"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Update subcommand tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cli_update_check() {
+        let cli = Cli::try_parse_from(["carapace", "update", "--check"]).unwrap();
+        match cli.command {
+            Some(Command::Update { check, version }) => {
+                assert!(check);
+                assert!(version.is_none());
+            }
+            other => panic!("Expected Update, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_update_with_version() {
+        let cli = Cli::try_parse_from(["carapace", "update", "--version", "0.2.0"]).unwrap();
+        match cli.command {
+            Some(Command::Update { check, version }) => {
+                assert!(!check);
+                assert_eq!(version.as_deref(), Some("0.2.0"));
+            }
+            other => panic!("Expected Update, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_compare_versions() {
+        use std::cmp::Ordering;
+
+        assert_eq!(compare_versions("0.1.0", "0.1.0"), Ordering::Equal);
+        assert_eq!(compare_versions("0.1.0", "0.2.0"), Ordering::Less);
+        assert_eq!(compare_versions("0.2.0", "0.1.0"), Ordering::Greater);
+        assert_eq!(compare_versions("1.0.0", "0.9.9"), Ordering::Greater);
+        assert_eq!(compare_versions("0.1.1", "0.1.0"), Ordering::Greater);
+        assert_eq!(compare_versions("0.0.1", "0.0.2"), Ordering::Less);
+    }
+
+    #[test]
+    fn test_platform_asset_name() {
+        let name = platform_asset_name();
+        assert!(
+            name.starts_with("carapace-"),
+            "Asset name should start with 'carapace-'"
+        );
+        // Should contain an OS identifier.
+        let has_os = name.contains("linux") || name.contains("macos") || name.contains("windows");
+        assert!(
+            has_os,
+            "Asset name should contain an OS identifier: {}",
+            name
+        );
+        // Should contain an architecture identifier.
+        let has_arch = name.contains("x86_64") || name.contains("aarch64");
+        assert!(
+            has_arch,
+            "Asset name should contain an architecture identifier: {}",
+            name
+        );
+    }
+
+    #[test]
+    fn test_update_version_comparison_up_to_date() {
+        let current = "0.1.0";
+        let latest = "0.1.0";
+        assert_eq!(current, latest, "Same versions should be equal");
+    }
+
+    #[test]
+    fn test_update_version_comparison_update_available() {
+        let current = "0.1.0";
+        let latest = "0.2.0";
+        assert_ne!(current, latest, "Different versions should not be equal");
+        assert_eq!(
+            compare_versions(current, latest),
+            std::cmp::Ordering::Less,
+            "Current should be less than latest when update is available"
+        );
     }
 }

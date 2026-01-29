@@ -550,6 +550,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hex",
  "hickory-resolver",
+ "hmac",
  "insta",
  "json5",
  "keyring",

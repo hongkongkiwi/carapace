@@ -4,9 +4,12 @@
 //! and the core agent run loop that ties everything together.
 
 pub mod anthropic;
+pub mod bedrock;
 pub mod builtin_tools;
+pub mod channel_tools;
 pub mod context;
 pub mod executor;
+pub mod gemini;
 pub mod ollama;
 pub mod openai;
 pub mod provider;

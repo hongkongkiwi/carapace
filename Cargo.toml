@@ -7,7 +7,7 @@ license = "MIT"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs", "signal", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs", "signal", "io-util", "process"] }
 axum = { version = "0.7", features = ["ws"] }
 chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.12", features = ["rustls-tls", "stream", "json", "blocking", "multipart"], default-features = false }
@@ -35,6 +35,7 @@ bytes = "1"
 getrandom = "0.2"
 hex = "0.4"
 sha2 = "0.10"
+hmac = "0.12"
 mdns-sd = "0.11"
 rcgen = "0.13"
 tokio-rustls = "0.26"

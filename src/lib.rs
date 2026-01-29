@@ -25,5 +25,6 @@ pub mod nodes;
 pub mod plugins;
 pub mod server;
 pub mod sessions;
+pub mod tailscale;
 pub mod tls;
 pub mod usage;
