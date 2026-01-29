@@ -30,8 +30,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # TODO: Add -D warnings once clippy is clean
-      - run: cargo clippy --all-targets --all-features
+      - run: cargo clippy --all-targets --all-features -- -D warnings
 
   build:
     name: Build
