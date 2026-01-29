@@ -129,6 +129,7 @@ pub fn create_registry_with_builtins() -> ToolRegistry {
     registry.register(Arc::new(builtins::TimeTool));
     registry.register(Arc::new(builtins::UuidTool));
     registry.register(Arc::new(builtins::SystemInfoTool));
+    registry.register(Arc::new(builtins::BrowserTool));
 
     registry
 }
