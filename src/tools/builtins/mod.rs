@@ -4,9 +4,11 @@
 
 pub mod bash;
 pub mod browser;
+pub mod screen;
 
 pub use bash::BashTool;
 pub use browser::BrowserTool;
+pub use screen::ScreenTool;
 
 use super::{Tool, ToolOutput};
 use crate::tools::ToolError;
