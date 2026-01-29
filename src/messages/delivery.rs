@@ -90,13 +90,13 @@ pub async fn delivery_loop(
                     let error = delivery
                         .error
                         .unwrap_or_else(|| "delivery failed".to_string());
-                    if delivery.retryable && msg.can_retry() {
-                        // Leave in queue for retry — mark_failed removes from queue,
-                        // so we just log and let it be picked up next iteration
+                    if delivery.retryable && pipeline.can_retry(&message_id) {
+                        // Reset status to Queued so the delivery loop picks it up again
+                        let _ = pipeline.mark_retry(&message_id, &error);
                         warn!(
                             id = %message_id,
                             error = %error,
-                            "retryable delivery failure, will retry"
+                            "retryable delivery failure, reset to queued for retry"
                         );
                     } else {
                         let _ = pipeline.mark_failed(&message_id, &error);
@@ -394,7 +394,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delivery_retries_on_retryable_failure() {
+    async fn test_delivery_retries_on_retryable_failure_resets_status() {
         let mock = Arc::new(MockChannel::failing(true));
         let (pipeline, plugin_reg, channel_reg) =
             make_pipeline_and_registries("retry-ch", Some(mock.clone()), true);
@@ -418,12 +418,117 @@ mod tests {
         pipeline.notifier().notify_one();
         let _ = handle.await;
 
-        // Message should still be in queue (retryable failure)
+        // Message status must be reset to Queued (not stuck at Sending, not Failed)
         let status = pipeline.get_status(&result.message_id);
-        // After mark_sending, the status is Sending (not Failed because retry keeps it)
-        assert_ne!(
+        assert_eq!(
             status,
-            Some(crate::messages::outbound::DeliveryStatus::Failed)
+            Some(crate::messages::outbound::DeliveryStatus::Queued),
+            "retryable failure must reset status to Queued, not leave it as Sending"
+        );
+
+        // Message should still be in the channel queue for retry
+        assert_eq!(
+            pipeline.channels_with_messages().len(),
+            1,
+            "message should remain in channel queue after retryable failure"
+        );
+
+        // The error from the failed attempt should be recorded
+        let queued = pipeline.get_message(&result.message_id).unwrap();
+        assert_eq!(queued.last_error, Some("mock failure".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_delivery_non_retryable_failure_marks_failed() {
+        let mock = Arc::new(MockChannel::failing(false));
+        let (pipeline, plugin_reg, channel_reg) =
+            make_pipeline_and_registries("noretry-ch", Some(mock.clone()), true);
+
+        let msg = OutboundMessage::new("noretry-ch", MessageContent::text("hello"));
+        let ctx = MsgOutboundContext::new().with_retries(3);
+        let result = pipeline.queue(msg, ctx).unwrap();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let state = Arc::new(crate::server::ws::WsServerState::new(
+            crate::server::ws::WsServerConfig::default(),
+        ));
+
+        let pl = pipeline.clone();
+        let handle = tokio::spawn(async move {
+            delivery_loop(pl, plugin_reg, channel_reg, state, shutdown_rx).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = shutdown_tx.send(true);
+        pipeline.notifier().notify_one();
+        let _ = handle.await;
+
+        // Non-retryable failure must be marked as Failed
+        let status = pipeline.get_status(&result.message_id);
+        assert_eq!(
+            status,
+            Some(crate::messages::outbound::DeliveryStatus::Failed),
+            "non-retryable failure must be marked as Failed"
+        );
+
+        // Message should be removed from the channel queue
+        assert_eq!(
+            pipeline.queue_size("noretry-ch"),
+            0,
+            "failed message should be removed from channel queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_mechanism_picks_up_reset_messages() {
+        // Use a mock that always fails with retryable=true
+        let mock = Arc::new(MockChannel::failing(true));
+        let (pipeline, plugin_reg, channel_reg) =
+            make_pipeline_and_registries("pickup-ch", Some(mock.clone()), true);
+
+        let msg = OutboundMessage::new("pickup-ch", MessageContent::text("hello"));
+        // Allow 3 retries so the message can be retried multiple times
+        let ctx = MsgOutboundContext::new().with_retries(3);
+        let result = pipeline.queue(msg, ctx).unwrap();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let state = Arc::new(crate::server::ws::WsServerState::new(
+            crate::server::ws::WsServerConfig::default(),
+        ));
+
+        let pl = pipeline.clone();
+        let handle = tokio::spawn(async move {
+            delivery_loop(pl, plugin_reg, channel_reg, state, shutdown_rx).await;
+        });
+
+        // Allow enough time for multiple delivery loop iterations to run.
+        // The loop wakes on notify or every 5s; we notify it repeatedly.
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            pipeline.notifier().notify_one();
+        }
+
+        let _ = shutdown_tx.send(true);
+        pipeline.notifier().notify_one();
+        let _ = handle.await;
+
+        // The mock should have been called more than once, proving the retry
+        // mechanism picked up the message again after it was reset to Queued.
+        let send_count = mock.send_text_count.load(Ordering::Relaxed);
+        assert!(
+            send_count > 1,
+            "expected multiple delivery attempts from retry, got {}",
+            send_count
+        );
+
+        // After exhausting retries (3 attempts), the message should be Failed
+        // since can_retry() returns false when attempts >= max_retries.
+        let queued = pipeline.get_message(&result.message_id).unwrap();
+        assert_eq!(
+            queued.status,
+            crate::messages::outbound::DeliveryStatus::Failed,
+            "message should be Failed after exhausting retries (attempts={}, max=3)",
+            queued.attempts
         );
     }
 

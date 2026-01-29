@@ -321,6 +321,16 @@ impl QueuedMessage {
         self.updated_at = now_millis();
     }
 
+    /// Reset the message to Queued for retry after a failed delivery attempt.
+    ///
+    /// Records the error from the failed attempt but resets status so the
+    /// message will be picked up again by the delivery loop.
+    pub fn mark_retry(&mut self, error: impl Into<String>) {
+        self.status = DeliveryStatus::Queued;
+        self.last_error = Some(error.into());
+        self.updated_at = now_millis();
+    }
+
     /// Check if the message can be retried
     pub fn can_retry(&self) -> bool {
         self.context.retry_enabled && self.attempts < self.context.max_retries
@@ -539,6 +549,18 @@ impl MessagePipeline {
         }
     }
 
+    /// Check if a message can be retried (from the authoritative messages map).
+    ///
+    /// This reads the current attempt count and retry settings, ensuring
+    /// the retry decision is based on up-to-date state rather than a stale clone.
+    pub fn can_retry(&self, message_id: &MessageId) -> bool {
+        let messages = self.messages.read();
+        messages
+            .get(&message_id.0)
+            .map(|m| m.can_retry())
+            .unwrap_or(false)
+    }
+
     /// Get the next message to deliver for a channel
     ///
     /// This is used by delivery workers to get messages to send.
@@ -556,14 +578,32 @@ impl MessagePipeline {
     }
 
     /// Mark a message as being sent
+    ///
+    /// Updates both the `messages` lookup map and the `queues` entry so that
+    /// `next_for_channel` will not return a message that is already in-flight.
     pub fn mark_sending(&self, message_id: &MessageId) -> Result<(), PipelineError> {
-        let mut messages = self.messages.write();
-        if let Some(queued) = messages.get_mut(&message_id.0) {
-            queued.mark_sending();
-            Ok(())
-        } else {
-            Err(PipelineError::MessageNotFound(message_id.0.clone()))
+        let channel_id = {
+            let mut messages = self.messages.write();
+            if let Some(queued) = messages.get_mut(&message_id.0) {
+                queued.mark_sending();
+                queued.message.channel_id.clone()
+            } else {
+                return Err(PipelineError::MessageNotFound(message_id.0.clone()));
+            }
+        };
+
+        // Also update the queue entry so next_for_channel skips this message
+        let mut queues = self.queues.write();
+        if let Some(queue) = queues.get_mut(&channel_id) {
+            for entry in queue.iter_mut() {
+                if entry.message.id == *message_id {
+                    entry.mark_sending();
+                    break;
+                }
+            }
         }
+
+        Ok(())
     }
 
     /// Mark a message as sent successfully
@@ -584,6 +624,40 @@ impl MessagePipeline {
 
         // Clean up old completed messages to prevent memory leak
         self.maybe_cleanup_completed();
+
+        Ok(())
+    }
+
+    /// Reset a message to Queued so it can be retried by the delivery loop.
+    ///
+    /// Updates both the `messages` lookup map and the `queues` entry so that
+    /// `next_for_channel` will return this message again on the next iteration.
+    pub fn mark_retry(
+        &self,
+        message_id: &MessageId,
+        error: impl Into<String>,
+    ) -> Result<(), PipelineError> {
+        let (channel_id, error_str) = {
+            let error_string = error.into();
+            let mut messages = self.messages.write();
+            if let Some(queued) = messages.get_mut(&message_id.0) {
+                queued.mark_retry(&error_string);
+                (queued.message.channel_id.clone(), error_string)
+            } else {
+                return Err(PipelineError::MessageNotFound(message_id.0.clone()));
+            }
+        };
+
+        // Also update the queue entry so next_for_channel picks it up again
+        let mut queues = self.queues.write();
+        if let Some(queue) = queues.get_mut(&channel_id) {
+            for entry in queue.iter_mut() {
+                if entry.message.id == *message_id {
+                    entry.mark_retry(error_str);
+                    break;
+                }
+            }
+        }
 
         Ok(())
     }
@@ -852,6 +926,79 @@ mod tests {
 
         queued.attempts = 3;
         assert!(!queued.can_retry());
+    }
+
+    #[test]
+    fn test_queued_message_mark_retry_resets_to_queued() {
+        let msg = OutboundMessage::new("telegram", MessageContent::text("Hello"));
+        let ctx = OutboundContext::new().with_retries(3);
+        let mut queued = QueuedMessage::new(msg, ctx);
+
+        // Simulate a delivery attempt
+        queued.mark_sending();
+        assert_eq!(queued.status, DeliveryStatus::Sending);
+        assert_eq!(queued.attempts, 1);
+
+        // Simulate retryable failure: reset to Queued
+        queued.mark_retry("temporary error");
+        assert_eq!(queued.status, DeliveryStatus::Queued);
+        assert_eq!(queued.last_error, Some("temporary error".to_string()));
+        // attempts should remain at 1 (incremented by mark_sending, not by mark_retry)
+        assert_eq!(queued.attempts, 1);
+        assert!(queued.can_retry()); // still under max_retries=3
+    }
+
+    #[test]
+    fn test_pipeline_mark_retry_resets_status_in_both_stores() {
+        let pipeline = MessagePipeline::new();
+        let msg = OutboundMessage::new("telegram", MessageContent::text("Hello"));
+        let ctx = OutboundContext::new().with_retries(3);
+        let result = pipeline.queue(msg, ctx).unwrap();
+
+        // mark_sending sets status to Sending in both messages map and queue
+        pipeline.mark_sending(&result.message_id).unwrap();
+        assert_eq!(
+            pipeline.get_status(&result.message_id),
+            Some(DeliveryStatus::Sending)
+        );
+        // next_for_channel should NOT return a Sending message
+        assert!(pipeline.next_for_channel("telegram").is_none());
+
+        // mark_retry resets status to Queued in both messages map and queue
+        pipeline
+            .mark_retry(&result.message_id, "transient error")
+            .unwrap();
+        assert_eq!(
+            pipeline.get_status(&result.message_id),
+            Some(DeliveryStatus::Queued)
+        );
+        // next_for_channel should now return the message again
+        let next = pipeline.next_for_channel("telegram");
+        assert!(next.is_some(), "message should be available for retry");
+        assert_eq!(next.unwrap().message.id, result.message_id);
+    }
+
+    #[test]
+    fn test_pipeline_can_retry_uses_authoritative_state() {
+        let pipeline = MessagePipeline::new();
+        let msg = OutboundMessage::new("telegram", MessageContent::text("Hello"));
+        let ctx = OutboundContext::new().with_retries(2);
+        let result = pipeline.queue(msg, ctx).unwrap();
+
+        // Initially can retry (0 attempts < 2 max)
+        assert!(pipeline.can_retry(&result.message_id));
+
+        // First attempt
+        pipeline.mark_sending(&result.message_id).unwrap();
+        // After 1 attempt, can still retry (1 < 2)
+        assert!(pipeline.can_retry(&result.message_id));
+
+        pipeline.mark_retry(&result.message_id, "error 1").unwrap();
+
+        // Second attempt
+        pipeline.mark_sending(&result.message_id).unwrap();
+        // After 2 attempts, cannot retry (2 >= 2)
+        assert!(!pipeline.can_retry(&result.message_id));
     }
 
     #[test]

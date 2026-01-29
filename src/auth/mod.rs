@@ -531,4 +531,723 @@ mod tests {
         let addr = Some(IpAddr::V4("127.0.0.1".parse().unwrap()));
         assert!(!is_loopback_request(addr, &headers));
     }
+
+    // ============== authorize_gateway_connect Tests ==============
+
+    /// Helper: create a non-local remote address so Tailscale/local-direct logic
+    /// does not interfere with token/password auth tests.
+    fn remote_addr() -> SocketAddr {
+        "192.168.1.50:9999".parse().unwrap()
+    }
+
+    fn empty_headers() -> HeaderMap {
+        HeaderMap::new()
+    }
+
+    fn no_trusted_proxies() -> Vec<String> {
+        vec![]
+    }
+
+    // --- Token mode: valid token ---
+
+    #[test]
+    fn test_gateway_auth_token_valid() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::Token,
+            token: Some("my-secret-token".to_string()),
+            password: None,
+            allow_tailscale: false,
+        };
+        let result = authorize_gateway_connect(
+            &auth,
+            Some("my-secret-token"),
+            None,
+            &empty_headers(),
+            remote_addr(),
+            &no_trusted_proxies(),
+        );
+        assert!(result.ok, "Valid token should be accepted");
+        assert_eq!(result.method, Some(GatewayAuthMethod::Token));
+        assert!(result.user.is_none());
+        assert!(result.reason.is_none());
+    }
+
+    // --- Token mode: invalid token ---
+
+    #[test]
+    fn test_gateway_auth_token_mismatch() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::Token,
+            token: Some("my-secret-token".to_string()),
+            password: None,
+            allow_tailscale: false,
+        };
+        let result = authorize_gateway_connect(
+            &auth,
+            Some("wrong-token"),
+            None,
+            &empty_headers(),
+            remote_addr(),
+            &no_trusted_proxies(),
+        );
+        assert!(!result.ok, "Wrong token should be rejected");
+        assert!(result.method.is_none());
+        assert_eq!(result.reason, Some(GatewayAuthFailure::TokenMismatch));
+    }
+
+    // --- Token mode: missing token in request ---
+
+    #[test]
+    fn test_gateway_auth_token_missing_from_request() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::Token,
+            token: Some("my-secret-token".to_string()),
+            password: None,
+            allow_tailscale: false,
+        };
+        let result = authorize_gateway_connect(
+            &auth,
+            None,
+            None,
+            &empty_headers(),
+            remote_addr(),
+            &no_trusted_proxies(),
+        );
+        assert!(!result.ok, "Missing token should be rejected");
+        assert_eq!(result.reason, Some(GatewayAuthFailure::TokenMissing));
+    }
+
+    // --- Token mode: token not configured on server ---
+
+    #[test]
+    fn test_gateway_auth_token_not_configured() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::Token,
+            token: None,
+            password: None,
+            allow_tailscale: false,
+        };
+        let result = authorize_gateway_connect(
+            &auth,
+            Some("any-token"),
+            None,
+            &empty_headers(),
+            remote_addr(),
+            &no_trusted_proxies(),
+        );
+        assert!(!result.ok, "Token not configured should reject");
+        assert_eq!(result.reason, Some(GatewayAuthFailure::TokenMissingConfig));
+    }
+
+    // --- Token mode: no token configured and no token provided ---
+
+    #[test]
+    fn test_gateway_auth_token_not_configured_and_not_provided() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::Token,
+            token: None,
+            password: None,
+            allow_tailscale: false,
+        };
+        let result = authorize_gateway_connect(
+            &auth,
+            None,
+            None,
+            &empty_headers(),
+            remote_addr(),
+            &no_trusted_proxies(),
+        );
+        assert!(
+            !result.ok,
+            "No config and no credential should still reject"
+        );
+        assert_eq!(result.reason, Some(GatewayAuthFailure::TokenMissingConfig));
+    }
+
+    // --- Password mode: valid password ---
+
+    #[test]
+    fn test_gateway_auth_password_valid() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::Password,
+            token: None,
+            password: Some("my-secret-pass".to_string()),
+            allow_tailscale: false,
+        };
+        let result = authorize_gateway_connect(
+            &auth,
+            None,
+            Some("my-secret-pass"),
+            &empty_headers(),
+            remote_addr(),
+            &no_trusted_proxies(),
+        );
+        assert!(result.ok, "Valid password should be accepted");
+        assert_eq!(result.method, Some(GatewayAuthMethod::Password));
+        assert!(result.user.is_none());
+        assert!(result.reason.is_none());
+    }
+
+    // --- Password mode: invalid password ---
+
+    #[test]
+    fn test_gateway_auth_password_mismatch() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::Password,
+            token: None,
+            password: Some("my-secret-pass".to_string()),
+            allow_tailscale: false,
+        };
+        let result = authorize_gateway_connect(
+            &auth,
+            None,
+            Some("wrong-pass"),
+            &empty_headers(),
+            remote_addr(),
+            &no_trusted_proxies(),
+        );
+        assert!(!result.ok, "Wrong password should be rejected");
+        assert_eq!(result.reason, Some(GatewayAuthFailure::PasswordMismatch));
+    }
+
+    // --- Password mode: missing password in request ---
+
+    #[test]
+    fn test_gateway_auth_password_missing_from_request() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::Password,
+            token: None,
+            password: Some("my-secret-pass".to_string()),
+            allow_tailscale: false,
+        };
+        let result = authorize_gateway_connect(
+            &auth,
+            None,
+            None,
+            &empty_headers(),
+            remote_addr(),
+            &no_trusted_proxies(),
+        );
+        assert!(!result.ok, "Missing password should be rejected");
+        assert_eq!(result.reason, Some(GatewayAuthFailure::PasswordMissing));
+    }
+
+    // --- Password mode: password not configured on server ---
+
+    #[test]
+    fn test_gateway_auth_password_not_configured() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::Password,
+            token: None,
+            password: None,
+            allow_tailscale: false,
+        };
+        let result = authorize_gateway_connect(
+            &auth,
+            None,
+            Some("any-pass"),
+            &empty_headers(),
+            remote_addr(),
+            &no_trusted_proxies(),
+        );
+        assert!(!result.ok, "Password not configured should reject");
+        assert_eq!(
+            result.reason,
+            Some(GatewayAuthFailure::PasswordMissingConfig)
+        );
+    }
+
+    // --- Password mode: no password configured and no password provided ---
+
+    #[test]
+    fn test_gateway_auth_password_not_configured_and_not_provided() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::Password,
+            token: None,
+            password: None,
+            allow_tailscale: false,
+        };
+        let result = authorize_gateway_connect(
+            &auth,
+            None,
+            None,
+            &empty_headers(),
+            remote_addr(),
+            &no_trusted_proxies(),
+        );
+        assert!(!result.ok);
+        assert_eq!(
+            result.reason,
+            Some(GatewayAuthFailure::PasswordMissingConfig)
+        );
+    }
+
+    // --- Edge case: empty token ---
+
+    #[test]
+    fn test_gateway_auth_token_empty_string() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::Token,
+            token: Some("real-token".to_string()),
+            password: None,
+            allow_tailscale: false,
+        };
+        let result = authorize_gateway_connect(
+            &auth,
+            Some(""),
+            None,
+            &empty_headers(),
+            remote_addr(),
+            &no_trusted_proxies(),
+        );
+        assert!(!result.ok, "Empty token should be rejected");
+        assert_eq!(result.reason, Some(GatewayAuthFailure::TokenMismatch));
+    }
+
+    // --- Edge case: empty password ---
+
+    #[test]
+    fn test_gateway_auth_password_empty_string() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::Password,
+            token: None,
+            password: Some("real-pass".to_string()),
+            allow_tailscale: false,
+        };
+        let result = authorize_gateway_connect(
+            &auth,
+            None,
+            Some(""),
+            &empty_headers(),
+            remote_addr(),
+            &no_trusted_proxies(),
+        );
+        assert!(!result.ok, "Empty password should be rejected");
+        assert_eq!(result.reason, Some(GatewayAuthFailure::PasswordMismatch));
+    }
+
+    // --- Edge case: whitespace-only token ---
+
+    #[test]
+    fn test_gateway_auth_token_whitespace_only() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::Token,
+            token: Some("real-token".to_string()),
+            password: None,
+            allow_tailscale: false,
+        };
+        let result = authorize_gateway_connect(
+            &auth,
+            Some("   "),
+            None,
+            &empty_headers(),
+            remote_addr(),
+            &no_trusted_proxies(),
+        );
+        assert!(!result.ok, "Whitespace-only token should be rejected");
+        assert_eq!(result.reason, Some(GatewayAuthFailure::TokenMismatch));
+    }
+
+    // --- Edge case: whitespace-only password ---
+
+    #[test]
+    fn test_gateway_auth_password_whitespace_only() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::Password,
+            token: None,
+            password: Some("real-pass".to_string()),
+            allow_tailscale: false,
+        };
+        let result = authorize_gateway_connect(
+            &auth,
+            None,
+            Some("   "),
+            &empty_headers(),
+            remote_addr(),
+            &no_trusted_proxies(),
+        );
+        assert!(!result.ok, "Whitespace-only password should be rejected");
+        assert_eq!(result.reason, Some(GatewayAuthFailure::PasswordMismatch));
+    }
+
+    // --- Token mode ignores password field ---
+
+    #[test]
+    fn test_gateway_auth_token_mode_ignores_password() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::Token,
+            token: Some("my-token".to_string()),
+            password: None,
+            allow_tailscale: false,
+        };
+        // Provide password but not token -- should fail because mode is Token
+        let result = authorize_gateway_connect(
+            &auth,
+            None,
+            Some("my-token"),
+            &empty_headers(),
+            remote_addr(),
+            &no_trusted_proxies(),
+        );
+        assert!(
+            !result.ok,
+            "Token mode should not accept password credential"
+        );
+        assert_eq!(result.reason, Some(GatewayAuthFailure::TokenMissing));
+    }
+
+    // --- Password mode ignores token field ---
+
+    #[test]
+    fn test_gateway_auth_password_mode_ignores_token() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::Password,
+            token: None,
+            password: Some("my-pass".to_string()),
+            allow_tailscale: false,
+        };
+        // Provide token but not password -- should fail because mode is Password
+        let result = authorize_gateway_connect(
+            &auth,
+            Some("my-pass"),
+            None,
+            &empty_headers(),
+            remote_addr(),
+            &no_trusted_proxies(),
+        );
+        assert!(
+            !result.ok,
+            "Password mode should not accept token credential"
+        );
+        assert_eq!(result.reason, Some(GatewayAuthFailure::PasswordMissing));
+    }
+
+    // --- Token comparison is case-sensitive ---
+
+    #[test]
+    fn test_gateway_auth_token_case_sensitive() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::Token,
+            token: Some("MyToken".to_string()),
+            password: None,
+            allow_tailscale: false,
+        };
+        let result = authorize_gateway_connect(
+            &auth,
+            Some("mytoken"),
+            None,
+            &empty_headers(),
+            remote_addr(),
+            &no_trusted_proxies(),
+        );
+        assert!(!result.ok, "Token comparison must be case-sensitive");
+        assert_eq!(result.reason, Some(GatewayAuthFailure::TokenMismatch));
+    }
+
+    // --- Password comparison is case-sensitive ---
+
+    #[test]
+    fn test_gateway_auth_password_case_sensitive() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::Password,
+            token: None,
+            password: Some("MyPass".to_string()),
+            allow_tailscale: false,
+        };
+        let result = authorize_gateway_connect(
+            &auth,
+            None,
+            Some("mypass"),
+            &empty_headers(),
+            remote_addr(),
+            &no_trusted_proxies(),
+        );
+        assert!(!result.ok, "Password comparison must be case-sensitive");
+        assert_eq!(result.reason, Some(GatewayAuthFailure::PasswordMismatch));
+    }
+
+    // --- Both empty-string config and empty-string request should match ---
+
+    #[test]
+    fn test_gateway_auth_token_both_empty_matches() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::Token,
+            token: Some(String::new()),
+            password: None,
+            allow_tailscale: false,
+        };
+        let result = authorize_gateway_connect(
+            &auth,
+            Some(""),
+            None,
+            &empty_headers(),
+            remote_addr(),
+            &no_trusted_proxies(),
+        );
+        assert!(
+            result.ok,
+            "Empty token config + empty token request = match (timing_safe_eq on empty strings)"
+        );
+        assert_eq!(result.method, Some(GatewayAuthMethod::Token));
+    }
+
+    // --- GatewayAuthFailure message coverage ---
+
+    #[test]
+    fn test_gateway_auth_failure_messages() {
+        assert!(GatewayAuthFailure::TokenMissingConfig
+            .message()
+            .contains("token not configured"));
+        assert!(GatewayAuthFailure::TokenMissing
+            .message()
+            .contains("token missing"));
+        assert!(GatewayAuthFailure::TokenMismatch
+            .message()
+            .contains("token mismatch"));
+        assert!(GatewayAuthFailure::PasswordMissingConfig
+            .message()
+            .contains("password not configured"));
+        assert!(GatewayAuthFailure::PasswordMissing
+            .message()
+            .contains("password missing"));
+        assert!(GatewayAuthFailure::PasswordMismatch
+            .message()
+            .contains("password mismatch"));
+        assert!(GatewayAuthFailure::Unauthorized
+            .message()
+            .contains("unauthorized"));
+    }
+
+    // --- GatewayAuthResult fields are correct on success ---
+
+    #[test]
+    fn test_gateway_auth_result_fields_on_token_success() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::Token,
+            token: Some("tok".to_string()),
+            password: None,
+            allow_tailscale: false,
+        };
+        let result = authorize_gateway_connect(
+            &auth,
+            Some("tok"),
+            None,
+            &empty_headers(),
+            remote_addr(),
+            &no_trusted_proxies(),
+        );
+        assert!(result.ok);
+        assert_eq!(result.method, Some(GatewayAuthMethod::Token));
+        assert!(result.user.is_none(), "Token auth should not set user");
+        assert!(result.reason.is_none());
+    }
+
+    #[test]
+    fn test_gateway_auth_result_fields_on_password_success() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::Password,
+            token: None,
+            password: Some("pwd".to_string()),
+            allow_tailscale: false,
+        };
+        let result = authorize_gateway_connect(
+            &auth,
+            None,
+            Some("pwd"),
+            &empty_headers(),
+            remote_addr(),
+            &no_trusted_proxies(),
+        );
+        assert!(result.ok);
+        assert_eq!(result.method, Some(GatewayAuthMethod::Password));
+        assert!(result.user.is_none(), "Password auth should not set user");
+        assert!(result.reason.is_none());
+    }
+
+    // --- GatewayAuthResult fields are correct on failure ---
+
+    #[test]
+    fn test_gateway_auth_result_fields_on_failure() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::Token,
+            token: Some("tok".to_string()),
+            password: None,
+            allow_tailscale: false,
+        };
+        let result = authorize_gateway_connect(
+            &auth,
+            Some("bad"),
+            None,
+            &empty_headers(),
+            remote_addr(),
+            &no_trusted_proxies(),
+        );
+        assert!(!result.ok);
+        assert!(result.method.is_none(), "Failed auth should not set method");
+        assert!(result.user.is_none(), "Failed auth should not set user");
+        assert!(result.reason.is_some());
+    }
+
+    // --- Default ResolvedGatewayAuth: token mode with nothing configured ---
+
+    #[test]
+    fn test_gateway_auth_default_config_rejects() {
+        let auth = ResolvedGatewayAuth::default();
+        // Default is Token mode with token=None, so should reject
+        let result = authorize_gateway_connect(
+            &auth,
+            Some("any-token"),
+            None,
+            &empty_headers(),
+            remote_addr(),
+            &no_trusted_proxies(),
+        );
+        assert!(!result.ok);
+        assert_eq!(result.reason, Some(GatewayAuthFailure::TokenMissingConfig));
+    }
+
+    // --- Token with special characters ---
+
+    #[test]
+    fn test_gateway_auth_token_special_chars() {
+        let special_token = "t0k3n!@#$%^&*()_+-=[]{}|;':\",./<>?";
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::Token,
+            token: Some(special_token.to_string()),
+            password: None,
+            allow_tailscale: false,
+        };
+        let result = authorize_gateway_connect(
+            &auth,
+            Some(special_token),
+            None,
+            &empty_headers(),
+            remote_addr(),
+            &no_trusted_proxies(),
+        );
+        assert!(result.ok, "Token with special characters should match");
+    }
+
+    // --- Long token ---
+
+    #[test]
+    fn test_gateway_auth_token_long_value() {
+        let long_token: String = "a".repeat(1024);
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::Token,
+            token: Some(long_token.clone()),
+            password: None,
+            allow_tailscale: false,
+        };
+        let result = authorize_gateway_connect(
+            &auth,
+            Some(&long_token),
+            None,
+            &empty_headers(),
+            remote_addr(),
+            &no_trusted_proxies(),
+        );
+        assert!(result.ok, "Long token should match");
+    }
+
+    // --- Token mode: providing both token and password, only token matters ---
+
+    #[test]
+    fn test_gateway_auth_token_mode_with_both_credentials() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::Token,
+            token: Some("correct-token".to_string()),
+            password: Some("some-pass".to_string()),
+            allow_tailscale: false,
+        };
+        // Correct token provided; password is irrelevant in token mode
+        let result = authorize_gateway_connect(
+            &auth,
+            Some("correct-token"),
+            Some("wrong-pass"),
+            &empty_headers(),
+            remote_addr(),
+            &no_trusted_proxies(),
+        );
+        assert!(
+            result.ok,
+            "Token mode only checks token, password is ignored"
+        );
+        assert_eq!(result.method, Some(GatewayAuthMethod::Token));
+    }
+
+    // --- Password mode: providing both token and password, only password matters ---
+
+    #[test]
+    fn test_gateway_auth_password_mode_with_both_credentials() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::Password,
+            token: Some("some-token".to_string()),
+            password: Some("correct-pass".to_string()),
+            allow_tailscale: false,
+        };
+        // Correct password provided; token is irrelevant in password mode
+        let result = authorize_gateway_connect(
+            &auth,
+            Some("wrong-token"),
+            Some("correct-pass"),
+            &empty_headers(),
+            remote_addr(),
+            &no_trusted_proxies(),
+        );
+        assert!(
+            result.ok,
+            "Password mode only checks password, token is ignored"
+        );
+        assert_eq!(result.method, Some(GatewayAuthMethod::Password));
+    }
+
+    // --- Token with trailing/leading whitespace: no implicit trimming ---
+
+    #[test]
+    fn test_gateway_auth_token_no_implicit_trimming() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::Token,
+            token: Some("my-token".to_string()),
+            password: None,
+            allow_tailscale: false,
+        };
+        // Provide token with leading/trailing space -- should NOT match
+        let result = authorize_gateway_connect(
+            &auth,
+            Some(" my-token "),
+            None,
+            &empty_headers(),
+            remote_addr(),
+            &no_trusted_proxies(),
+        );
+        assert!(
+            !result.ok,
+            "Token comparison should not trim whitespace implicitly"
+        );
+    }
+
+    // --- Password with trailing/leading whitespace: no implicit trimming ---
+
+    #[test]
+    fn test_gateway_auth_password_no_implicit_trimming() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::Password,
+            token: None,
+            password: Some("my-pass".to_string()),
+            allow_tailscale: false,
+        };
+        let result = authorize_gateway_connect(
+            &auth,
+            None,
+            Some(" my-pass "),
+            &empty_headers(),
+            remote_addr(),
+            &no_trusted_proxies(),
+        );
+        assert!(
+            !result.ok,
+            "Password comparison should not trim whitespace implicitly"
+        );
+    }
 }

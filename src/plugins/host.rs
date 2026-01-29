@@ -26,6 +26,20 @@ use super::capabilities::{
 /// Maximum message size for logging (4KB)
 pub const MAX_LOG_MESSAGE_SIZE: usize = 4 * 1024;
 
+/// Safely truncate a string to at most `max_bytes` bytes without splitting
+/// a multi-byte UTF-8 character. Returns the full string if it is already
+/// within the limit.
+fn safe_truncate(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut boundary = max_bytes;
+    while boundary > 0 && !s.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    &s[..boundary]
+}
+
 /// Maximum HTTP request body size (10MB)
 pub const MAX_HTTP_BODY_SIZE: usize = 10 * 1024 * 1024;
 
@@ -180,12 +194,8 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         // Check rate limit
         self.rate_limiters.check_log_message(&self.plugin_id)?;
 
-        // Truncate message if too long
-        let truncated = if message.len() > MAX_LOG_MESSAGE_SIZE {
-            &message[..MAX_LOG_MESSAGE_SIZE]
-        } else {
-            message
-        };
+        // Truncate message if too long (UTF-8 safe)
+        let truncated = safe_truncate(message, MAX_LOG_MESSAGE_SIZE);
 
         // Log with plugin context
         match level {
@@ -868,20 +878,85 @@ mod tests {
     }
 
     #[test]
-    fn test_log_message_truncation() {
-        // The logging should handle messages over MAX_LOG_MESSAGE_SIZE
-        // by truncating them. This test just ensures no panic.
+    fn test_log_message_truncation_ascii() {
+        // ASCII strings truncate exactly at MAX_LOG_MESSAGE_SIZE
         let long_message = "x".repeat(MAX_LOG_MESSAGE_SIZE * 2);
-
-        // Since we can't easily test the actual log output,
-        // we just verify the truncation logic doesn't panic
-        let truncated = if long_message.len() > MAX_LOG_MESSAGE_SIZE {
-            &long_message[..MAX_LOG_MESSAGE_SIZE]
-        } else {
-            &long_message
-        };
-
+        let truncated = safe_truncate(&long_message, MAX_LOG_MESSAGE_SIZE);
         assert_eq!(truncated.len(), MAX_LOG_MESSAGE_SIZE);
+    }
+
+    #[test]
+    fn test_log_message_truncation_multibyte_utf8() {
+        // Build a string of multi-byte chars that exceeds the limit.
+        // U+00E9 (e-acute) is 2 bytes in UTF-8; U+1F600 (emoji) is 4 bytes.
+        let two_byte_char = "\u{00E9}"; // 2 bytes each
+        let count = MAX_LOG_MESSAGE_SIZE; // guarantees overflow
+        let long_message: String = two_byte_char.repeat(count);
+        assert!(long_message.len() > MAX_LOG_MESSAGE_SIZE);
+
+        let truncated = safe_truncate(&long_message, MAX_LOG_MESSAGE_SIZE);
+        // Must not exceed the limit
+        assert!(truncated.len() <= MAX_LOG_MESSAGE_SIZE);
+        // Must be valid UTF-8 (it is a &str, so this is guaranteed at compile time)
+        // and must end on a character boundary
+        assert!(truncated.is_char_boundary(truncated.len()));
+        // Since each char is 2 bytes, the truncated length should be even
+        assert_eq!(truncated.len() % 2, 0);
+    }
+
+    #[test]
+    fn test_log_message_truncation_four_byte_utf8() {
+        // 4-byte emoji repeated to exceed the limit
+        let emoji = "\u{1F600}"; // 4 bytes
+        let count = MAX_LOG_MESSAGE_SIZE; // way over the byte limit
+        let long_message: String = emoji.repeat(count);
+        assert!(long_message.len() > MAX_LOG_MESSAGE_SIZE);
+
+        let truncated = safe_truncate(&long_message, MAX_LOG_MESSAGE_SIZE);
+        assert!(truncated.len() <= MAX_LOG_MESSAGE_SIZE);
+        assert!(truncated.is_char_boundary(truncated.len()));
+        // Length should be a multiple of 4 since each emoji is 4 bytes
+        assert_eq!(truncated.len() % 4, 0);
+    }
+
+    #[test]
+    fn test_log_message_truncation_short_string() {
+        // Strings shorter than the limit are returned unchanged
+        let short = "hello";
+        let truncated = safe_truncate(short, MAX_LOG_MESSAGE_SIZE);
+        assert_eq!(truncated, "hello");
+    }
+
+    #[test]
+    fn test_log_message_truncation_empty_string() {
+        let truncated = safe_truncate("", MAX_LOG_MESSAGE_SIZE);
+        assert_eq!(truncated, "");
+    }
+
+    #[test]
+    fn test_log_message_truncation_exact_boundary() {
+        // String exactly at the limit should be returned as-is
+        let exact = "x".repeat(MAX_LOG_MESSAGE_SIZE);
+        let truncated = safe_truncate(&exact, MAX_LOG_MESSAGE_SIZE);
+        assert_eq!(truncated.len(), MAX_LOG_MESSAGE_SIZE);
+        assert_eq!(truncated, exact.as_str());
+    }
+
+    #[test]
+    fn test_safe_truncate_splits_inside_multibyte() {
+        // "aé" is 3 bytes: 'a' (1 byte) + 'é' (2 bytes: 0xC3 0xA9)
+        // Truncating at byte 2 would split the 'é', so we expect byte 1.
+        let s = "a\u{00E9}";
+        assert_eq!(s.len(), 3);
+        let truncated = safe_truncate(s, 2);
+        assert_eq!(truncated, "a");
+        assert_eq!(truncated.len(), 1);
+    }
+
+    #[test]
+    fn test_safe_truncate_zero_limit() {
+        let truncated = safe_truncate("hello", 0);
+        assert_eq!(truncated, "");
     }
 
     async fn create_test_context_with_tailscale(
