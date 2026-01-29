@@ -88,15 +88,15 @@ enum Commands {
         #[arg(long)]
         hooks: bool,
 
-        /// Hooks authentication token
+        /// Hooks authentication token (use CARAPACE_HOOKS_TOKEN env var to avoid exposure in process list)
         #[arg(long, value_name = "TOKEN")]
         hooks_token: Option<String>,
 
-        /// Gateway authentication token
+        /// Gateway authentication token (use CARAPACE_GATEWAY_TOKEN env var to avoid exposure in process list)
         #[arg(long, value_name = "TOKEN")]
         gateway_token: Option<String>,
 
-        /// Gateway authentication password
+        /// Gateway authentication password (use CARAPACE_GATEWAY_PASSWORD env var to avoid exposure in process list)
         #[arg(long, value_name = "PASSWORD")]
         gateway_password: Option<String>,
 
@@ -205,7 +205,7 @@ async fn main() {
 
     match cli.command {
         Commands::Start {
-            config: _config,
+            config,
             bind,
             dev,
             pid_file,
@@ -220,6 +220,17 @@ async fn main() {
             ui_dist_path,
             log,
         } => {
+            // Check if --config was provided (not yet supported)
+            if config.is_some() {
+                eprintln!("Error: --config is not yet supported. Use environment variables or CLI flags.");
+                process::exit(1);
+            }
+
+            // Fall back to environment variables for secrets (not exposed in process list)
+            let hooks_token = hooks_token.or_else(|| std::env::var("CARAPACE_HOOKS_TOKEN").ok());
+            let gateway_token = gateway_token.or_else(|| std::env::var("CARAPACE_GATEWAY_TOKEN").ok());
+            let gateway_password = gateway_password.or_else(|| std::env::var("CARAPACE_GATEWAY_PASSWORD").ok());
+
             // Set up logging
             if let Some(log_level) = log {
                 std::env::set_var("RUST_LOG", log_level);
@@ -293,7 +304,6 @@ async fn main() {
             // Send SIGTERM for graceful shutdown
             #[cfg(unix)]
             {
-                use std::os::unix::process::CommandExt;
                 let status = std::process::Command::new("kill")
                     .arg("-TERM")
                     .arg(pid.to_string())
@@ -368,8 +378,13 @@ async fn main() {
 
             // Check health endpoint
             if health && running {
-                match reqwest::get(format!("{}/control/status", url)).await {
-                    Ok(resp) => {
+                let client = reqwest::Client::builder()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                    .unwrap();
+                let health_url = format!("{}/control/status", url);
+                match tokio::time::timeout(Duration::from_secs(5), client.get(&health_url).send()).await {
+                    Ok(Ok(resp)) => {
                         if resp.status().is_success() {
                             match resp.json::<serde_json::Value>().await {
                                 Ok(json) => {
@@ -389,8 +404,11 @@ async fn main() {
                             println!("Health: ERROR - HTTP {}", resp.status());
                         }
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         println!("Health: ERROR - {}", e);
+                    }
+                    Err(_) => {
+                        println!("Health: ERROR - Request timed out after 5 seconds");
                     }
                 }
             }
