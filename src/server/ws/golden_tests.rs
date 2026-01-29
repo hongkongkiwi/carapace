@@ -147,6 +147,13 @@ mod golden_trace {
                     if map.contains_key("config") {
                         map.insert("config".to_string(), json!("<CONFIG_DATA>"));
                     }
+                    // exists/valid depend on whether a config file is on disk.
+                    if map.contains_key("exists") {
+                        map.insert("exists".to_string(), json!("<CONFIG_EXISTS>"));
+                    }
+                    if map.contains_key("valid") {
+                        map.insert("valid".to_string(), json!("<CONFIG_VALID>"));
+                    }
                     if let Some(hash) = map.get("hash") {
                         if hash.is_string() || hash.is_null() {
                             map.insert("hash".to_string(), json!("<CONFIG_HASH>"));

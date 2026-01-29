@@ -7,14 +7,14 @@ expression: normalized
   "ok": true,
   "result": {
     "config": "<CONFIG_DATA>",
-    "exists": true,
+    "exists": "<CONFIG_EXISTS>",
     "hash": "<CONFIG_HASH>",
     "issues": "<CONFIG_ISSUES>",
     "legacyIssues": [],
     "parsed": "<CONFIG_PARSED>",
     "path": "<PATH>",
     "raw": "<CONFIG_RAW>",
-    "valid": true,
+    "valid": "<CONFIG_VALID>",
     "warnings": []
   }
 }
