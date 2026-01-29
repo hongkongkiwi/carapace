@@ -20,6 +20,7 @@ pub mod media;
 pub mod messages;
 pub mod nodes;
 pub mod plugins;
+pub mod providers;
 pub mod server;
 pub mod sessions;
 pub mod usage;
