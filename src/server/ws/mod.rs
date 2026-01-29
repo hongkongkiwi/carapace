@@ -553,6 +553,16 @@ impl WsServerState {
         self.plugin_registry.as_ref()
     }
 
+    /// Get the outbound message pipeline.
+    pub(crate) fn message_pipeline(&self) -> &Arc<messages::outbound::MessagePipeline> {
+        &self.message_pipeline
+    }
+
+    /// Get the channel registry.
+    pub(crate) fn channel_registry(&self) -> &Arc<channels::ChannelRegistry> {
+        &self.channel_registry
+    }
+
     fn next_event_seq(&self) -> u64 {
         let mut guard = self.event_seq.lock();
         *guard += 1;
@@ -2720,7 +2730,7 @@ fn resolve_node_command_allowlist(
     allowlist
 }
 
-fn resolve_state_dir() -> PathBuf {
+pub(crate) fn resolve_state_dir() -> PathBuf {
     if let Ok(dir) = env::var("MOLTBOT_STATE_DIR") {
         return PathBuf::from(dir);
     }
