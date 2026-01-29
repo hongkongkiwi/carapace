@@ -20,11 +20,13 @@ const SKILL_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 /// Name of the skills manifest file stored alongside WASM binaries.
 const SKILLS_MANIFEST_FILE: &str = "skills-manifest.json";
 
-fn ensure_object(value: &mut Value) -> &mut serde_json::Map<String, Value> {
+fn ensure_object(value: &mut Value) -> Result<&mut serde_json::Map<String, Value>, ErrorShape> {
     if !value.is_object() {
         *value = Value::Object(serde_json::Map::new());
     }
-    value.as_object_mut().expect("value is object")
+    value
+        .as_object_mut()
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "expected JSON object value", None))
 }
 
 fn resolve_workspace_dir(cfg: &Value) -> PathBuf {
@@ -126,8 +128,26 @@ fn validate_url(raw: &str) -> Result<url::Url, ErrorShape> {
 fn read_skills_manifest(skills_dir: &Path) -> Value {
     let manifest_path = skills_dir.join(SKILLS_MANIFEST_FILE);
     match std::fs::read_to_string(&manifest_path) {
-        Ok(contents) => serde_json::from_str(&contents).unwrap_or_else(|_| json!({})),
-        Err(_) => json!({}),
+        Ok(contents) => serde_json::from_str(&contents).unwrap_or_else(|e| {
+            tracing::warn!(
+                path = %manifest_path.display(),
+                error = %e,
+                "skills manifest JSON is corrupt, falling back to empty object"
+            );
+            json!({})
+        }),
+        Err(e) => {
+            // Only warn if the file exists but could not be read (permission error, etc.).
+            // A missing file is expected on first run and not worth logging.
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    path = %manifest_path.display(),
+                    error = %e,
+                    "failed to read skills manifest, falling back to empty object"
+                );
+            }
+            json!({})
+        }
     }
 }
 
@@ -406,11 +426,11 @@ fn handle_skills_install_inner(
 
     // Record metadata in the skills manifest
     let mut manifest = read_skills_manifest(skills_dir);
-    let manifest_obj = ensure_object(&mut manifest);
+    let manifest_obj = ensure_object(&mut manifest)?;
     let entry = manifest_obj
         .entry(name.to_string())
         .or_insert_with(|| json!({}));
-    let entry_obj = ensure_object(entry);
+    let entry_obj = ensure_object(entry)?;
     entry_obj.insert("name".to_string(), Value::String(name.to_string()));
     if let Some(ref v) = version {
         entry_obj.insert("version".to_string(), Value::String(v.clone()));
@@ -432,15 +452,15 @@ fn handle_skills_install_inner(
 
     // Also record the skill in the main config (preserving existing behaviour)
     let mut config_value = read_config_snapshot().config;
-    let root = ensure_object(&mut config_value);
+    let root = ensure_object(&mut config_value)?;
     let skills = root.entry("skills").or_insert_with(|| json!({}));
-    let skills_obj = ensure_object(skills);
+    let skills_obj = ensure_object(skills)?;
     let entries = skills_obj.entry("entries").or_insert_with(|| json!({}));
-    let entries_obj = ensure_object(entries);
+    let entries_obj = ensure_object(entries)?;
     let cfg_entry = entries_obj
         .entry(name.to_string())
         .or_insert_with(|| json!({}));
-    let cfg_entry_obj = ensure_object(cfg_entry);
+    let cfg_entry_obj = ensure_object(cfg_entry)?;
     cfg_entry_obj.insert("enabled".to_string(), Value::Bool(true));
     cfg_entry_obj.insert("name".to_string(), Value::String(name.to_string()));
     cfg_entry_obj.insert(
@@ -535,11 +555,11 @@ fn handle_skills_update_inner(
     let updated_at = now_ms();
 
     // Update the manifest entry
-    let manifest_obj = ensure_object(&mut manifest);
+    let manifest_obj = ensure_object(&mut manifest)?;
     let entry = manifest_obj
         .entry(name.to_string())
         .or_insert_with(|| json!({}));
-    let entry_obj = ensure_object(entry);
+    let entry_obj = ensure_object(entry)?;
     entry_obj.insert("name".to_string(), Value::String(name.to_string()));
     if let Some(ref v) = version {
         entry_obj.insert("version".to_string(), Value::String(v.clone()));
@@ -964,6 +984,60 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.message.contains("unsupported url scheme"));
+    }
+
+    // ---- ensure_object tests ----
+
+    #[test]
+    fn test_ensure_object_with_object_value() {
+        let mut value = json!({"key": "val"});
+        let obj = ensure_object(&mut value).unwrap();
+        assert_eq!(obj.get("key").unwrap(), "val");
+    }
+
+    #[test]
+    fn test_ensure_object_with_non_object_resets_to_empty() {
+        // A non-object value (e.g. a string) should be replaced with an empty object
+        let mut value = json!("not an object");
+        let obj = ensure_object(&mut value).unwrap();
+        assert!(obj.is_empty());
+        assert!(value.is_object());
+    }
+
+    #[test]
+    fn test_ensure_object_with_null_resets_to_empty() {
+        let mut value = Value::Null;
+        let obj = ensure_object(&mut value).unwrap();
+        assert!(obj.is_empty());
+        assert!(value.is_object());
+    }
+
+    #[test]
+    fn test_ensure_object_with_array_resets_to_empty() {
+        let mut value = json!([1, 2, 3]);
+        let obj = ensure_object(&mut value).unwrap();
+        assert!(obj.is_empty());
+        assert!(value.is_object());
+    }
+
+    // ---- read_skills_manifest logging tests ----
+
+    #[test]
+    fn test_read_skills_manifest_corrupt_json_returns_empty() {
+        // Corrupt JSON should fall back to empty object (and log a warning)
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(SKILLS_MANIFEST_FILE), b"not json {{{{").unwrap();
+        let manifest = read_skills_manifest(dir.path());
+        assert_eq!(manifest, json!({}));
+    }
+
+    #[test]
+    fn test_read_skills_manifest_empty_file_returns_empty() {
+        // An empty file is invalid JSON and should fall back gracefully
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(SKILLS_MANIFEST_FILE), b"").unwrap();
+        let manifest = read_skills_manifest(dir.path());
+        assert_eq!(manifest, json!({}));
     }
 
     // ---- download_skill_wasm tests ----
