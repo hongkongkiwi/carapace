@@ -4,8 +4,18 @@
 //! and their connection states.
 
 pub mod telegram;
+pub mod matrix;
+pub mod line;
+pub mod teams;
+pub mod mattermost;
+pub mod googlechat;
 
 pub use telegram::*;
+pub use matrix::*;
+pub use line::*;
+pub use teams::*;
+pub use mattermost::*;
+pub use googlechat::*;
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
