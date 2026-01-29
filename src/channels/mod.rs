@@ -4,8 +4,21 @@
 //! and their connection states.
 
 pub mod console;
+pub mod discord;
+pub mod google_chat;
+pub mod imessage;
 pub mod line;
+pub mod matrix;
+pub mod signal;
+pub mod skype;
+pub mod slack;
+pub mod teams;
+pub mod telegram;
+pub mod voice;
+pub mod whatsapp;
 pub mod webhook;
+pub mod webchat;
+pub mod zalo;
 
 pub use line::*;
 

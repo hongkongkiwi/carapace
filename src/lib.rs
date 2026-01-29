@@ -15,6 +15,7 @@ pub mod credentials;
 pub mod cron;
 pub mod devices;
 pub mod exec;
+pub mod flows;
 pub mod hooks;
 pub mod logging;
 pub mod media;
@@ -25,5 +26,7 @@ pub mod plugins;
 pub mod polls;
 pub mod server;
 pub mod sessions;
+pub mod skills;
 pub mod tts;
+// pub mod ui; // Temporarily disabled - requires leptos_router 0.8 API update
 pub mod usage;

@@ -24,6 +24,7 @@ mod credentials;
 mod cron;
 mod devices;
 mod exec;
+mod flows;
 mod hooks;
 mod logging;
 mod media;

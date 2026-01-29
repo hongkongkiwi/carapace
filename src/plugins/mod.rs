@@ -40,6 +40,7 @@ pub mod dispatch;
 pub mod host;
 pub mod loader;
 pub mod runtime;
+pub mod typescript;
 pub mod tools;
 
 pub mod caps;

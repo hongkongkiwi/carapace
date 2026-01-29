@@ -30,6 +30,9 @@ pub enum BindingError {
     #[error("Host error: {0}")]
     HostError(#[from] HostError),
 
+    #[error("JSON error: {0}")]
+    JsonError(#[from] serde_json::Error),
+
     #[error("Wasmtime error: {0}")]
     WasmtimeError(String),
 }
