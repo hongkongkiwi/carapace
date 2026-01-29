@@ -114,9 +114,29 @@ impl AgentRunRegistry {
 
     /// Register a new agent run.
     ///
+    /// Returns `false` if a run with the same ID already exists and is still
+    /// active (Queued or Running). Callers should treat this as an idempotent
+    /// duplicate and return the existing run's status instead of spawning a new
+    /// executor.
+    ///
     /// Automatically prunes old completed runs when the registry exceeds
     /// [`MAX_RUNS`] to prevent unbounded memory growth.
-    pub fn register(&mut self, run: AgentRun) {
+    pub fn register(&mut self, run: AgentRun) -> bool {
+        // Reject duplicate registration for active runs
+        if let Some(existing) = self.runs.get(&run.run_id) {
+            if matches!(
+                existing.status,
+                AgentRunStatus::Queued | AgentRunStatus::Running
+            ) {
+                tracing::warn!(
+                    run_id = %run.run_id,
+                    status = %existing.status,
+                    "duplicate run registration rejected — run already active"
+                );
+                return false;
+            }
+        }
+
         let run_id = run.run_id.clone();
         let session_key = run.session_key.clone();
         self.runs.insert(run_id.clone(), run);
@@ -128,6 +148,7 @@ impl AgentRunRegistry {
         if self.runs.len() > Self::MAX_RUNS {
             self.prune_completed();
         }
+        true
     }
 
     /// Remove the oldest completed/failed/cancelled runs to stay under the cap.
@@ -1493,6 +1514,25 @@ pub(super) fn handle_agent(
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
+    // Check for duplicate idempotencyKey — return existing run status
+    {
+        let registry = state.agent_run_registry.lock();
+        if let Some(existing) = registry.get(idempotency_key) {
+            if matches!(
+                existing.status,
+                AgentRunStatus::Queued | AgentRunStatus::Running
+            ) {
+                return Ok(json!({
+                    "runId": existing.run_id,
+                    "status": existing.status.to_string(),
+                    "sessionKey": existing.session_key,
+                    "duplicate": true,
+                    "streaming": stream
+                }));
+            }
+        }
+    }
+
     let metadata = build_session_metadata(params);
     let session = state
         .session_store
@@ -1887,6 +1927,25 @@ pub(super) fn handle_chat_send(
         .and_then(|v| v.get("triggerAgent"))
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
+
+    // Check for duplicate idempotencyKey — return existing run status
+    {
+        let registry = state.agent_run_registry.lock();
+        if let Some(existing) = registry.get(idempotency_key) {
+            if matches!(
+                existing.status,
+                AgentRunStatus::Queued | AgentRunStatus::Running
+            ) {
+                return Ok(json!({
+                    "runId": existing.run_id,
+                    "status": existing.status.to_string(),
+                    "sessionKey": existing.session_key,
+                    "duplicate": true,
+                    "streaming": stream
+                }));
+            }
+        }
+    }
 
     let session = if let Some(session_id) = session_id {
         state
@@ -2302,6 +2361,26 @@ mod tests {
         let result = rx.await.unwrap();
         assert_eq!(result.status, AgentRunStatus::Completed);
         assert_eq!(result.response, Some("final response".to_string()));
+    }
+
+    #[test]
+    fn test_agent_run_registry_register_rejects_active_duplicate() {
+        let mut registry = AgentRunRegistry::new();
+
+        // First registration succeeds
+        assert!(registry.register(create_test_run("run-1", "session-1")));
+        assert!(registry.get("run-1").is_some());
+
+        // Duplicate registration while Queued is rejected
+        assert!(!registry.register(create_test_run("run-1", "session-1")));
+
+        // Mark as Running — duplicate still rejected
+        registry.mark_started("run-1");
+        assert!(!registry.register(create_test_run("run-1", "session-1")));
+
+        // Mark as Completed — re-registration now allowed (terminal state)
+        registry.mark_completed("run-1", "done".to_string());
+        assert!(registry.register(create_test_run("run-1", "session-1")));
     }
 
     // ============== AgentStreamEvent Tests ==============
