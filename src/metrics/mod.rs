@@ -81,7 +81,15 @@ impl Histogram {
 
     /// Create a histogram with custom bucket bounds (in milliseconds)
     pub fn with_buckets(bounds: &[u64]) -> Self {
-        let buckets = bounds
+        // Sort and dedup bounds, then add overflow bucket
+        let mut sorted = bounds.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        if sorted.last().copied() != Some(u64::MAX) {
+            sorted.push(u64::MAX);
+        }
+
+        let buckets = sorted
             .iter()
             .map(|&b| (b, AtomicU64::new(0)))
             .collect();
