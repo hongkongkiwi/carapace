@@ -11,7 +11,7 @@
 | Category | Completion | Notes |
 |----------|-----------|-------|
 | Infrastructure (WS, HTTP, config, logging) | ~99% | Production-quality, TLS, mDNS, config reload, CLI, Tailscale, remote gateway |
-| Security (auth, credentials, rate limiting) | ~99% | Real, reviewed, tool allowlists, OAuth profiles (Google/GitHub/Discord) |
+| Security (auth, credentials, rate limiting, encryption) | ~99% | Real, reviewed, tool allowlists, OAuth profiles, encrypted secrets, audit logging, backup encryption |
 | Data storage (sessions, cron, usage, nodes, devices) | ~99% | Real, tested, file-backed, retention cleanup |
 | Core functionality (agent/LLM, channel delivery, cron execution) | ~99% | Multi-provider (Anthropic/OpenAI/Ollama/Gemini/Bedrock), built-in tools, channel tools, media analysis, link understanding |
 
@@ -40,6 +40,14 @@
 - [x] Network binding modes — loopback/lan/auto/tailnet/custom with interface detection
 - [x] Link understanding — URL extraction, SSRF-safe fetching, HTML-to-text, LRU cache
 - [x] Tailscale serve/funnel — auto-configure Tailscale serve (LAN proxy) or funnel (public internet), lifecycle management, teardown on shutdown
+
+## Security Features
+
+- [x] Encrypted config secrets — `src/config/secrets.rs` AES-256-GCM at-rest encryption with PBKDF2 key derivation, `enc:v1:` prefix format, seal/resolve config tree operations (41 tests)
+- [x] Structured audit logging — `src/logging/audit.rs` append-only JSONL audit trail with 17 event types, file rotation at 50MB, `recent_audit_events()` tail reader (29 tests)
+- [x] Secret masking in logs — `src/logging/redact.rs` regex-based redaction of API keys, bearer tokens, query params; JSON key name matching; `RedactedDisplay<T>` wrapper (22 tests)
+- [x] Backup encryption — `src/cli/backup_crypto.rs` AES-256-GCM with PBKDF2-HMAC-SHA256 (600K iterations), `CRPC_ENC` format with magic/version/salt/nonce header (17 tests)
+- [x] Prometheus metrics — `src/server/metrics.rs` counter, gauge, histogram types with atomic backing, `/metrics` text exposition endpoint, 10 standard metrics (31 tests)
 
 ## Core Functionality
 
@@ -101,7 +109,7 @@
 
 ## Remaining Code TODOs
 
-No TODO comments remain in the codebase.
+- [ ] Gateway WS transport — actual `tokio-tungstenite` WebSocket client connection in `connect_to_gateway` (currently returns mock Connected state)
 
 ## Feature Gaps (clawdbot parity)
 
@@ -139,6 +147,30 @@ Priority order reflects what blocks real-world usage soonest.
 - [x] **Agent tool allowlists** — `src/agent/tool_policy.rs` with AllowAll/AllowList/DenyList, enforcement at definition filtering and dispatch
 - [x] **Automatic session retention cleanup** — `src/sessions/retention.rs` with background timer, configurable interval/retention days
 
+## Security Superiority Roadmap (beyond parity)
+
+### Completed
+
+- [x] **Encrypted config secrets** — AES-256-GCM at-rest encryption for API keys and tokens in config files
+- [x] **Structured audit logging** — Append-only JSONL audit trail for all security-relevant operations
+- [x] **Secret masking in logs** — Automatic redaction of secrets from all log output
+- [x] **Backup encryption** — AES-256-GCM encrypted backup archives with PBKDF2 key derivation
+- [x] **Prometheus metrics** — `/metrics` endpoint for monitoring and alerting
+
+### Planned
+
+- [ ] **Prompt guard** — Three-layer safety system for agent prompts:
+  - Pre-flight analysis: Static checks on system prompts (injection patterns, privilege escalation vectors, data exfiltration markers)
+  - Post-flight filtering: Output sanitization (PII leak detection, credential exposure, harmful instruction detection)
+  - Config-time linting: Warn when `agents.list` entries contain risky patterns (unrestricted tool access, no output limits, overly broad instructions)
+- [ ] **Gateway WS transport** — Real WebSocket client connection for remote gateway nodes via `tokio-tungstenite`
+- [ ] **Content security policy for agent outputs** — Sandboxed HTML/markdown rendering with CSP
+- [ ] **Agent execution sandboxing** — Resource limits (CPU, memory, network) per agent run
+- [ ] **Cryptographic session integrity** — HMAC-signed session files to detect tampering
+- [ ] **mTLS for gateway-to-gateway** — Mutual TLS authentication for multi-node deployments
+- [ ] **Capability-based plugin permissions** — Fine-grained permissions model for WASM plugins
+- [ ] **deny.toml** — `cargo-deny` configuration for dependency auditing
+
 ## Missing Non-Code Artifacts
 
 - [x] Example config file — `config.example.json5`
@@ -149,7 +181,7 @@ Priority order reflects what blocks real-world usage soonest.
 
 ## Tests
 
-- [x] 1,684 tests passing (`cargo nextest run`)
+- [x] 1,849 tests passing (`cargo test --lib`)
 - [x] Pre-commit hooks: `cargo fmt --check` + `cargo clippy -- -D warnings`
 - [x] Pre-push hooks: full test suite via `cargo nextest run`
 - [x] CI: fmt, clippy -D warnings, nextest, MSRV check (1.75.0), cargo-deny, cross-platform (macOS, Windows, Linux)

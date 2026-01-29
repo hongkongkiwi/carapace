@@ -7,6 +7,7 @@ pub mod control;
 pub mod csrf;
 pub mod headers;
 pub mod http;
+pub mod metrics;
 pub mod openai;
 pub mod ratelimit;
 pub mod ws;

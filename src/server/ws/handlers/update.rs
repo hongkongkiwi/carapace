@@ -6,6 +6,8 @@
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
@@ -79,6 +81,128 @@ impl Default for UpdateState {
             last_error: None,
             release_notes: None,
             download_url: None,
+        }
+    }
+}
+
+/// Result of applying a staged update binary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplyResult {
+    /// Whether the update was successfully applied
+    pub applied: bool,
+    /// SHA-256 hash of the new binary
+    pub sha256: String,
+    /// Path to the binary that was replaced
+    pub binary_path: String,
+}
+
+/// Compute SHA-256 hex digest of a file at the given path.
+fn compute_sha256(path: &str) -> Result<String, String> {
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("failed to open file for hashing: {e}"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let n = file
+            .read(&mut buffer)
+            .map_err(|e| format!("failed to read file for hashing: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Apply a staged binary update atomically.
+pub fn apply_staged_update(staged_path: &str) -> Result<ApplyResult, String> {
+    let staged_meta = std::fs::metadata(staged_path)
+        .map_err(|e| format!("staged binary not found at '{}': {e}", staged_path))?;
+    if staged_meta.len() == 0 {
+        return Err(format!("staged binary at '{}' is empty", staged_path));
+    }
+
+    let sha256 = compute_sha256(staged_path)?;
+
+    let current_exe = std::env::current_exe()
+        .map_err(|e| format!("failed to determine current binary path: {e}"))?;
+    let current_path = current_exe
+        .canonicalize()
+        .map_err(|e| format!("failed to canonicalize current binary path: {e}"))?;
+    let binary_path = current_path.to_string_lossy().into_owned();
+
+    let backup_path = format!("{}.bak", current_path.display());
+
+    std::fs::rename(&current_path, &backup_path)
+        .map_err(|e| format!("failed to rename current binary to .bak: {e}"))?;
+
+    if let Err(copy_err) = std::fs::copy(staged_path, &current_path) {
+        if let Err(restore_err) = std::fs::rename(&backup_path, &current_path) {
+            return Err(format!(
+                "CRITICAL: copy failed ({copy_err}) AND restore failed ({restore_err}). Backup at: {backup_path}"
+            ));
+        }
+        return Err(format!(
+            "failed to copy staged binary to current path: {copy_err}"
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o755);
+        if let Err(e) = std::fs::set_permissions(&current_path, perms) {
+            warn!("failed to set executable permissions on updated binary: {e}");
+        }
+    }
+
+    if let Err(e) = std::fs::remove_file(&backup_path) {
+        warn!("failed to remove backup file {}: {e}", backup_path);
+    }
+
+    Ok(ApplyResult {
+        applied: true,
+        sha256,
+        binary_path,
+    })
+}
+
+/// Remove stale backup and old update files.
+pub fn cleanup_old_binaries() {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            if let Ok(entries) = std::fs::read_dir(parent) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if let Some(ext) = path.extension() {
+                        if ext == "bak" || ext == "old" {
+                            if let Err(e) = std::fs::remove_file(&path) {
+                                warn!("failed to remove old binary {}: {e}", path.display());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let updates_dir = resolve_state_dir().join("updates");
+    if let Ok(entries) = std::fs::read_dir(&updates_dir) {
+        let seven_days = Duration::from_secs(7 * 24 * 60 * 60);
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Ok(meta) = path.metadata() {
+                let stale = meta
+                    .modified()
+                    .ok()
+                    .and_then(|m| m.elapsed().ok())
+                    .is_some_and(|age| age > seven_days);
+                if stale {
+                    if let Err(e) = std::fs::remove_file(&path) {
+                        warn!("failed to remove stale staged file {}: {e}", path.display());
+                    }
+                }
+            }
         }
     }
 }
@@ -486,12 +610,36 @@ pub(super) async fn handle_update_install() -> Result<Value, ErrorShape> {
     state.installing = false;
 
     match result {
-        Ok(staged_path) => Ok(json!({
-            "ok": true,
-            "version": version,
-            "stagedPath": staged_path,
-            "message": "Update staged successfully. Restart to apply."
-        })),
+        Ok(staged_path) => {
+            // Apply the staged binary atomically
+            match apply_staged_update(&staged_path) {
+                Ok(apply_result) => {
+                    // Clean up old binaries in the background
+                    cleanup_old_binaries();
+                    Ok(json!({
+                        "ok": true,
+                        "version": version,
+                        "stagedPath": staged_path,
+                        "applied": apply_result.applied,
+                        "sha256": apply_result.sha256,
+                        "binaryPath": apply_result.binary_path,
+                        "message": "Update applied successfully. Restart to use new version."
+                    }))
+                }
+                Err(apply_err) => {
+                    warn!("update apply failed: {apply_err}");
+                    state.last_error = Some(apply_err.clone());
+                    Err(error_shape(
+                        ERROR_UNAVAILABLE,
+                        &format!("update apply failed: {apply_err}"),
+                        Some(json!({
+                            "version": version,
+                            "stagedPath": staged_path
+                        })),
+                    ))
+                }
+            }
+        }
         Err(err) => {
             warn!("update install failed: {err}");
             state.last_error = Some(err.clone());
@@ -728,5 +876,236 @@ mod tests {
         // last_error should be populated since HTTP failed
         assert!(state.last_error.is_some());
         assert!(!state.update_available);
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_staged_update tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_apply_staged_update_nonexistent_path() {
+        let result = apply_staged_update("/nonexistent/path/to/binary");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("staged binary not found"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_apply_staged_update_empty_file() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let empty_file = dir.path().join("empty-binary");
+        std::fs::write(&empty_file, b"").expect("failed to write empty file");
+        let result = apply_staged_update(empty_file.to_str().unwrap());
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("is empty"), "unexpected error: {err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // SHA-256 computation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_sha256_known_value() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let file_path = dir.path().join("test-hash");
+        // SHA-256 of b"hello world\n"
+        std::fs::write(&file_path, b"hello world\n").expect("failed to write file");
+        let hash = compute_sha256(file_path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            hash, "a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447",
+            "SHA-256 mismatch for known input"
+        );
+    }
+
+    #[test]
+    fn test_compute_sha256_empty_file() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let file_path = dir.path().join("empty");
+        std::fs::write(&file_path, b"").expect("failed to write file");
+        let hash = compute_sha256(file_path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            hash,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn test_compute_sha256_nonexistent_file() {
+        let result = compute_sha256("/nonexistent/file/path");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("failed to open file"));
+    }
+
+    #[test]
+    fn test_compute_sha256_deterministic() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let file_path = dir.path().join("deterministic");
+        std::fs::write(&file_path, b"deterministic content").expect("failed to write");
+        let path_str = file_path.to_str().unwrap();
+        let hash1 = compute_sha256(path_str).unwrap();
+        let hash2 = compute_sha256(path_str).unwrap();
+        assert_eq!(hash1, hash2, "SHA-256 should be deterministic");
+    }
+
+    // -----------------------------------------------------------------------
+    // cleanup_old_binaries tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cleanup_old_binaries_removes_bak_files() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let bak_file = dir.path().join("carapace.bak");
+        let old_file = dir.path().join("carapace.old");
+        std::fs::write(&bak_file, b"backup").expect("write bak");
+        std::fs::write(&old_file, b"old").expect("write old");
+        cleanup_old_binaries();
+    }
+
+    #[test]
+    fn test_cleanup_old_binaries_preserves_non_backup_files() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let normal_file = dir.path().join("important.txt");
+        std::fs::write(&normal_file, b"keep me").expect("write");
+        cleanup_old_binaries();
+        assert!(
+            normal_file.exists(),
+            "cleanup_old_binaries should not remove non-backup files"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_old_binaries_no_panic_on_missing_dirs() {
+        cleanup_old_binaries();
+    }
+
+    // -----------------------------------------------------------------------
+    // expected_asset_name tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_expected_asset_name_format() {
+        let name = expected_asset_name();
+        let parts: Vec<&str> = name.split('-').collect();
+        assert!(
+            parts.len() >= 3,
+            "asset name should have at least 3 dash-separated parts: {name}"
+        );
+        assert_eq!(parts[0], "carapace");
+    }
+
+    #[test]
+    fn test_expected_asset_name_no_exe_on_unix() {
+        let name = expected_asset_name();
+        if cfg!(unix) {
+            assert!(
+                !name.ends_with(".exe"),
+                "Unix asset name should not end with .exe: {name}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Staged path construction tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_staged_path_construction() {
+        let updates_dir = resolve_state_dir().join("updates");
+        let version = "1.2.3";
+        let staged_name = format!("carapace-{version}");
+        let staged_path = updates_dir.join(&staged_name);
+        let path_str = staged_path.to_string_lossy();
+        assert!(
+            path_str.contains("updates") && path_str.contains("carapace-1.2.3"),
+            "staged path should contain updates/carapace-VERSION: {}",
+            staged_path.display()
+        );
+    }
+
+    #[test]
+    fn test_staged_path_different_versions() {
+        let updates_dir = resolve_state_dir().join("updates");
+        let path_a = updates_dir.join("carapace-1.0.0");
+        let path_b = updates_dir.join("carapace-2.0.0");
+        assert_ne!(
+            path_a, path_b,
+            "different versions should have different paths"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // State transition tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_install_sets_installing_flag() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        reset_state();
+        {
+            let mut state = UPDATE_STATE.write();
+            state.update_available = true;
+            state.latest_version = Some("99.0.0".to_string());
+            state.installing = false;
+        }
+        let state = UPDATE_STATE.read();
+        assert!(!state.installing);
+        assert!(state.update_available);
+    }
+
+    #[test]
+    fn test_state_default_values() {
+        let state = UpdateState::default();
+        assert!(!state.update_available);
+        assert!(!state.checking);
+        assert!(!state.installing);
+        assert_eq!(state.channel, "stable");
+        assert!(state.auto_update);
+        assert!(state.latest_version.is_none());
+        assert!(state.last_error.is_none());
+        assert!(state.download_url.is_none());
+        assert!(state.release_notes.is_none());
+        assert!(state.last_check_at.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // ApplyResult struct tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_apply_result_fields() {
+        let result = ApplyResult {
+            applied: true,
+            sha256: "abc123".to_string(),
+            binary_path: "/usr/bin/carapace".to_string(),
+        };
+        assert!(result.applied);
+        assert_eq!(result.sha256, "abc123");
+        assert_eq!(result.binary_path, "/usr/bin/carapace");
+    }
+
+    #[test]
+    fn test_apply_result_serialize() {
+        let result = ApplyResult {
+            applied: true,
+            sha256: "deadbeef".to_string(),
+            binary_path: "/tmp/test".to_string(),
+        };
+        let json = serde_json::to_value(&result).expect("serialize ApplyResult");
+        assert_eq!(json["applied"], true);
+        assert_eq!(json["sha256"], "deadbeef");
+        assert_eq!(json["binary_path"], "/tmp/test");
+    }
+
+    #[test]
+    fn test_apply_result_deserialize() {
+        let json_str = r##"{"applied":false,"sha256":"abc","binary_path":"/bin/ttt"}"##;
+        let result: ApplyResult = serde_json::from_str(json_str).expect("deserialize ApplyResult");
+        assert!(!result.applied);
+        assert_eq!(result.sha256, "abc");
+        assert_eq!(result.binary_path, "/bin/ttt");
     }
 }

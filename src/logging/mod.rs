@@ -37,7 +37,9 @@
 //! }).unwrap();
 //! ```
 
+pub mod audit;
 pub mod buffer;
+pub mod redact;
 
 use std::fs::File;
 use std::io;

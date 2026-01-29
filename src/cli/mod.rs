@@ -13,6 +13,8 @@
 //! - `pair` -- pair with a remote gateway node
 //! - `update` -- check for updates or self-update
 
+pub mod backup_crypto;
+
 use clap::{Parser, Subcommand};
 
 /// Carapace gateway server for AI assistants.
@@ -1023,19 +1025,77 @@ pub async fn handle_update(
             .is_some_and(|n| n.contains(&asset_name))
     });
 
-    if let Some(asset) = matching_asset {
-        let name = asset
-            .get("name")
-            .and_then(|n| n.as_str())
-            .unwrap_or(&asset_name);
-        println!("Downloading {}...", name);
+    let asset = match matching_asset {
+        Some(a) => a,
+        None => {
+            eprintln!(
+                "No matching binary asset found for platform '{}'. Download manually from: {}",
+                asset_name, html_url
+            );
+            return Ok(());
+        }
+    };
+
+    let download_url = asset
+        .get("browser_download_url")
+        .and_then(|u| u.as_str())
+        .ok_or("asset has no download URL")?;
+    let name = asset
+        .get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or(&asset_name);
+
+    println!("Downloading {}...", name);
+
+    // Download the binary
+    let dl_response = client
+        .get(download_url)
+        .header("User-Agent", format!("carapace/{}", current_version))
+        .send()
+        .await?;
+
+    if !dl_response.status().is_success() {
+        eprintln!("Download failed with HTTP {}", dl_response.status());
+        return Err(format!("download failed: HTTP {}", dl_response.status()).into());
     }
 
-    // Stub the actual binary replacement.
-    println!(
-        "Self-update installation is not yet implemented. Download manually from: {}",
-        html_url
-    );
+    let bytes = dl_response.bytes().await?;
+    if bytes.is_empty() {
+        return Err("downloaded asset is empty".into());
+    }
+
+    // Stage the binary
+    let state_dir = crate::server::ws::resolve_state_dir();
+    let updates_dir = state_dir.join("updates");
+    std::fs::create_dir_all(&updates_dir)?;
+    let staged_path = updates_dir.join(format!("carapace-{}", target_version));
+    std::fs::write(&staged_path, &bytes)?;
+
+    // Set executable permissions on Unix
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&staged_path, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    println!("Applying update...");
+
+    // Apply the staged binary
+    let staged_str = staged_path.to_string_lossy();
+    match crate::server::ws::apply_staged_update(&staged_str) {
+        Ok(result) => {
+            println!("Update applied successfully.");
+            println!("  Binary: {}", result.binary_path);
+            println!("  SHA-256: {}", result.sha256);
+            // Clean up old backup files
+            crate::server::ws::cleanup_old_binaries();
+            println!("Restart carapace to use v{}.", target_version);
+        }
+        Err(e) => {
+            eprintln!("Failed to apply update: {}", e);
+            return Err(e.into());
+        }
+    }
 
     Ok(())
 }

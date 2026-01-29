@@ -36,6 +36,7 @@ pub(super) use system::*;
 pub(super) use talk::*;
 pub(super) use tts::*;
 pub(super) use update::*;
+pub(crate) use update::{apply_staged_update, cleanup_old_binaries, ApplyResult};
 pub(super) use usage::*;
 pub(super) use voicewake::*;
 

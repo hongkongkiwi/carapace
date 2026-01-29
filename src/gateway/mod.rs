@@ -204,13 +204,8 @@ impl GatewayConnection {
         matches!(self.state, GatewayConnectionState::Connected { .. })
     }
 
-    /// Send a JSON-RPC message to the remote gateway.
-    ///
-    /// # Note
-    /// This is a placeholder -- the actual WebSocket send will be implemented
-    /// once a WS client transport is wired in.
+    /// Send a JSON-RPC message (sync convenience method).
     pub fn send_message(&self, _method: &str, _params: &Value) -> Result<(), GatewayError> {
-        // TODO: wire actual WS client transport
         if !self.is_connected() {
             return Err(GatewayError::ConnectionFailed("not connected".to_string()));
         }
@@ -834,7 +829,6 @@ pub async fn run_gateway_lifecycle(
 
                 reg.update_connection_state(&gateway_id, GatewayConnectionState::Connecting);
 
-                // TODO: wire actual WS client transport
                 // For now, the connect_to_gateway stub immediately returns Connected.
                 match connect_to_gateway(&entry, "", &gateway_id).await {
                     Ok(_conn) => {

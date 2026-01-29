@@ -4,6 +4,7 @@
 //! and caching. Matches moltbot's format for drop-in compatibility.
 
 pub mod defaults;
+pub mod secrets;
 pub mod watcher;
 
 use parking_lot::RwLock;
