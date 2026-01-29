@@ -808,7 +808,7 @@ pub(crate) fn handle_node_invoke_result(
     let caller_node_id = conn
         .device_id
         .as_ref()
-        .or_else(|| Some(&conn.client.id))
+        .or(Some(&conn.client.id))
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "node identity required", None))?;
     if caller_node_id != node_id {
         return Err(error_shape(ERROR_INVALID_REQUEST, "nodeId mismatch", None));
@@ -866,7 +866,7 @@ pub(crate) fn handle_node_event(
     let caller_node_id = conn
         .device_id
         .as_ref()
-        .or_else(|| Some(&conn.client.id))
+        .or(Some(&conn.client.id))
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "node identity required", None))?;
     let node_id = params
         .and_then(|v| v.get("nodeId"))

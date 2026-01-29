@@ -97,9 +97,9 @@ pub(super) async fn handle_exec_approvals_node_get(
     // Check if the node is connected and supports the command
     let node_supports_command = {
         let registry = state.node_registry.lock();
-        registry.get(node_id).map_or(false, |node| {
-            node.commands.contains("system.execApprovals.get")
-        })
+        registry
+            .get(node_id)
+            .is_some_and(|node| node.commands.contains("system.execApprovals.get"))
     };
 
     if !node_supports_command {
@@ -196,9 +196,9 @@ pub(super) async fn handle_exec_approvals_node_set(
     // Check if the node is connected and supports the command
     let node_supports_command = {
         let registry = state.node_registry.lock();
-        registry.get(node_id).map_or(false, |node| {
-            node.commands.contains("system.execApprovals.set")
-        })
+        registry
+            .get(node_id)
+            .is_some_and(|node| node.commands.contains("system.execApprovals.set"))
     };
 
     if !node_supports_command {
@@ -363,7 +363,7 @@ pub(super) fn handle_exec_approval_resolve(params: Option<&Value>) -> Result<Val
         .and_then(|v| v.as_str())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "decision is required", None))?;
 
-    let decision = ExecApprovalDecision::from_str(decision_str).ok_or_else(|| {
+    let decision = ExecApprovalDecision::parse_decision(decision_str).ok_or_else(|| {
         error_shape(
             ERROR_INVALID_REQUEST,
             "invalid decision (must be allow-once, allow-always, or deny)",

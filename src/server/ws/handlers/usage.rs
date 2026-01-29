@@ -255,8 +255,7 @@ pub(super) fn handle_usage_daily(params: Option<&Value>) -> Result<Value, ErrorS
         .and_then(|v| v.get("days"))
         .and_then(|v| v.as_i64())
         .unwrap_or(30)
-        .max(1)
-        .min(365) as usize;
+        .clamp(1, 365) as usize;
 
     let state = USAGE_STATE.read();
 

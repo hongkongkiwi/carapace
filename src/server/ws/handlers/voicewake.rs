@@ -136,7 +136,7 @@ const DEFAULT_TRIGGERS: [&str; 3] = ["clawd", "claude", "computer"];
 /// - Clamp to 32 entries max
 /// - Filter empty strings
 /// - Fall back to default triggers when empty
-/// Note: Node does NOT lowercase or dedupe
+///   Note: Node does NOT lowercase or dedupe
 fn normalize_triggers(raw: Vec<String>) -> Vec<String> {
     let sanitized: Vec<String> = raw
         .into_iter()

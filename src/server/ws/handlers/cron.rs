@@ -102,7 +102,7 @@ pub(super) fn handle_cron_add(
     let delete_after_run = params.get("deleteAfterRun").and_then(|v| v.as_bool());
     let session_target = parse_session_target(params.get("sessionTarget"));
     let wake_mode = parse_wake_mode(params.get("wakeMode"));
-    let isolation = params.get("isolation").and_then(|v| parse_isolation(v));
+    let isolation = params.get("isolation").and_then(parse_isolation);
 
     let input = CronJobCreate {
         name: name.to_string(),
@@ -207,7 +207,7 @@ pub(super) fn handle_cron_update(
             Some(v) => Some(parse_payload(Some(v))?),
             None => None,
         },
-        isolation: params.get("isolation").and_then(|v| parse_isolation(v)),
+        isolation: params.get("isolation").and_then(parse_isolation),
     };
 
     let job = state
@@ -293,17 +293,9 @@ pub(super) fn handle_cron_run(
 
     // Validate mode if provided
     let mode = if let Some(m) = mode_str {
-        match m {
-            "due" => Some(CronRunMode::Due),
-            "force" => Some(CronRunMode::Force),
-            _ => {
-                return Err(error_shape(
-                    ERROR_INVALID_REQUEST,
-                    "mode must be 'due' or 'force'",
-                    None,
-                ));
-            }
-        }
+        Some(CronRunMode::parse_mode(m).ok_or_else(|| {
+            error_shape(ERROR_INVALID_REQUEST, "mode must be 'due' or 'force'", None)
+        })?)
     } else {
         None
     };

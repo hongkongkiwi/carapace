@@ -1,18 +1,15 @@
 #!/bin/bash
-# Pre-commit hook: check formatting and clippy
-
-set -e
+# Pre-commit hook: check formatting and run clippy with warnings-as-errors.
+# Install via: just setup-hooks
 
 echo "Running cargo fmt --check..."
-cargo fmt --all --check
-if [ $? -ne 0 ]; then
+if ! cargo fmt --all --check; then
     echo "❌ Formatting check failed. Run 'cargo fmt' to fix."
     exit 1
 fi
 
-echo "Running cargo clippy..."
-cargo clippy --all-targets --all-features -- -D warnings 2>/dev/null || cargo clippy --all-targets --all-features
-if [ $? -ne 0 ]; then
+echo "Running cargo clippy -- -D warnings..."
+if ! cargo clippy --all-targets -- -D warnings; then
     echo "❌ Clippy check failed. Fix the warnings above."
     exit 1
 fi

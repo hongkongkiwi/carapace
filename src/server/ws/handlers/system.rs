@@ -32,11 +32,7 @@ pub(super) struct ParsedPresence {
 /// or without prefix: "host (ip) · app 1.2.3 · ..."
 /// Segments are separated by " · " (space-dot-space).
 pub(super) fn parse_presence(text: &str) -> ParsedPresence {
-    let mut parsed = ParsedPresence::default();
-
-    // Store text_slice as full text truncated to 64 chars (Node uses text.slice(0,64))
-    // Use safe truncation to avoid panicking on multi-byte UTF-8 boundaries
-    parsed.text_slice = Some(if text.len() > 64 {
+    let text_slice = Some(if text.len() > 64 {
         // Find the last character that ends at or before 64 bytes
         let truncate_at = text
             .char_indices()
@@ -48,6 +44,11 @@ pub(super) fn parse_presence(text: &str) -> ParsedPresence {
     } else {
         text.to_string()
     });
+
+    let mut parsed = ParsedPresence {
+        text_slice,
+        ..Default::default()
+    };
 
     // Split by " · " separator (Node format)
     let segments: Vec<&str> = text.split(" · ").collect();
@@ -235,8 +236,10 @@ pub(super) fn handle_send(
         .filter(|s| !s.is_empty())
         .unwrap_or("default");
 
-    let mut metadata = messages::outbound::MessageMetadata::default();
-    metadata.recipient_id = Some(to.to_string());
+    let metadata = messages::outbound::MessageMetadata {
+        recipient_id: Some(to.to_string()),
+        ..Default::default()
+    };
 
     let outbound = messages::outbound::OutboundMessage::new(
         channel,
@@ -309,7 +312,7 @@ fn derive_presence_key(
         .or(parsed.host.as_ref())
         .or(parsed.ip.as_ref())
         .or(parsed.text_slice.as_ref())
-        .map(|s| s.clone())
+        .cloned()
         .unwrap_or_else(|| fallback.to_string());
     // Node normalizes presence keys to lowercase
     key.to_lowercase()
@@ -725,32 +728,40 @@ mod tests {
 
     #[test]
     fn test_derive_presence_key_parsed_instance() {
-        let mut parsed = ParsedPresence::default();
-        parsed.instance_id = Some("parsed-instance".to_string());
+        let parsed = ParsedPresence {
+            instance_id: Some("parsed-instance".to_string()),
+            ..Default::default()
+        };
         let key = derive_presence_key(&None, &None, &parsed, "fallback");
         assert_eq!(key, "parsed-instance");
     }
 
     #[test]
     fn test_derive_presence_key_parsed_host() {
-        let mut parsed = ParsedPresence::default();
-        parsed.host = Some("parsed-host".to_string());
+        let parsed = ParsedPresence {
+            host: Some("parsed-host".to_string()),
+            ..Default::default()
+        };
         let key = derive_presence_key(&None, &None, &parsed, "fallback");
         assert_eq!(key, "parsed-host");
     }
 
     #[test]
     fn test_derive_presence_key_parsed_ip() {
-        let mut parsed = ParsedPresence::default();
-        parsed.ip = Some("192.168.1.1".to_string());
+        let parsed = ParsedPresence {
+            ip: Some("192.168.1.1".to_string()),
+            ..Default::default()
+        };
         let key = derive_presence_key(&None, &None, &parsed, "fallback");
         assert_eq!(key, "192.168.1.1");
     }
 
     #[test]
     fn test_derive_presence_key_text_slice() {
-        let mut parsed = ParsedPresence::default();
-        parsed.text_slice = Some("text-slice".to_string());
+        let parsed = ParsedPresence {
+            text_slice: Some("text-slice".to_string()),
+            ..Default::default()
+        };
         let key = derive_presence_key(&None, &None, &parsed, "fallback");
         assert_eq!(key, "text-slice");
     }
@@ -774,8 +785,10 @@ mod tests {
         );
         assert_eq!(key, "device-abc-123");
 
-        let mut parsed_upper = ParsedPresence::default();
-        parsed_upper.host = Some("MyHost.Local".to_string());
+        let parsed_upper = ParsedPresence {
+            host: Some("MyHost.Local".to_string()),
+            ..Default::default()
+        };
         let key2 = derive_presence_key(&None, &None, &parsed_upper, "fallback");
         assert_eq!(key2, "myhost.local");
     }

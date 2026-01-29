@@ -230,20 +230,12 @@ const GATEWAY_EVENTS: [&str; 18] = [
     "exec.approval.resolved",
 ];
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct WsAuthConfig {
     pub resolved: auth::ResolvedGatewayAuth,
 }
 
-impl Default for WsAuthConfig {
-    fn default() -> Self {
-        Self {
-            resolved: auth::ResolvedGatewayAuth::default(),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct WsServerConfig {
     pub auth: WsAuthConfig,
     pub policy: WsPolicy,
@@ -252,20 +244,6 @@ pub struct WsServerConfig {
     pub control_ui_disable_device_auth: bool,
     pub node_allow_commands: Vec<String>,
     pub node_deny_commands: Vec<String>,
-}
-
-impl Default for WsServerConfig {
-    fn default() -> Self {
-        Self {
-            auth: WsAuthConfig::default(),
-            policy: WsPolicy::default(),
-            trusted_proxies: Vec::new(),
-            control_ui_allow_insecure_auth: false,
-            control_ui_disable_device_auth: false,
-            node_allow_commands: Vec::new(),
-            node_deny_commands: Vec::new(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -752,7 +730,7 @@ impl WsServerState {
     }
 
     /// Broadcast presence event to all operator connections
-    pub fn broadcast_presence_event(&self, state_version: StateVersion) {
+    pub(crate) fn broadcast_presence_event(&self, state_version: StateVersion) {
         let presence_list = self.get_presence_list();
         let frame = EventFrame {
             frame_type: "event",
@@ -1178,7 +1156,7 @@ struct EventFrame<'a> {
 }
 
 #[derive(Debug, Serialize)]
-struct StateVersion {
+pub(crate) struct StateVersion {
     presence: u64,
     health: u64,
 }
@@ -1314,7 +1292,7 @@ async fn handle_socket(
         }
     };
 
-    if text.as_bytes().len() > MAX_PAYLOAD_BYTES {
+    if text.len() > MAX_PAYLOAD_BYTES {
         let _ = send_close(&tx, 1008, "payload too large");
         return;
     }
@@ -1652,7 +1630,7 @@ async fn handle_socket(
                 break;
             }
         };
-        if text.as_bytes().len() > MAX_PAYLOAD_BYTES {
+        if text.len() > MAX_PAYLOAD_BYTES {
             let _ = send_close(&tx, 1008, "payload too large");
             break;
         }
@@ -1933,19 +1911,11 @@ fn ensure_paired(
             return require_pairing(state, device, connect, role, scopes, is_local, remote_addr);
         }
 
-        if !scopes.is_empty() {
-            if paired.scopes.is_empty() || !scopes.iter().all(|scope| paired.scopes.contains(scope))
-            {
-                return require_pairing(
-                    state,
-                    device,
-                    connect,
-                    role,
-                    scopes,
-                    is_local,
-                    remote_addr,
-                );
-            }
+        if !scopes.is_empty()
+            && (paired.scopes.is_empty()
+                || !scopes.iter().all(|scope| paired.scopes.contains(scope)))
+        {
+            return require_pairing(state, device, connect, role, scopes, is_local, remote_addr);
         }
 
         let remote_ip = if is_local {
@@ -2073,7 +2043,7 @@ fn ensure_device_token(
     role: &str,
     scopes: &[String],
 ) -> devices::IssuedDeviceToken {
-    let result = state
+    state
         .device_registry
         .ensure_token(device_id, role.to_string(), scopes.to_vec())
         .unwrap_or_else(|_| devices::IssuedDeviceToken {
@@ -2081,8 +2051,7 @@ fn ensure_device_token(
             role: role.to_string(),
             scopes: scopes.to_vec(),
             issued_at_ms: now_ms(),
-        });
-    result
+        })
 }
 
 fn verify_device_token(
@@ -2326,6 +2295,7 @@ pub fn broadcast_agent_event(
 /// * `error_message` - Optional error description (for error state)
 /// * `usage` - Optional token usage (for final state)
 /// * `stop_reason` - Optional stop reason
+#[allow(clippy::too_many_arguments)]
 pub fn broadcast_chat_event(
     state: &WsServerState,
     run_id: &str,
@@ -2541,6 +2511,7 @@ pub fn broadcast_talk_mode(state: &WsServerState, enabled: bool, channel: Option
 /// * `timeout_ms` - Optional timeout in milliseconds
 ///
 /// Returns true if the event was sent successfully
+#[allow(clippy::too_many_arguments)]
 pub fn send_node_invoke_request(
     state: &WsServerState,
     node_id: &str,
@@ -2596,7 +2567,7 @@ fn send_close(tx: &mpsc::UnboundedSender<Message>, code: u16, reason: &str) -> R
     // Truncate close reason to 123 bytes to fit WebSocket limit
     let truncated_reason: String = reason.chars().take(123).collect();
     let frame = CloseFrame {
-        code: code.into(),
+        code,
         reason: truncated_reason.into(),
     };
     tx.send(Message::Close(Some(frame))).map_err(|_| ())

@@ -87,11 +87,10 @@ pub(super) fn read_config_snapshot() -> ConfigSnapshot {
             (cfg, issues, valid)
         }
         Err(err) => {
-            let mut issues = Vec::new();
-            issues.push(ConfigIssue {
+            let issues = vec![ConfigIssue {
                 path: "".to_string(),
                 message: err.to_string(),
-            });
+            }];
             (parsed.clone(), issues, false)
         }
     };

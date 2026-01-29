@@ -186,8 +186,8 @@ where
             let line = buffer[..newline_pos].trim_end_matches('\r').to_string();
             buffer = buffer[newline_pos + 1..].to_string();
 
-            if line.starts_with("event: ") {
-                event_type = line[7..].to_string();
+            if let Some(evt) = line.strip_prefix("event: ") {
+                event_type = evt.to_string();
             } else if let Some(data) = line.strip_prefix("data: ") {
                 if let Some(event) =
                     parse_sse_event(&event_type, data, &mut tool_calls, &mut accumulated_usage)
