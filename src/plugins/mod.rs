@@ -41,6 +41,7 @@ pub mod host;
 pub mod loader;
 pub mod runtime;
 pub mod tools;
+pub mod typescript;
 
 pub mod caps;
 
@@ -74,4 +75,8 @@ pub use runtime::{
 pub use tools::{
     create_registry as create_tools_registry, BuiltinTool, ToolInvokeContext, ToolInvokeError,
     ToolInvokeResult, ToolsRegistry,
+};
+pub use typescript::{
+    MOLTBOT_SDK_SHIM, TypescriptPluginConfig, TypescriptPluginInstance, TypescriptPluginLoader,
+    create_moltbot_plugin_template,
 };
