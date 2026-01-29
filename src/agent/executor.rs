@@ -88,9 +88,10 @@ pub async fn execute_run(
         // Build LLM context from in-memory history
         let (system, messages) = build_context(&history, config.system.as_deref());
 
-        // Get available tools
+        // Get available tools, filtered by the agent's tool policy
         let tools = if let Some(tools_registry) = state.tools_registry() {
-            tools::list_provider_tools(tools_registry)
+            let all_tools = tools::list_provider_tools(tools_registry);
+            config.tool_policy.filter_tools(all_tools)
         } else {
             vec![]
         };
@@ -294,8 +295,12 @@ pub async fn execute_run(
             let mut tool_msgs = Vec::with_capacity(pending_tool_calls.len());
 
             for (tool_id, tool_name, tool_input) in &pending_tool_calls {
-                // Execute the tool
-                let tool_result = if let Some(tools_registry) = state.tools_registry() {
+                // Check tool policy before dispatching (defence-in-depth)
+                let tool_result = if !config.tool_policy.is_allowed(tool_name) {
+                    ToolCallResult::Error {
+                        message: format!("Tool \"{}\" is not available for this agent", tool_name),
+                    }
+                } else if let Some(tools_registry) = state.tools_registry() {
                     tools::execute_tool_call(
                         tool_name,
                         tool_input.clone(),
@@ -1130,6 +1135,260 @@ mod tests {
             matches!(&result, Err(AgentError::Stream(msg)) if msg.contains("stop")),
             "expected Stream error about missing stop event, got: {:?}",
             result,
+        );
+    }
+
+    // ============== Tool Policy Enforcement Tests ==============
+
+    #[tokio::test]
+    async fn test_tool_policy_deny_list_blocks_tool_call() {
+        // Configure a deny-list that blocks the "time" tool.
+        // The LLM requests "time" anyway — the executor should return an error
+        // result for that tool call and continue.
+        use crate::agent::tool_policy::ToolPolicy;
+        use std::collections::HashSet;
+
+        let (state, _tmp) = make_test_state_with_tools();
+        let run_id = "run-policy-deny";
+        let session_key = "test-policy-deny";
+        setup_session_and_run(&state, session_key, run_id);
+
+        // Turn 1: LLM requests "time" tool, Turn 2: text response
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                StreamEvent::ToolUse {
+                    id: "tool_1".to_string(),
+                    name: "time".to_string(),
+                    input: serde_json::json!({}),
+                },
+                StreamEvent::Stop {
+                    reason: StopReason::ToolUse,
+                    usage: TokenUsage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                    },
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta {
+                    text: "Done.".to_string(),
+                },
+                StreamEvent::Stop {
+                    reason: StopReason::EndTurn,
+                    usage: TokenUsage {
+                        input_tokens: 20,
+                        output_tokens: 5,
+                    },
+                },
+            ],
+        ]));
+
+        let config = AgentConfig {
+            max_turns: 5,
+            tool_policy: ToolPolicy::DenyList(
+                ["time"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<HashSet<_>>(),
+            ),
+            ..Default::default()
+        };
+
+        let result = execute_run(
+            run_id.to_string(),
+            session_key.to_string(),
+            config,
+            state.clone(),
+            provider,
+            CancellationToken::new(),
+        )
+        .await;
+
+        // The run should complete successfully — the denied tool returns an
+        // error to the LLM which then produces a text response.
+        assert!(result.is_ok(), "execute_run failed: {:?}", result.err());
+
+        // Verify the tool result was an error by checking session history
+        let session = state
+            .session_store()
+            .get_session_by_key(session_key)
+            .unwrap();
+        let history = state
+            .session_store()
+            .get_history(&session.id, None, None)
+            .unwrap();
+
+        // Find the tool result message
+        let tool_msg = history
+            .iter()
+            .find(|m| m.role == sessions::MessageRole::Tool)
+            .expect("should have a tool result message");
+        assert!(
+            tool_msg.content.contains("not available"),
+            "tool result should indicate tool is not available, got: {}",
+            tool_msg.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_policy_allow_list_blocks_unlisted_tool() {
+        // Configure an allow-list with only "search" — the "time" tool is NOT listed.
+        // The LLM requests "time" anyway — should be blocked.
+        use crate::agent::tool_policy::ToolPolicy;
+        use std::collections::HashSet;
+
+        let (state, _tmp) = make_test_state_with_tools();
+        let run_id = "run-policy-allow";
+        let session_key = "test-policy-allow";
+        setup_session_and_run(&state, session_key, run_id);
+
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                StreamEvent::ToolUse {
+                    id: "tool_1".to_string(),
+                    name: "time".to_string(),
+                    input: serde_json::json!({}),
+                },
+                StreamEvent::Stop {
+                    reason: StopReason::ToolUse,
+                    usage: TokenUsage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                    },
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta {
+                    text: "OK".to_string(),
+                },
+                StreamEvent::Stop {
+                    reason: StopReason::EndTurn,
+                    usage: TokenUsage {
+                        input_tokens: 15,
+                        output_tokens: 3,
+                    },
+                },
+            ],
+        ]));
+
+        let config = AgentConfig {
+            max_turns: 5,
+            tool_policy: ToolPolicy::AllowList(
+                ["search"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<HashSet<_>>(),
+            ),
+            ..Default::default()
+        };
+
+        let result = execute_run(
+            run_id.to_string(),
+            session_key.to_string(),
+            config,
+            state.clone(),
+            provider,
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(result.is_ok(), "execute_run failed: {:?}", result.err());
+
+        let session = state
+            .session_store()
+            .get_session_by_key(session_key)
+            .unwrap();
+        let history = state
+            .session_store()
+            .get_history(&session.id, None, None)
+            .unwrap();
+
+        let tool_msg = history
+            .iter()
+            .find(|m| m.role == sessions::MessageRole::Tool)
+            .expect("should have a tool result message");
+        assert!(
+            tool_msg.content.contains("not available"),
+            "tool result should indicate tool is not available, got: {}",
+            tool_msg.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_policy_allow_all_permits_tool() {
+        // With AllowAll policy, the "time" tool should execute normally.
+        use crate::agent::tool_policy::ToolPolicy;
+
+        let (state, _tmp) = make_test_state_with_tools();
+        let run_id = "run-policy-all";
+        let session_key = "test-policy-all";
+        setup_session_and_run(&state, session_key, run_id);
+
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                StreamEvent::ToolUse {
+                    id: "tool_1".to_string(),
+                    name: "time".to_string(),
+                    input: serde_json::json!({}),
+                },
+                StreamEvent::Stop {
+                    reason: StopReason::ToolUse,
+                    usage: TokenUsage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                    },
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta {
+                    text: "The time is now.".to_string(),
+                },
+                StreamEvent::Stop {
+                    reason: StopReason::EndTurn,
+                    usage: TokenUsage {
+                        input_tokens: 20,
+                        output_tokens: 10,
+                    },
+                },
+            ],
+        ]));
+
+        let config = AgentConfig {
+            max_turns: 5,
+            tool_policy: ToolPolicy::AllowAll,
+            ..Default::default()
+        };
+
+        let result = execute_run(
+            run_id.to_string(),
+            session_key.to_string(),
+            config,
+            state.clone(),
+            provider,
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(result.is_ok(), "execute_run failed: {:?}", result.err());
+
+        let session = state
+            .session_store()
+            .get_session_by_key(session_key)
+            .unwrap();
+        let history = state
+            .session_store()
+            .get_history(&session.id, None, None)
+            .unwrap();
+
+        // The tool result should be a successful time response, not an error
+        let tool_msg = history
+            .iter()
+            .find(|m| m.role == sessions::MessageRole::Tool)
+            .expect("should have a tool result message");
+        assert!(
+            tool_msg.content.contains("timestamp"),
+            "tool result should contain timestamp from successful execution, got: {}",
+            tool_msg.content
         );
     }
 }

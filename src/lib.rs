@@ -17,6 +17,7 @@ pub mod devices;
 pub mod discovery;
 pub mod exec;
 pub mod hooks;
+pub mod links;
 pub mod logging;
 pub mod media;
 pub mod messages;

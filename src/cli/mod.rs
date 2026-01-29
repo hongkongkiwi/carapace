@@ -6,6 +6,9 @@
 //! - `status` -- query a running instance for health info
 //! - `logs` -- tail log entries from a running instance
 //! - `version` -- print build/version info
+//! - `backup` -- create a backup archive of all gateway data
+//! - `restore` -- restore from a backup archive
+//! - `reset` -- clear specific data categories
 
 use clap::{Parser, Subcommand};
 
@@ -58,6 +61,50 @@ pub enum Command {
 
     /// Print version, build date, and git commit information.
     Version,
+
+    /// Create a backup archive of all gateway data.
+    Backup {
+        /// Output file path (default: ./carapace-backup-{timestamp}.tar.gz).
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Restore from a backup archive.
+    Restore {
+        /// Path to the backup archive file.
+        path: String,
+
+        /// Overwrite existing data without confirmation prompt.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Clear specific categories of gateway data.
+    Reset {
+        /// Delete all session data.
+        #[arg(long)]
+        sessions: bool,
+
+        /// Delete all cron job data.
+        #[arg(long)]
+        cron: bool,
+
+        /// Reset usage tracking data.
+        #[arg(long)]
+        usage: bool,
+
+        /// Delete agent memory stores.
+        #[arg(long)]
+        memory: bool,
+
+        /// Delete everything (equivalent to all flags).
+        #[arg(long)]
+        all: bool,
+
+        /// Proceed without confirmation prompt.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -309,6 +356,415 @@ pub fn handle_version() {
         std::env::consts::OS,
         std::env::consts::ARCH
     );
+}
+
+// ---------------------------------------------------------------------------
+// Backup / Restore / Reset handlers
+// ---------------------------------------------------------------------------
+
+use std::io::{Read as IoRead, Write as IoWrite};
+use std::path::{Path, PathBuf};
+
+/// Resolve the state directory (same logic as `server::ws::resolve_state_dir`
+/// but duplicated here to avoid pulling in the full server module for CLI-only
+/// commands).
+fn resolve_state_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("MOLTBOT_STATE_DIR") {
+        return PathBuf::from(dir);
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".moltbot")
+}
+
+/// Resolve the memory store directory.
+fn resolve_memory_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config")
+        .join("carapace")
+        .join("memory")
+}
+
+/// Name of the marker file inside backup archives to identify them as
+/// carapace backups.
+const BACKUP_MARKER: &str = ".carapace-backup";
+
+/// Run the `backup` subcommand.
+pub fn handle_backup(output: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let state_dir = resolve_state_dir();
+    let config_path = config::get_config_path();
+    let memory_dir = resolve_memory_dir();
+
+    // Determine output path.
+    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    let default_name = format!("carapace-backup-{}.tar.gz", timestamp);
+    let output_path = PathBuf::from(output.unwrap_or(&default_name));
+
+    // Build the tar.gz archive.
+    let file = std::fs::File::create(&output_path)?;
+    let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    let mut archive = tar::Builder::new(enc);
+
+    // Write marker file so we can validate on restore.
+    let marker_content = format!("carapace-backup v1\ncreated={}\n", timestamp);
+    let marker_bytes = marker_content.as_bytes();
+    let mut header = tar::Header::new_gnu();
+    header.set_size(marker_bytes.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    archive.append_data(&mut header, BACKUP_MARKER, marker_bytes)?;
+
+    let mut included_sections: Vec<&str> = Vec::new();
+
+    // Sessions directory.
+    let sessions_dir = state_dir.join("sessions");
+    if sessions_dir.is_dir() {
+        archive.append_dir_all("sessions", &sessions_dir)?;
+        included_sections.push("sessions");
+    }
+
+    // Config file.
+    if config_path.exists() {
+        let name = config_path
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("moltbot.json"));
+        archive.append_path_with_name(&config_path, Path::new("config").join(name))?;
+        included_sections.push("config");
+    }
+
+    // Memory store directory.
+    if memory_dir.is_dir() {
+        archive.append_dir_all("memory", &memory_dir)?;
+        included_sections.push("memory");
+    }
+
+    // Cron data directory.
+    let cron_dir = state_dir.join("cron");
+    if cron_dir.is_dir() {
+        archive.append_dir_all("cron", &cron_dir)?;
+        included_sections.push("cron");
+    }
+
+    // Usage data file.
+    let usage_path = state_dir.join("usage.json");
+    if usage_path.exists() {
+        archive.append_path_with_name(&usage_path, "usage/usage.json")?;
+        included_sections.push("usage");
+    }
+
+    // Finalize the archive.
+    let enc = archive.into_inner()?;
+    enc.finish()?;
+
+    // Report results.
+    let metadata = std::fs::metadata(&output_path)?;
+    let size = metadata.len();
+    let human_size = format_file_size(size);
+
+    println!("Backup created successfully");
+    println!("  Path: {}", output_path.display());
+    println!("  Size: {} ({})", human_size, size);
+    println!(
+        "  Included: {}",
+        if included_sections.is_empty() {
+            "(empty)".to_string()
+        } else {
+            included_sections.join(", ")
+        }
+    );
+
+    Ok(())
+}
+
+/// Run the `restore` subcommand.
+pub fn handle_restore(archive_path: &str, force: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let archive_path = PathBuf::from(archive_path);
+    if !archive_path.exists() {
+        eprintln!("Backup file not found: {}", archive_path.display());
+        std::process::exit(1);
+    }
+
+    // Open and decompress the archive.
+    let file = std::fs::File::open(&archive_path)?;
+    let dec = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(dec);
+
+    // First pass: validate by checking for the marker file.
+    let mut found_marker = false;
+    let mut sections_found: Vec<String> = Vec::new();
+
+    for entry_result in archive.entries()? {
+        let entry = entry_result?;
+        let path = entry.path()?;
+        let path_str = path.to_string_lossy().to_string();
+
+        if path_str == BACKUP_MARKER {
+            found_marker = true;
+        } else if path_str.starts_with("sessions/") {
+            if !sections_found.contains(&"sessions".to_string()) {
+                sections_found.push("sessions".to_string());
+            }
+        } else if path_str.starts_with("config/") {
+            if !sections_found.contains(&"config".to_string()) {
+                sections_found.push("config".to_string());
+            }
+        } else if path_str.starts_with("memory/") {
+            if !sections_found.contains(&"memory".to_string()) {
+                sections_found.push("memory".to_string());
+            }
+        } else if path_str.starts_with("cron/") {
+            if !sections_found.contains(&"cron".to_string()) {
+                sections_found.push("cron".to_string());
+            }
+        } else if path_str.starts_with("usage/") && !sections_found.contains(&"usage".to_string()) {
+            sections_found.push("usage".to_string());
+        }
+    }
+
+    if !found_marker {
+        eprintln!("Invalid backup: archive does not contain a carapace backup marker.");
+        eprintln!("The file may be corrupt or was not created by `carapace backup`.");
+        std::process::exit(1);
+    }
+
+    // Prompt for confirmation unless --force is given.
+    if !force {
+        eprintln!(
+            "This will overwrite existing data with the contents of: {}",
+            archive_path.display()
+        );
+        eprintln!(
+            "Sections to restore: {}",
+            if sections_found.is_empty() {
+                "(none)".to_string()
+            } else {
+                sections_found.join(", ")
+            }
+        );
+        eprintln!("Pass --force to proceed without this prompt.");
+        std::process::exit(1);
+    }
+
+    // Second pass: extract files to the appropriate locations.
+    let state_dir = resolve_state_dir();
+    let config_path = config::get_config_path();
+    let memory_dir = resolve_memory_dir();
+
+    let file = std::fs::File::open(&archive_path)?;
+    let dec = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(dec);
+
+    let mut restored: Vec<String> = Vec::new();
+    let mut restored_sessions: usize = 0;
+
+    for entry_result in archive.entries()? {
+        let mut entry = entry_result?;
+        let path = entry.path()?.to_path_buf();
+        let path_str = path.to_string_lossy().to_string();
+
+        if path_str == BACKUP_MARKER {
+            continue;
+        }
+
+        if path_str.starts_with("sessions/") {
+            // Strip "sessions/" prefix and place into state_dir/sessions/.
+            let rel = path.strip_prefix("sessions").unwrap_or(&path);
+            let target = state_dir.join("sessions").join(rel);
+            extract_entry(&mut entry, &target)?;
+            if path_str.ends_with(".json") && !path_str.ends_with(".jsonl") {
+                restored_sessions += 1;
+            }
+            if !restored.contains(&"sessions".to_string()) {
+                restored.push("sessions".to_string());
+            }
+        } else if path_str.starts_with("config/") {
+            // Restore config to the resolved config path.
+            let rel = path.strip_prefix("config").unwrap_or(&path);
+            // Use the resolved config path's parent directory.
+            let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+            let target = config_dir.join(rel);
+            extract_entry(&mut entry, &target)?;
+            if !restored.contains(&"config".to_string()) {
+                restored.push("config".to_string());
+            }
+        } else if path_str.starts_with("memory/") {
+            let rel = path.strip_prefix("memory").unwrap_or(&path);
+            let target = memory_dir.join(rel);
+            extract_entry(&mut entry, &target)?;
+            if !restored.contains(&"memory".to_string()) {
+                restored.push("memory".to_string());
+            }
+        } else if path_str.starts_with("cron/") {
+            let rel = path.strip_prefix("cron").unwrap_or(&path);
+            let target = state_dir.join("cron").join(rel);
+            extract_entry(&mut entry, &target)?;
+            if !restored.contains(&"cron".to_string()) {
+                restored.push("cron".to_string());
+            }
+        } else if path_str.starts_with("usage/") {
+            let rel = path.strip_prefix("usage").unwrap_or(&path);
+            let target = state_dir.join(rel);
+            extract_entry(&mut entry, &target)?;
+            if !restored.contains(&"usage".to_string()) {
+                restored.push("usage".to_string());
+            }
+        }
+    }
+
+    println!("Restore completed successfully");
+    println!(
+        "  Restored: {}",
+        if restored.is_empty() {
+            "(nothing)".to_string()
+        } else {
+            restored.join(", ")
+        }
+    );
+    if restored_sessions > 0 {
+        println!("  Sessions: {}", restored_sessions);
+    }
+
+    Ok(())
+}
+
+/// Extract a single tar entry to a target path, creating parent directories.
+fn extract_entry(
+    entry: &mut tar::Entry<'_, flate2::read::GzDecoder<std::fs::File>>,
+    target: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let entry_type = entry.header().entry_type();
+    if entry_type.is_dir() {
+        std::fs::create_dir_all(target)?;
+    } else if entry_type.is_file() {
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut buf = Vec::new();
+        entry.read_to_end(&mut buf)?;
+        std::fs::write(target, &buf)?;
+    }
+    Ok(())
+}
+
+/// Run the `reset` subcommand.
+pub fn handle_reset(
+    sessions: bool,
+    cron: bool,
+    usage: bool,
+    memory: bool,
+    all: bool,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let do_sessions = sessions || all;
+    let do_cron = cron || all;
+    let do_usage = usage || all;
+    let do_memory = memory || all;
+
+    if !do_sessions && !do_cron && !do_usage && !do_memory {
+        eprintln!(
+            "No data category specified. Use --sessions, --cron, --usage, --memory, or --all."
+        );
+        std::process::exit(1);
+    }
+
+    // Build a list of what will be deleted for the confirmation prompt.
+    let mut categories: Vec<&str> = Vec::new();
+    if do_sessions {
+        categories.push("sessions");
+    }
+    if do_cron {
+        categories.push("cron");
+    }
+    if do_usage {
+        categories.push("usage");
+    }
+    if do_memory {
+        categories.push("memory");
+    }
+
+    if !force {
+        eprintln!("This will permanently delete: {}", categories.join(", "));
+        eprintln!("Pass --force to proceed without this prompt.");
+        std::process::exit(1);
+    }
+
+    let state_dir = resolve_state_dir();
+    let mut deleted: Vec<String> = Vec::new();
+
+    if do_sessions {
+        let sessions_dir = state_dir.join("sessions");
+        if sessions_dir.is_dir() {
+            let count = count_files_in_dir(&sessions_dir, "json");
+            std::fs::remove_dir_all(&sessions_dir)?;
+            deleted.push(format!("sessions ({} metadata files removed)", count));
+        } else {
+            deleted.push("sessions (directory not found, nothing to delete)".to_string());
+        }
+    }
+
+    if do_cron {
+        let cron_dir = state_dir.join("cron");
+        if cron_dir.is_dir() {
+            std::fs::remove_dir_all(&cron_dir)?;
+            deleted.push("cron (directory removed)".to_string());
+        } else {
+            deleted.push("cron (directory not found, nothing to delete)".to_string());
+        }
+    }
+
+    if do_usage {
+        let usage_path = state_dir.join("usage.json");
+        if usage_path.exists() {
+            std::fs::remove_file(&usage_path)?;
+            deleted.push("usage (usage.json removed)".to_string());
+        } else {
+            deleted.push("usage (file not found, nothing to delete)".to_string());
+        }
+    }
+
+    if do_memory {
+        let memory_dir = resolve_memory_dir();
+        if memory_dir.is_dir() {
+            let count = count_files_in_dir(&memory_dir, "json");
+            std::fs::remove_dir_all(&memory_dir)?;
+            deleted.push(format!("memory ({} store files removed)", count));
+        } else {
+            deleted.push("memory (directory not found, nothing to delete)".to_string());
+        }
+    }
+
+    println!("Reset completed");
+    for item in &deleted {
+        println!("  - {}", item);
+    }
+
+    Ok(())
+}
+
+/// Count files matching a given extension in a directory (non-recursive top level).
+fn count_files_in_dir(dir: &Path, extension: &str) -> usize {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == extension))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Format a file size in human-readable form.
+fn format_file_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -624,5 +1080,403 @@ mod tests {
     fn test_resolve_port_default() {
         // When config is unavailable, should fall back to DEFAULT_PORT.
         assert_eq!(resolve_port(None), DEFAULT_PORT);
+    }
+
+    // -----------------------------------------------------------------------
+    // Backup / Restore / Reset CLI parsing tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cli_backup_no_args() {
+        let cli = Cli::try_parse_from(["carapace", "backup"]).unwrap();
+        match cli.command {
+            Some(Command::Backup { output }) => {
+                assert!(output.is_none());
+            }
+            other => panic!("Expected Backup, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_backup_with_output() {
+        let cli = Cli::try_parse_from(["carapace", "backup", "--output", "/tmp/my-backup.tar.gz"])
+            .unwrap();
+        match cli.command {
+            Some(Command::Backup { output }) => {
+                assert_eq!(output.as_deref(), Some("/tmp/my-backup.tar.gz"));
+            }
+            other => panic!("Expected Backup, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_backup_with_short_flag() {
+        let cli = Cli::try_parse_from(["carapace", "backup", "-o", "/tmp/backup.tar.gz"]).unwrap();
+        match cli.command {
+            Some(Command::Backup { output }) => {
+                assert_eq!(output.as_deref(), Some("/tmp/backup.tar.gz"));
+            }
+            other => panic!("Expected Backup, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_restore_requires_path() {
+        let result = Cli::try_parse_from(["carapace", "restore"]);
+        assert!(result.is_err(), "restore should require a path argument");
+    }
+
+    #[test]
+    fn test_cli_restore_with_path() {
+        let cli = Cli::try_parse_from(["carapace", "restore", "/tmp/backup.tar.gz"]).unwrap();
+        match cli.command {
+            Some(Command::Restore { ref path, force }) => {
+                assert_eq!(path, "/tmp/backup.tar.gz");
+                assert!(!force);
+            }
+            other => panic!("Expected Restore, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_restore_with_force() {
+        let cli =
+            Cli::try_parse_from(["carapace", "restore", "/tmp/backup.tar.gz", "--force"]).unwrap();
+        match cli.command {
+            Some(Command::Restore { force, .. }) => {
+                assert!(force);
+            }
+            other => panic!("Expected Restore, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_reset_no_flags() {
+        let cli = Cli::try_parse_from(["carapace", "reset"]).unwrap();
+        match cli.command {
+            Some(Command::Reset {
+                sessions,
+                cron,
+                usage,
+                memory,
+                all,
+                force,
+            }) => {
+                assert!(!sessions);
+                assert!(!cron);
+                assert!(!usage);
+                assert!(!memory);
+                assert!(!all);
+                assert!(!force);
+            }
+            other => panic!("Expected Reset, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_reset_all_force() {
+        let cli = Cli::try_parse_from(["carapace", "reset", "--all", "--force"]).unwrap();
+        match cli.command {
+            Some(Command::Reset { all, force, .. }) => {
+                assert!(all);
+                assert!(force);
+            }
+            other => panic!("Expected Reset, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_reset_individual_flags() {
+        let cli = Cli::try_parse_from([
+            "carapace",
+            "reset",
+            "--sessions",
+            "--cron",
+            "--usage",
+            "--memory",
+            "--force",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Reset {
+                sessions,
+                cron,
+                usage,
+                memory,
+                all,
+                force,
+            }) => {
+                assert!(sessions);
+                assert!(cron);
+                assert!(usage);
+                assert!(memory);
+                assert!(!all);
+                assert!(force);
+            }
+            other => panic!("Expected Reset, got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Backup/Restore round-trip tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_backup_creates_valid_archive() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        let sessions_dir = state_dir.join("sessions");
+        let cron_dir = state_dir.join("cron");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::create_dir_all(&cron_dir).unwrap();
+
+        // Create some fake session data.
+        std::fs::write(
+            sessions_dir.join("abc123.json"),
+            r#"{"id":"abc123","agentId":"test"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            sessions_dir.join("abc123.jsonl"),
+            r#"{"id":"m1","role":"user","content":"hello"}"#,
+        )
+        .unwrap();
+
+        // Create fake cron data.
+        std::fs::write(cron_dir.join("jobs.json"), r#"{"version":1,"jobs":[]}"#).unwrap();
+
+        // Create fake usage data.
+        std::fs::write(state_dir.join("usage.json"), r#"{"totalTokens":42}"#).unwrap();
+
+        // Build archive.
+        let archive_path = temp.path().join("test-backup.tar.gz");
+        let file = std::fs::File::create(&archive_path).unwrap();
+        let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(enc);
+
+        // Write marker.
+        let marker = b"carapace-backup v1\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(marker.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, BACKUP_MARKER, &marker[..])
+            .unwrap();
+
+        // Add sessions.
+        builder.append_dir_all("sessions", &sessions_dir).unwrap();
+        // Add cron.
+        builder.append_dir_all("cron", &cron_dir).unwrap();
+        // Add usage.
+        builder
+            .append_path_with_name(state_dir.join("usage.json"), "usage/usage.json")
+            .unwrap();
+
+        let enc = builder.into_inner().unwrap();
+        enc.finish().unwrap();
+
+        // Verify the archive can be read and contains the marker.
+        let file = std::fs::File::open(&archive_path).unwrap();
+        let dec = flate2::read::GzDecoder::new(file);
+        let mut archive = tar::Archive::new(dec);
+
+        let mut found_marker = false;
+        let mut found_session = false;
+        let mut found_cron = false;
+        let mut found_usage = false;
+
+        for entry in archive.entries().unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path().unwrap().to_string_lossy().to_string();
+            if path == BACKUP_MARKER {
+                found_marker = true;
+            } else if path.contains("abc123.json") {
+                found_session = true;
+            } else if path.contains("jobs.json") {
+                found_cron = true;
+            } else if path.contains("usage.json") {
+                found_usage = true;
+            }
+        }
+
+        assert!(found_marker, "Archive should contain backup marker");
+        assert!(found_session, "Archive should contain session data");
+        assert!(found_cron, "Archive should contain cron data");
+        assert!(found_usage, "Archive should contain usage data");
+    }
+
+    #[test]
+    fn test_backup_restore_round_trip() {
+        let temp = tempfile::TempDir::new().unwrap();
+
+        // Set up source state directory.
+        let source_state = temp.path().join("source");
+        let source_sessions = source_state.join("sessions");
+        let source_cron = source_state.join("cron");
+        std::fs::create_dir_all(&source_sessions).unwrap();
+        std::fs::create_dir_all(&source_cron).unwrap();
+
+        std::fs::write(source_sessions.join("sess1.json"), r#"{"id":"sess1"}"#).unwrap();
+        std::fs::write(source_cron.join("store.json"), r#"{"version":1}"#).unwrap();
+        std::fs::write(source_state.join("usage.json"), r#"{"totalTokens":100}"#).unwrap();
+
+        // Create an archive.
+        let archive_path = temp.path().join("roundtrip.tar.gz");
+        let file = std::fs::File::create(&archive_path).unwrap();
+        let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(enc);
+
+        let marker = b"carapace-backup v1\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(marker.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, BACKUP_MARKER, &marker[..])
+            .unwrap();
+        builder
+            .append_dir_all("sessions", &source_sessions)
+            .unwrap();
+        builder.append_dir_all("cron", &source_cron).unwrap();
+        builder
+            .append_path_with_name(source_state.join("usage.json"), "usage/usage.json")
+            .unwrap();
+
+        let enc = builder.into_inner().unwrap();
+        enc.finish().unwrap();
+
+        // Set up a fresh target state directory and restore into it.
+        let target_state = temp.path().join("target");
+        std::fs::create_dir_all(&target_state).unwrap();
+
+        // Manually extract (simulating what handle_restore does).
+        let file = std::fs::File::open(&archive_path).unwrap();
+        let dec = flate2::read::GzDecoder::new(file);
+        let mut archive = tar::Archive::new(dec);
+
+        for entry_result in archive.entries().unwrap() {
+            let mut entry = entry_result.unwrap();
+            let path = entry.path().unwrap().to_path_buf();
+            let path_str = path.to_string_lossy().to_string();
+
+            if path_str == BACKUP_MARKER {
+                continue;
+            }
+
+            if path_str.starts_with("sessions/") {
+                let rel = path.strip_prefix("sessions").unwrap_or(&path);
+                let target = target_state.join("sessions").join(rel);
+                let entry_type = entry.header().entry_type();
+                if entry_type.is_dir() {
+                    std::fs::create_dir_all(&target).unwrap();
+                } else if entry_type.is_file() {
+                    if let Some(parent) = target.parent() {
+                        std::fs::create_dir_all(parent).unwrap();
+                    }
+                    let mut buf = Vec::new();
+                    entry.read_to_end(&mut buf).unwrap();
+                    std::fs::write(&target, &buf).unwrap();
+                }
+            } else if path_str.starts_with("cron/") {
+                let rel = path.strip_prefix("cron").unwrap_or(&path);
+                let target = target_state.join("cron").join(rel);
+                let entry_type = entry.header().entry_type();
+                if entry_type.is_dir() {
+                    std::fs::create_dir_all(&target).unwrap();
+                } else if entry_type.is_file() {
+                    if let Some(parent) = target.parent() {
+                        std::fs::create_dir_all(parent).unwrap();
+                    }
+                    let mut buf = Vec::new();
+                    entry.read_to_end(&mut buf).unwrap();
+                    std::fs::write(&target, &buf).unwrap();
+                }
+            } else if path_str.starts_with("usage/") {
+                let rel = path.strip_prefix("usage").unwrap_or(&path);
+                let target = target_state.join(rel);
+                let entry_type = entry.header().entry_type();
+                if entry_type.is_file() {
+                    if let Some(parent) = target.parent() {
+                        std::fs::create_dir_all(parent).unwrap();
+                    }
+                    let mut buf = Vec::new();
+                    entry.read_to_end(&mut buf).unwrap();
+                    std::fs::write(&target, &buf).unwrap();
+                }
+            }
+        }
+
+        // Verify restored data matches original.
+        let restored_session =
+            std::fs::read_to_string(target_state.join("sessions").join("sess1.json")).unwrap();
+        assert_eq!(restored_session, r#"{"id":"sess1"}"#);
+
+        let restored_cron =
+            std::fs::read_to_string(target_state.join("cron").join("store.json")).unwrap();
+        assert_eq!(restored_cron, r#"{"version":1}"#);
+
+        let restored_usage = std::fs::read_to_string(target_state.join("usage.json")).unwrap();
+        assert_eq!(restored_usage, r#"{"totalTokens":100}"#);
+    }
+
+    // -----------------------------------------------------------------------
+    // Reset logic tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reset_sessions_deletes_directory() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let sessions_dir = temp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::write(sessions_dir.join("s1.json"), "{}").unwrap();
+        std::fs::write(sessions_dir.join("s2.json"), "{}").unwrap();
+
+        assert!(sessions_dir.exists());
+        std::fs::remove_dir_all(&sessions_dir).unwrap();
+        assert!(!sessions_dir.exists());
+    }
+
+    #[test]
+    fn test_reset_usage_deletes_file() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let usage_path = temp.path().join("usage.json");
+        std::fs::write(&usage_path, r#"{"tokens":0}"#).unwrap();
+
+        assert!(usage_path.exists());
+        std::fs::remove_file(&usage_path).unwrap();
+        assert!(!usage_path.exists());
+    }
+
+    #[test]
+    fn test_count_files_in_dir() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::write(temp.path().join("a.json"), "{}").unwrap();
+        std::fs::write(temp.path().join("b.json"), "{}").unwrap();
+        std::fs::write(temp.path().join("c.txt"), "").unwrap();
+        std::fs::write(temp.path().join("d.jsonl"), "").unwrap();
+
+        let count = count_files_in_dir(temp.path(), "json");
+        assert_eq!(count, 2);
+
+        let count_txt = count_files_in_dir(temp.path(), "txt");
+        assert_eq!(count_txt, 1);
+
+        let count_missing = count_files_in_dir(&temp.path().join("nonexistent"), "json");
+        assert_eq!(count_missing, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Helper function tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_file_size() {
+        assert_eq!(format_file_size(0), "0 B");
+        assert_eq!(format_file_size(512), "512 B");
+        assert_eq!(format_file_size(1024), "1.0 KB");
+        assert_eq!(format_file_size(1536), "1.5 KB");
+        assert_eq!(format_file_size(1048576), "1.0 MB");
+        assert_eq!(format_file_size(1073741824), "1.00 GB");
     }
 }

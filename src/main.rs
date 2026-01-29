@@ -60,6 +60,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cli::handle_version();
             Ok(())
         }
+
+        Some(Command::Backup { output }) => cli::handle_backup(output.as_deref()),
+
+        Some(Command::Restore { path, force }) => cli::handle_restore(&path, force),
+
+        Some(Command::Reset {
+            sessions,
+            cron,
+            usage,
+            memory,
+            all,
+            force,
+        }) => cli::handle_reset(sessions, cron, usage, memory, all, force),
     }
 }
 
@@ -102,7 +115,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // 5. Build WsServerState (persistent, with device/node registries)
     let ws_state = server::ws::build_ws_state_from_config().await?;
 
-    // 6. Configure LLM providers (Anthropic + OpenAI)
+    // 6. Configure LLM providers (Anthropic + OpenAI + Ollama)
     // 6a. Anthropic provider
     let anthropic_api_key = std::env::var("ANTHROPIC_API_KEY").ok().or_else(|| {
         cfg.get("anthropic")
@@ -186,19 +199,86 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // 6c. Build multi-provider dispatcher
-    let multi_provider = agent::provider::MultiProvider::new(anthropic_provider, openai_provider);
+    // 6c. Ollama provider (local inference)
+    let ollama_providers_cfg = cfg.get("providers").and_then(|v| v.get("ollama"));
+    let ollama_base_url = std::env::var("OLLAMA_BASE_URL").ok().or_else(|| {
+        ollama_providers_cfg
+            .and_then(|v| v.get("baseUrl"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+    let ollama_api_key = ollama_providers_cfg
+        .and_then(|v| v.get("apiKey"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    // Ollama is configured if a base URL is explicitly set, or if the
+    // providers.ollama section exists in the config, or if the
+    // OLLAMA_BASE_URL env var is present. We always attempt creation
+    // since no API key is required for local Ollama.
+    let ollama_explicitly_configured = ollama_base_url.is_some() || ollama_providers_cfg.is_some();
+    let ollama_provider: Option<Arc<dyn agent::LlmProvider>> = if ollama_explicitly_configured {
+        match agent::ollama::OllamaProvider::new() {
+            Ok(provider) => {
+                let provider = if let Some(url) = ollama_base_url {
+                    match provider.with_base_url(url) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            warn!("Invalid OLLAMA_BASE_URL: {}", e);
+                            return Err(e.into());
+                        }
+                    }
+                } else {
+                    provider
+                };
+                let provider = if let Some(key) = ollama_api_key {
+                    provider.with_api_key(key)
+                } else {
+                    provider
+                };
+                info!("LLM provider configured: Ollama ({})", provider.base_url());
+                // Connectivity check (non-blocking, best-effort)
+                let provider = Arc::new(provider);
+                let provider_clone = Arc::clone(&provider);
+                tokio::spawn(async move {
+                    match provider_clone.check_connectivity().await {
+                        Ok(models) => {
+                            if models.is_empty() {
+                                info!("Ollama connected (no models pulled yet)");
+                            } else {
+                                info!("Ollama connected, available models: {}", models.join(", "));
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Ollama connectivity check failed: {} (provider will remain configured, requests may fail until Ollama is reachable)", e);
+                        }
+                    }
+                });
+                Some(provider)
+            }
+            Err(e) => {
+                warn!("Failed to configure Ollama provider: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // 6d. Build multi-provider dispatcher
+    let multi_provider = agent::provider::MultiProvider::new(anthropic_provider, openai_provider)
+        .with_ollama(ollama_provider);
 
     let ws_state = if multi_provider.has_any_provider() {
         let inner = Arc::try_unwrap(ws_state)
             .expect("WsServerState Arc should have single owner at startup");
         Arc::new(inner.with_llm_provider(Arc::new(multi_provider)))
     } else {
-        info!("No LLM provider configured (set ANTHROPIC_API_KEY and/or OPENAI_API_KEY to enable)");
+        info!("No LLM provider configured (set ANTHROPIC_API_KEY, OPENAI_API_KEY, and/or configure Ollama to enable)");
         ws_state
     };
 
-    // 6d. Register built-in console channel (for testing/demo)
+    // 6e. Register built-in console channel (for testing/demo)
     let ws_state = {
         let plugin_reg = Arc::new(plugins::PluginRegistry::new());
         plugin_reg.register_channel(

@@ -268,6 +268,20 @@ impl LlmProvider for OpenAiProvider {
 /// the stream is treated as corrupted to prevent unbounded memory growth.
 const MAX_SSE_BUFFER_BYTES: usize = 1_048_576;
 
+/// Process an OpenAI-compatible SSE byte stream into StreamEvents.
+///
+/// This is a public wrapper used by the Ollama provider, which uses the same
+/// SSE format via Ollama's `/v1/chat/completions` OpenAI-compatible endpoint.
+pub async fn process_ollama_sse_stream<S>(
+    stream: S,
+    tx: &mpsc::Sender<StreamEvent>,
+) -> Result<(), String>
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
+{
+    process_sse_stream(stream, tx).await
+}
+
 /// Process an OpenAI SSE byte stream into StreamEvents.
 async fn process_sse_stream<S>(mut stream: S, tx: &mpsc::Sender<StreamEvent>) -> Result<(), String>
 where

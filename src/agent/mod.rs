@@ -7,8 +7,10 @@ pub mod anthropic;
 pub mod builtin_tools;
 pub mod context;
 pub mod executor;
+pub mod ollama;
 pub mod openai;
 pub mod provider;
+pub mod tool_policy;
 pub mod tools;
 
 use std::sync::Arc;
@@ -19,6 +21,7 @@ use crate::server::ws::{AgentRunStatus, WsServerState};
 pub use executor::execute_run;
 pub use provider::{LlmProvider, StreamEvent};
 use tokio_util::sync::CancellationToken;
+pub use tool_policy::ToolPolicy;
 
 /// Default LLM model used when none is specified.
 pub const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
@@ -69,6 +72,8 @@ pub struct AgentConfig {
     pub temperature: Option<f64>,
     /// Whether to deliver the final message via the channel pipeline.
     pub deliver: bool,
+    /// Tool policy controlling which tools this agent may invoke.
+    pub tool_policy: ToolPolicy,
 }
 
 impl Default for AgentConfig {
@@ -80,6 +85,7 @@ impl Default for AgentConfig {
             max_tokens: 8192,
             temperature: None,
             deliver: false,
+            tool_policy: ToolPolicy::default(),
         }
     }
 }
