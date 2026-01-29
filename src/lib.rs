@@ -22,4 +22,5 @@ pub mod nodes;
 pub mod plugins;
 pub mod server;
 pub mod sessions;
+pub mod tts;
 pub mod usage;
