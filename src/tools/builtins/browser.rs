@@ -147,3 +147,220 @@ impl Tool for BrowserTool {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::Tool;
+
+    #[test]
+    fn test_browser_tool_name() {
+        let tool = BrowserTool;
+        assert_eq!(tool.name(), "browser");
+    }
+
+    #[test]
+    fn test_browser_tool_description() {
+        let tool = BrowserTool;
+        assert_eq!(tool.description(), "Automate browser actions: navigate, screenshot, click, type");
+    }
+
+    #[test]
+    fn test_browser_tool_requires_approval() {
+        let tool = BrowserTool;
+        assert!(tool.requires_approval());
+    }
+
+    #[test]
+    fn test_browser_tool_parameters_schema() {
+        let tool = BrowserTool;
+        let schema = tool.parameters_schema();
+
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"]["action"].is_object());
+        assert_eq!(schema["properties"]["action"]["type"], "string");
+
+        let required = schema["required"].as_array().unwrap();
+        assert!(required.contains(&json!("action")));
+    }
+
+    #[tokio::test]
+    async fn test_browser_tool_navigate() {
+        let tool = BrowserTool;
+        let params = json!({
+            "action": "navigate",
+            "url": "https://example.com"
+        });
+
+        let result = tool.execute(params).await;
+        assert!(result.is_ok());
+
+        let output = result.unwrap();
+        assert!(output.success);
+    }
+
+    #[tokio::test]
+    async fn test_browser_tool_navigate_missing_url() {
+        let tool = BrowserTool;
+        let params = json!({
+            "action": "navigate"
+        });
+
+        let result = tool.execute(params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_browser_tool_screenshot() {
+        let tool = BrowserTool;
+        let params = json!({
+            "action": "screenshot",
+            "full_page": true
+        });
+
+        let result = tool.execute(params).await;
+        assert!(result.is_ok());
+
+        let output = result.unwrap();
+        assert!(output.success);
+    }
+
+    #[tokio::test]
+    async fn test_browser_tool_screenshot_default() {
+        let tool = BrowserTool;
+        let params = json!({
+            "action": "screenshot"
+        });
+
+        let result = tool.execute(params).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_browser_tool_click() {
+        let tool = BrowserTool;
+        let params = json!({
+            "action": "click",
+            "selector": "#submit-button"
+        });
+
+        let result = tool.execute(params).await;
+        assert!(result.is_ok());
+
+        let output = result.unwrap();
+        assert!(output.success);
+    }
+
+    #[tokio::test]
+    async fn test_browser_tool_click_missing_selector() {
+        let tool = BrowserTool;
+        let params = json!({
+            "action": "click"
+        });
+
+        let result = tool.execute(params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_browser_tool_type() {
+        let tool = BrowserTool;
+        let params = json!({
+            "action": "type",
+            "selector": "#username",
+            "text": "testuser"
+        });
+
+        let result = tool.execute(params).await;
+        assert!(result.is_ok());
+
+        let output = result.unwrap();
+        assert!(output.success);
+    }
+
+    #[tokio::test]
+    async fn test_browser_tool_type_missing_selector() {
+        let tool = BrowserTool;
+        let params = json!({
+            "action": "type",
+            "text": "testuser"
+        });
+
+        let result = tool.execute(params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_browser_tool_type_missing_text() {
+        let tool = BrowserTool;
+        let params = json!({
+            "action": "type",
+            "selector": "#username"
+        });
+
+        let result = tool.execute(params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_browser_tool_evaluate() {
+        let tool = BrowserTool;
+        let params = json!({
+            "action": "evaluate",
+            "script": "document.title"
+        });
+
+        let result = tool.execute(params).await;
+        assert!(result.is_ok());
+
+        let output = result.unwrap();
+        assert!(output.success);
+    }
+
+    #[tokio::test]
+    async fn test_browser_tool_evaluate_missing_script() {
+        let tool = BrowserTool;
+        let params = json!({
+            "action": "evaluate"
+        });
+
+        let result = tool.execute(params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_browser_tool_pdf() {
+        let tool = BrowserTool;
+        let params = json!({
+            "action": "pdf"
+        });
+
+        let result = tool.execute(params).await;
+        assert!(result.is_ok());
+
+        let output = result.unwrap();
+        assert!(output.success);
+    }
+
+    #[tokio::test]
+    async fn test_browser_tool_unknown_action() {
+        let tool = BrowserTool;
+        let params = json!({
+            "action": "invalid_action"
+        });
+
+        let result = tool.execute(params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_browser_tool_missing_action() {
+        let tool = BrowserTool;
+        let params = json!({
+            "url": "https://example.com"
+        });
+
+        let result = tool.execute(params).await;
+        assert!(result.is_err());
+    }
+}

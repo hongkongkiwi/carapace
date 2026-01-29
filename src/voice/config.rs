@@ -84,3 +84,125 @@ impl VoiceConfig {
             && !self.webhook_url.is_empty()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_voice_config_default() {
+        let config = VoiceConfig::default();
+        assert!(!config.enabled);
+        assert!(config.account_sid.is_empty());
+        assert!(config.auth_token.is_empty());
+        assert!(config.phone_number.is_empty());
+        assert!(config.webhook_url.is_empty());
+        assert!(config.verify_signatures);
+        assert_eq!(config.tts_voice, "Polly.Joanna");
+        assert_eq!(config.tts_language, "en-US");
+        assert!(config.barge_in_enabled);
+        assert!(!config.record_calls);
+        assert_eq!(config.max_call_duration, 3600);
+    }
+
+    #[test]
+    fn test_voice_config_validate_disabled() {
+        let config = VoiceConfig::default();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_voice_config_validate_missing_account_sid() {
+        let config = VoiceConfig {
+            enabled: true,
+            auth_token: "token".to_string(),
+            phone_number: "+1234567890".to_string(),
+            webhook_url: "https://example.com/webhook".to_string(),
+            ..VoiceConfig::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("account SID"));
+    }
+
+    #[test]
+    fn test_voice_config_validate_missing_auth_token() {
+        let config = VoiceConfig {
+            enabled: true,
+            account_sid: "AC123".to_string(),
+            phone_number: "+1234567890".to_string(),
+            webhook_url: "https://example.com/webhook".to_string(),
+            ..VoiceConfig::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("auth token"));
+    }
+
+    #[test]
+    fn test_voice_config_validate_missing_phone_number() {
+        let config = VoiceConfig {
+            enabled: true,
+            account_sid: "AC123".to_string(),
+            auth_token: "token".to_string(),
+            webhook_url: "https://example.com/webhook".to_string(),
+            ..VoiceConfig::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("phone number"));
+    }
+
+    #[test]
+    fn test_voice_config_validate_missing_webhook_url() {
+        let config = VoiceConfig {
+            enabled: true,
+            account_sid: "AC123".to_string(),
+            auth_token: "token".to_string(),
+            phone_number: "+1234567890".to_string(),
+            ..VoiceConfig::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Webhook URL"));
+    }
+
+    #[test]
+    fn test_voice_config_validate_valid() {
+        let config = VoiceConfig {
+            enabled: true,
+            account_sid: "AC123".to_string(),
+            auth_token: "token".to_string(),
+            phone_number: "+1234567890".to_string(),
+            webhook_url: "https://example.com/webhook".to_string(),
+            ..VoiceConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_voice_config_is_configured() {
+        let config = VoiceConfig::default();
+        assert!(!config.is_configured());
+
+        let config = VoiceConfig {
+            enabled: true,
+            account_sid: "AC123".to_string(),
+            auth_token: "token".to_string(),
+            phone_number: "+1234567890".to_string(),
+            webhook_url: "https://example.com/webhook".to_string(),
+            ..VoiceConfig::default()
+        };
+        assert!(config.is_configured());
+
+        let config = VoiceConfig {
+            enabled: true,
+            account_sid: "AC123".to_string(),
+            auth_token: "token".to_string(),
+            phone_number: "+1234567890".to_string(),
+            webhook_url: "".to_string(),
+            ..VoiceConfig::default()
+        };
+        assert!(!config.is_configured());
+    }
+}

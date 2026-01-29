@@ -238,3 +238,190 @@ impl Default for CallManager {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_call_manager_create_call() {
+        let manager = CallManager::new();
+        let call = manager.create_call(
+            CallDirection::Outbound,
+            "+1234567890".to_string(),
+            "+0987654321".to_string(),
+            true,
+        ).await;
+
+        assert_eq!(call.direction, CallDirection::Outbound);
+        assert_eq!(call.from, "+1234567890");
+        assert_eq!(call.to, "+0987654321");
+        assert_eq!(call.status, CallStatus::Queued);
+        assert!(call.barge_in_enabled);
+        assert!(call.twilio_sid.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_call_manager_get_call() {
+        let manager = CallManager::new();
+        let call = manager.create_call(
+            CallDirection::Inbound,
+            "+1111111111".to_string(),
+            "+2222222222".to_string(),
+            false,
+        ).await;
+
+        let retrieved = manager.get_call(&call.id).await;
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().id, call.id);
+
+        assert!(manager.get_call("nonexistent").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_call_manager_update_status() {
+        let manager = CallManager::new();
+        let call = manager.create_call(
+            CallDirection::Outbound,
+            "+1234567890".to_string(),
+            "+0987654321".to_string(),
+            true,
+        ).await;
+
+        assert!(manager.update_status(&call.id, CallStatus::Ringing).await.is_some());
+
+        let updated = manager.get_call(&call.id).await.unwrap();
+        assert_eq!(updated.status, CallStatus::Ringing);
+
+        assert!(manager.update_status("nonexistent", CallStatus::Completed).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_call_manager_set_twilio_sid() {
+        let manager = CallManager::new();
+        let call = manager.create_call(
+            CallDirection::Outbound,
+            "+1234567890".to_string(),
+            "+0987654321".to_string(),
+            true,
+        ).await;
+
+        assert!(manager.set_twilio_sid(&call.id, "CA1234567890".to_string()).await.is_some());
+
+        let updated = manager.get_call(&call.id).await.unwrap();
+        assert_eq!(updated.twilio_sid, Some("CA1234567890".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_call_manager_add_transcript_entry() {
+        let manager = CallManager::new();
+        let call = manager.create_call(
+            CallDirection::Outbound,
+            "+1234567890".to_string(),
+            "+0987654321".to_string(),
+            true,
+        ).await;
+
+        assert!(manager.add_transcript_entry(&call.id, "caller".to_string(), "Hello".to_string()).await.is_some());
+        assert!(manager.add_transcript_entry(&call.id, "system".to_string(), "Hi there".to_string()).await.is_some());
+
+        let updated = manager.get_call(&call.id).await.unwrap();
+        assert_eq!(updated.transcript.len(), 2);
+        assert_eq!(updated.transcript[0].speaker, "caller");
+        assert_eq!(updated.transcript[0].text, "Hello");
+    }
+
+    #[tokio::test]
+    async fn test_call_manager_set_recording() {
+        let manager = CallManager::new();
+        let call = manager.create_call(
+            CallDirection::Outbound,
+            "+1234567890".to_string(),
+            "+0987654321".to_string(),
+            true,
+        ).await;
+
+        assert!(manager.set_recording(&call.id, "https://example.com/recording.mp3".to_string()).await.is_some());
+
+        let updated = manager.get_call(&call.id).await.unwrap();
+        assert_eq!(updated.recording_url, Some("https://example.com/recording.mp3".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_call_manager_list_active_calls() {
+        let manager = CallManager::new();
+
+        let call1 = manager.create_call(CallDirection::Outbound, "+1".to_string(), "+2".to_string(), true).await;
+        let call2 = manager.create_call(CallDirection::Inbound, "+3".to_string(), "+4".to_string(), false).await;
+        let _call3 = manager.create_call(CallDirection::Outbound, "+5".to_string(), "+6".to_string(), true).await;
+
+        manager.update_status(&call1.id, CallStatus::InProgress).await;
+        manager.update_status(&call2.id, CallStatus::Completed).await;
+
+        let active = manager.list_active_calls().await;
+        assert_eq!(active.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_call_manager_list_all_calls() {
+        let manager = CallManager::new();
+
+        let _call1 = manager.create_call(CallDirection::Outbound, "+1".to_string(), "+2".to_string(), true).await;
+        let _call2 = manager.create_call(CallDirection::Inbound, "+3".to_string(), "+4".to_string(), false).await;
+
+        let all = manager.list_all_calls().await;
+        assert_eq!(all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_call_manager_end_call() {
+        let manager = CallManager::new();
+        let call = manager.create_call(
+            CallDirection::Outbound,
+            "+1234567890".to_string(),
+            "+0987654321".to_string(),
+            true,
+        ).await;
+
+        assert!(manager.end_call(&call.id).await.is_some());
+
+        let ended = manager.get_call(&call.id).await.unwrap();
+        assert_eq!(ended.status, CallStatus::Completed);
+        assert!(ended.ended_at.is_some());
+        assert!(ended.duration.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_call_manager_delete_call() {
+        let manager = CallManager::new();
+        let call = manager.create_call(
+            CallDirection::Outbound,
+            "+1234567890".to_string(),
+            "+0987654321".to_string(),
+            true,
+        ).await;
+
+        assert!(manager.delete_call(&call.id).await.is_some());
+        assert!(manager.get_call(&call.id).await.is_none());
+        assert!(manager.delete_call(&call.id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_call_manager_get_call_by_twilio_sid() {
+        let manager = CallManager::new();
+        let call = manager.create_call(
+            CallDirection::Outbound,
+            "+1234567890".to_string(),
+            "+0987654321".to_string(),
+            true,
+        ).await;
+
+        manager.set_twilio_sid(&call.id, "CA12345".to_string()).await;
+
+        let found = manager.get_call_by_twilio_sid("CA12345").await;
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().id, call.id);
+
+        assert!(manager.get_call_by_twilio_sid("nonexistent").await.is_none());
+    }
+}
