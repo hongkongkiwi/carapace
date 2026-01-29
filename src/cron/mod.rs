@@ -11,9 +11,10 @@
 pub mod executor;
 pub mod tick;
 
+use chrono::{Datelike, TimeZone, Timelike, Utc};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -799,6 +800,243 @@ pub fn create_scheduler(store_path: PathBuf, enabled: bool) -> Arc<CronScheduler
     Arc::new(CronScheduler::new(store_path, enabled))
 }
 
+/// A parsed cron expression (5-field: minute hour day-of-month month day-of-week).
+///
+/// Each field is stored as a set of valid values. A datetime matches when all
+/// five fields match the corresponding component.
+#[derive(Debug, Clone)]
+pub struct CronExpr {
+    /// Valid minutes (0-59).
+    pub minutes: BTreeSet<u32>,
+    /// Valid hours (0-23).
+    pub hours: BTreeSet<u32>,
+    /// Valid days of month (1-31).
+    pub days_of_month: BTreeSet<u32>,
+    /// Valid months (1-12).
+    pub months: BTreeSet<u32>,
+    /// Valid days of week (0-6, where 0=Sunday).
+    pub days_of_week: BTreeSet<u32>,
+}
+
+/// Errors from parsing a cron expression.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CronParseError {
+    #[error("expected 5 fields, got {0}")]
+    WrongFieldCount(usize),
+    #[error("invalid field '{field}': {reason}")]
+    InvalidField { field: String, reason: String },
+}
+
+impl CronExpr {
+    /// Parse a standard 5-field cron expression.
+    ///
+    /// Format: `minute hour day-of-month month day-of-week`
+    ///
+    /// Each field supports: `*`, a number, a range (`1-5`), a list (`1,3,5`),
+    /// and steps (`*/5`, `1-10/2`).
+    pub fn parse(expr: &str) -> Result<Self, CronParseError> {
+        let fields: Vec<&str> = expr.split_whitespace().collect();
+        if fields.len() != 5 {
+            return Err(CronParseError::WrongFieldCount(fields.len()));
+        }
+
+        let minutes = Self::parse_field(fields[0], 0, 59, "minute")?;
+        let hours = Self::parse_field(fields[1], 0, 23, "hour")?;
+        let days_of_month = Self::parse_field(fields[2], 1, 31, "day-of-month")?;
+        let months = Self::parse_field(fields[3], 1, 12, "month")?;
+        let days_of_week = Self::parse_dow_field(fields[4])?;
+
+        Ok(Self {
+            minutes,
+            hours,
+            days_of_month,
+            months,
+            days_of_week,
+        })
+    }
+
+    /// Parse a single cron field into a set of valid values.
+    ///
+    /// The field can contain comma-separated items, where each item is one of:
+    /// - `*`           -> all values from `min` to `max`
+    /// - `*/step`      -> values from `min` to `max` stepping by `step`
+    /// - `N`           -> single value
+    /// - `N-M`         -> range from `N` to `M` inclusive
+    /// - `N-M/step`    -> range with step
+    fn parse_field(
+        field: &str,
+        min: u32,
+        max: u32,
+        name: &str,
+    ) -> Result<BTreeSet<u32>, CronParseError> {
+        let mut result = BTreeSet::new();
+        for part in field.split(',') {
+            let values = Self::parse_field_part(part, min, max, name)?;
+            result.extend(values);
+        }
+        if result.is_empty() {
+            return Err(CronParseError::InvalidField {
+                field: field.to_string(),
+                reason: format!("{name} field produced no valid values"),
+            });
+        }
+        Ok(result)
+    }
+
+    /// Parse a single comma-separated item of a cron field.
+    fn parse_field_part(
+        part: &str,
+        min: u32,
+        max: u32,
+        name: &str,
+    ) -> Result<BTreeSet<u32>, CronParseError> {
+        let make_err = |reason: String| CronParseError::InvalidField {
+            field: part.to_string(),
+            reason,
+        };
+
+        // Split on '/' first to handle steps
+        let (range_part, step) = if let Some((r, s)) = part.split_once('/') {
+            let step: u32 = s
+                .parse()
+                .map_err(|_| make_err(format!("invalid step '{s}' in {name}")))?;
+            if step == 0 {
+                return Err(make_err(format!("step cannot be 0 in {name}")));
+            }
+            (r, Some(step))
+        } else {
+            (part, None)
+        };
+
+        // Determine the range of values
+        let (range_min, range_max) = if range_part == "*" {
+            (min, max)
+        } else if let Some((lo, hi)) = range_part.split_once('-') {
+            let lo: u32 = lo
+                .parse()
+                .map_err(|_| make_err(format!("invalid range start '{lo}' in {name}")))?;
+            let hi: u32 = hi
+                .parse()
+                .map_err(|_| make_err(format!("invalid range end '{hi}' in {name}")))?;
+            if lo < min || hi > max {
+                return Err(make_err(format!(
+                    "range {lo}-{hi} out of bounds ({min}-{max}) for {name}"
+                )));
+            }
+            if lo > hi {
+                return Err(make_err(format!("range start {lo} > end {hi} in {name}")));
+            }
+            (lo, hi)
+        } else {
+            // Single number
+            let val: u32 = range_part
+                .parse()
+                .map_err(|_| make_err(format!("invalid value '{range_part}' in {name}")))?;
+            if val < min || val > max {
+                return Err(make_err(format!(
+                    "value {val} out of bounds ({min}-{max}) for {name}"
+                )));
+            }
+            if let Some(s) = step {
+                // e.g. "5/2" means starting at 5, stepping by 2 up to max
+                let mut set = BTreeSet::new();
+                let mut v = val;
+                while v <= max {
+                    set.insert(v);
+                    v += s;
+                }
+                return Ok(set);
+            }
+            return Ok(BTreeSet::from([val]));
+        };
+
+        // Build the set from range with optional step
+        let step = step.unwrap_or(1);
+        let mut set = BTreeSet::new();
+        let mut v = range_min;
+        while v <= range_max {
+            set.insert(v);
+            v += step;
+        }
+        Ok(set)
+    }
+
+    /// Parse the day-of-week field, handling 7 as an alias for Sunday (0).
+    fn parse_dow_field(field: &str) -> Result<BTreeSet<u32>, CronParseError> {
+        // Day-of-week: 0-7 where 0 and 7 both mean Sunday.
+        // We parse with range 0-7, then normalize 7 -> 0.
+        let mut result = BTreeSet::new();
+        for part in field.split(',') {
+            let values = Self::parse_field_part(part, 0, 7, "day-of-week")?;
+            result.extend(values);
+        }
+        // Normalize: 7 -> 0 (Sunday)
+        if result.remove(&7) {
+            result.insert(0);
+        }
+        if result.is_empty() {
+            return Err(CronParseError::InvalidField {
+                field: field.to_string(),
+                reason: "day-of-week field produced no valid values".to_string(),
+            });
+        }
+        Ok(result)
+    }
+
+    /// Check if a `chrono::DateTime<Utc>` matches this cron expression.
+    pub fn matches(&self, dt: &chrono::DateTime<Utc>) -> bool {
+        let minute = dt.minute();
+        let hour = dt.hour();
+        let day = dt.day();
+        let month = dt.month();
+        // chrono: Mon=0 .. Sun=6 via weekday().num_days_from_monday()
+        // cron: Sun=0, Mon=1 .. Sat=6 via weekday().num_days_from_sunday()
+        let dow = dt.weekday().num_days_from_sunday();
+
+        self.minutes.contains(&minute)
+            && self.hours.contains(&hour)
+            && self.days_of_month.contains(&day)
+            && self.months.contains(&month)
+            && self.days_of_week.contains(&dow)
+    }
+
+    /// Find the next minute (as UTC `DateTime`) after `after` that matches this expression.
+    ///
+    /// Searches up to ~4 years (2,100,000 minutes) to account for leap years and
+    /// edge cases. Returns `None` if no match is found (e.g., Feb 31).
+    pub fn next_after(&self, after: &chrono::DateTime<Utc>) -> Option<chrono::DateTime<Utc>> {
+        use chrono::Duration as CDuration;
+
+        // Start from the next whole minute after `after`
+        let mut candidate = *after + CDuration::seconds(60 - after.second() as i64)
+            - CDuration::nanoseconds(after.nanosecond() as i64);
+        // If `after` was already at a whole minute boundary, we already advanced by 60s,
+        // which is what we want (next minute after `after`, not `after` itself).
+        // But if after had sub-minute components, the above math may still land on the same
+        // minute. Let's normalize to ensure we're at seconds=0, nanos=0 of the next minute.
+        candidate = candidate
+            .with_second(0)
+            .unwrap_or(candidate)
+            .with_nanosecond(0)
+            .unwrap_or(candidate);
+
+        // If we're still at or before `after`, push forward one more minute
+        if candidate <= *after {
+            candidate += CDuration::minutes(1);
+        }
+
+        // Search up to ~4 years of minutes
+        let max_iterations = 2_100_000u32;
+        for _ in 0..max_iterations {
+            if self.matches(&candidate) {
+                return Some(candidate);
+            }
+            candidate += CDuration::minutes(1);
+        }
+        None
+    }
+}
+
 /// Compute the next run time for a schedule.
 fn compute_next_run(schedule: &CronSchedule, now: u64) -> Option<u64> {
     match schedule {
@@ -826,11 +1064,18 @@ fn compute_next_run(schedule: &CronSchedule, now: u64) -> Option<u64> {
                 Some(anchor + (periods + 1) * every_ms)
             }
         }
-        CronSchedule::Cron { expr: _, tz: _ } => {
-            // Cron expression parsing would require a cron library
-            // For now, return a default next minute
-            let next_minute = (now / 60_000 + 1) * 60_000;
-            Some(next_minute)
+        CronSchedule::Cron { expr, tz: _ } => {
+            let parsed = match CronExpr::parse(expr) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(expr = %expr, error = %e, "invalid cron expression");
+                    return None;
+                }
+            };
+            // Convert `now` (ms since epoch) to a chrono DateTime<Utc>
+            let now_dt = Utc.timestamp_millis_opt(now as i64).single()?;
+            let next_dt = parsed.next_after(&now_dt)?;
+            Some(next_dt.timestamp_millis() as u64)
         }
     }
 }
@@ -1430,5 +1675,309 @@ mod tests {
 
         // Job should have been removed
         assert!(scheduler.get(&job.id).is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // CronExpr parsing and matching tests
+    // ---------------------------------------------------------------
+
+    /// Helper: create a UTC datetime for testing.
+    fn utc(year: i32, month: u32, day: u32, hour: u32, min: u32) -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(year, month, day, hour, min, 0)
+            .unwrap()
+    }
+
+    #[test]
+    fn test_cron_expr_star_matches_every_minute() {
+        let expr = CronExpr::parse("* * * * *").unwrap();
+        // Should match any arbitrary datetime
+        assert!(expr.matches(&utc(2025, 6, 15, 14, 30)));
+        assert!(expr.matches(&utc(2025, 1, 1, 0, 0)));
+        assert!(expr.matches(&utc(2025, 12, 31, 23, 59)));
+    }
+
+    #[test]
+    fn test_cron_expr_minute_zero() {
+        let expr = CronExpr::parse("0 * * * *").unwrap();
+        // Matches at minute 0
+        assert!(expr.matches(&utc(2025, 6, 15, 14, 0)));
+        assert!(expr.matches(&utc(2025, 6, 15, 0, 0)));
+        // Does not match at other minutes
+        assert!(!expr.matches(&utc(2025, 6, 15, 14, 1)));
+        assert!(!expr.matches(&utc(2025, 6, 15, 14, 30)));
+        assert!(!expr.matches(&utc(2025, 6, 15, 14, 59)));
+    }
+
+    #[test]
+    fn test_cron_expr_specific_time() {
+        // "30 2 * * *" matches only at 2:30
+        let expr = CronExpr::parse("30 2 * * *").unwrap();
+        assert!(expr.matches(&utc(2025, 6, 15, 2, 30)));
+        assert!(expr.matches(&utc(2025, 1, 1, 2, 30)));
+        // Does not match at other times
+        assert!(!expr.matches(&utc(2025, 6, 15, 2, 31)));
+        assert!(!expr.matches(&utc(2025, 6, 15, 3, 30)));
+        assert!(!expr.matches(&utc(2025, 6, 15, 14, 30)));
+    }
+
+    #[test]
+    fn test_cron_expr_step_every_15_minutes() {
+        // "*/15 * * * *" matches at 0, 15, 30, 45
+        let expr = CronExpr::parse("*/15 * * * *").unwrap();
+        assert!(expr.matches(&utc(2025, 6, 15, 10, 0)));
+        assert!(expr.matches(&utc(2025, 6, 15, 10, 15)));
+        assert!(expr.matches(&utc(2025, 6, 15, 10, 30)));
+        assert!(expr.matches(&utc(2025, 6, 15, 10, 45)));
+        // Does not match at other minutes
+        assert!(!expr.matches(&utc(2025, 6, 15, 10, 1)));
+        assert!(!expr.matches(&utc(2025, 6, 15, 10, 14)));
+        assert!(!expr.matches(&utc(2025, 6, 15, 10, 16)));
+        assert!(!expr.matches(&utc(2025, 6, 15, 10, 59)));
+
+        // Verify the exact minute set
+        let expected: BTreeSet<u32> = [0, 15, 30, 45].into();
+        assert_eq!(expr.minutes, expected);
+    }
+
+    #[test]
+    fn test_cron_expr_weekday_business_hours() {
+        // "0 9-17 * * 1-5" matches hourly 9am-5pm on weekdays (Mon-Fri)
+        let expr = CronExpr::parse("0 9-17 * * 1-5").unwrap();
+
+        // 2025-06-16 is a Monday
+        assert!(expr.matches(&utc(2025, 6, 16, 9, 0)));
+        assert!(expr.matches(&utc(2025, 6, 16, 12, 0)));
+        assert!(expr.matches(&utc(2025, 6, 16, 17, 0)));
+        // 2025-06-20 is a Friday
+        assert!(expr.matches(&utc(2025, 6, 20, 9, 0)));
+
+        // Should NOT match on Saturday (2025-06-21)
+        assert!(!expr.matches(&utc(2025, 6, 21, 9, 0)));
+        // Should NOT match on Sunday (2025-06-22)
+        assert!(!expr.matches(&utc(2025, 6, 22, 9, 0)));
+        // Should NOT match at 8am on Monday
+        assert!(!expr.matches(&utc(2025, 6, 16, 8, 0)));
+        // Should NOT match at 18:00 on Monday
+        assert!(!expr.matches(&utc(2025, 6, 16, 18, 0)));
+        // Should NOT match at minute != 0
+        assert!(!expr.matches(&utc(2025, 6, 16, 9, 1)));
+    }
+
+    #[test]
+    fn test_cron_expr_first_of_month_midnight() {
+        // "0 0 1 * *" matches midnight on the 1st of every month
+        let expr = CronExpr::parse("0 0 1 * *").unwrap();
+        assert!(expr.matches(&utc(2025, 1, 1, 0, 0)));
+        assert!(expr.matches(&utc(2025, 6, 1, 0, 0)));
+        assert!(expr.matches(&utc(2025, 12, 1, 0, 0)));
+        // Does not match on other days
+        assert!(!expr.matches(&utc(2025, 1, 2, 0, 0)));
+        assert!(!expr.matches(&utc(2025, 1, 15, 0, 0)));
+        // Does not match at non-midnight
+        assert!(!expr.matches(&utc(2025, 1, 1, 1, 0)));
+        assert!(!expr.matches(&utc(2025, 1, 1, 0, 1)));
+    }
+
+    #[test]
+    fn test_cron_expr_sundays_midnight() {
+        // "0 0 * * 0" matches midnight on Sundays
+        let expr = CronExpr::parse("0 0 * * 0").unwrap();
+        // 2025-06-22 is a Sunday
+        assert!(expr.matches(&utc(2025, 6, 22, 0, 0)));
+        // 2025-06-15 is also a Sunday
+        assert!(expr.matches(&utc(2025, 6, 15, 0, 0)));
+        // Monday should not match
+        assert!(!expr.matches(&utc(2025, 6, 16, 0, 0)));
+        // Sunday but not midnight should not match
+        assert!(!expr.matches(&utc(2025, 6, 22, 12, 0)));
+    }
+
+    #[test]
+    fn test_cron_expr_dow_7_is_sunday() {
+        // "0 0 * * 7" should also match Sunday (7 is alias for 0)
+        let expr = CronExpr::parse("0 0 * * 7").unwrap();
+        // 2025-06-22 is a Sunday
+        assert!(expr.matches(&utc(2025, 6, 22, 0, 0)));
+        // Monday should not match
+        assert!(!expr.matches(&utc(2025, 6, 16, 0, 0)));
+    }
+
+    #[test]
+    fn test_cron_expr_invalid_expressions() {
+        // Too few fields
+        assert!(CronExpr::parse("* * *").is_err());
+        assert!(matches!(
+            CronExpr::parse("* * *"),
+            Err(CronParseError::WrongFieldCount(3))
+        ));
+
+        // Too many fields
+        assert!(CronExpr::parse("* * * * * *").is_err());
+        assert!(matches!(
+            CronExpr::parse("* * * * * *"),
+            Err(CronParseError::WrongFieldCount(6))
+        ));
+
+        // Empty string
+        assert!(CronExpr::parse("").is_err());
+
+        // Invalid values
+        assert!(CronExpr::parse("60 * * * *").is_err()); // minute > 59
+        assert!(CronExpr::parse("* 24 * * *").is_err()); // hour > 23
+        assert!(CronExpr::parse("* * 0 * *").is_err()); // day-of-month < 1
+        assert!(CronExpr::parse("* * 32 * *").is_err()); // day-of-month > 31
+        assert!(CronExpr::parse("* * * 0 *").is_err()); // month < 1
+        assert!(CronExpr::parse("* * * 13 *").is_err()); // month > 12
+        assert!(CronExpr::parse("* * * * 8").is_err()); // day-of-week > 7
+
+        // Invalid syntax
+        assert!(CronExpr::parse("abc * * * *").is_err());
+        assert!(CronExpr::parse("*/0 * * * *").is_err()); // step of 0
+        assert!(CronExpr::parse("5-2 * * * *").is_err()); // range start > end
+    }
+
+    #[test]
+    fn test_cron_expr_feb_31_never_matches() {
+        // "0 0 31 2 *" — February 31 never exists
+        let expr = CronExpr::parse("0 0 31 2 *").unwrap();
+        // No February date should match since Feb never has 31 days
+        for day in 1..=28 {
+            assert!(!expr.matches(&utc(2025, 2, day, 0, 0)));
+        }
+        // Even in leap year, Feb 29 doesn't match because we need day 31
+        assert!(!expr.matches(&utc(2024, 2, 29, 0, 0)));
+    }
+
+    #[test]
+    fn test_cron_expr_list_values() {
+        // "0,30 * * * *" matches at minute 0 and 30
+        let expr = CronExpr::parse("0,30 * * * *").unwrap();
+        assert!(expr.matches(&utc(2025, 6, 15, 10, 0)));
+        assert!(expr.matches(&utc(2025, 6, 15, 10, 30)));
+        assert!(!expr.matches(&utc(2025, 6, 15, 10, 15)));
+        assert!(!expr.matches(&utc(2025, 6, 15, 10, 1)));
+    }
+
+    #[test]
+    fn test_cron_expr_range_with_step() {
+        // "1-10/2 * * * *" matches at 1,3,5,7,9
+        let expr = CronExpr::parse("1-10/2 * * * *").unwrap();
+        let expected: BTreeSet<u32> = [1, 3, 5, 7, 9].into();
+        assert_eq!(expr.minutes, expected);
+        assert!(expr.matches(&utc(2025, 6, 15, 10, 1)));
+        assert!(expr.matches(&utc(2025, 6, 15, 10, 3)));
+        assert!(expr.matches(&utc(2025, 6, 15, 10, 9)));
+        assert!(!expr.matches(&utc(2025, 6, 15, 10, 2)));
+        assert!(!expr.matches(&utc(2025, 6, 15, 10, 10)));
+    }
+
+    #[test]
+    fn test_cron_expr_next_after_every_minute() {
+        let expr = CronExpr::parse("* * * * *").unwrap();
+        let now = utc(2025, 6, 15, 10, 30);
+        let next = expr.next_after(&now).unwrap();
+        assert_eq!(next, utc(2025, 6, 15, 10, 31));
+    }
+
+    #[test]
+    fn test_cron_expr_next_after_specific_time() {
+        // "30 2 * * *" — next occurrence after 2025-06-15 02:30 should be 2025-06-16 02:30
+        let expr = CronExpr::parse("30 2 * * *").unwrap();
+        let now = utc(2025, 6, 15, 2, 30);
+        let next = expr.next_after(&now).unwrap();
+        assert_eq!(next, utc(2025, 6, 16, 2, 30));
+    }
+
+    #[test]
+    fn test_cron_expr_next_after_step() {
+        // "*/15 * * * *" — next after 10:02 should be 10:15
+        let expr = CronExpr::parse("*/15 * * * *").unwrap();
+        let now = utc(2025, 6, 15, 10, 2);
+        let next = expr.next_after(&now).unwrap();
+        assert_eq!(next, utc(2025, 6, 15, 10, 15));
+    }
+
+    #[test]
+    fn test_cron_expr_next_after_wraps_hour() {
+        // "0 * * * *" — next after 10:30 should be 11:00
+        let expr = CronExpr::parse("0 * * * *").unwrap();
+        let now = utc(2025, 6, 15, 10, 30);
+        let next = expr.next_after(&now).unwrap();
+        assert_eq!(next, utc(2025, 6, 15, 11, 0));
+    }
+
+    #[test]
+    fn test_cron_expr_next_after_wraps_day() {
+        // "0 0 * * *" — next after 2025-06-15 23:30 should be 2025-06-16 00:00
+        let expr = CronExpr::parse("0 0 * * *").unwrap();
+        let now = utc(2025, 6, 15, 23, 30);
+        let next = expr.next_after(&now).unwrap();
+        assert_eq!(next, utc(2025, 6, 16, 0, 0));
+    }
+
+    #[test]
+    fn test_cron_expr_feb_31_next_after_returns_none() {
+        // "0 0 31 2 *" — Feb 31 never exists, next_after should return None
+        let expr = CronExpr::parse("0 0 31 2 *").unwrap();
+        let now = utc(2025, 1, 1, 0, 0);
+        assert!(expr.next_after(&now).is_none());
+    }
+
+    #[test]
+    fn test_compute_next_run_cron_schedule() {
+        // Ensure compute_next_run works with a real cron expression
+        let now_dt = utc(2025, 6, 15, 10, 0);
+        let now = now_dt.timestamp_millis() as u64;
+
+        let schedule = CronSchedule::Cron {
+            expr: "30 10 * * *".to_string(),
+            tz: None,
+        };
+        let next = compute_next_run(&schedule, now).unwrap();
+        let expected = utc(2025, 6, 15, 10, 30).timestamp_millis() as u64;
+        assert_eq!(next, expected);
+    }
+
+    #[test]
+    fn test_compute_next_run_cron_invalid_expr() {
+        // Invalid cron expression should return None
+        let schedule = CronSchedule::Cron {
+            expr: "invalid".to_string(),
+            tz: None,
+        };
+        assert_eq!(compute_next_run(&schedule, 1_000_000), None);
+    }
+
+    #[test]
+    fn test_cron_expr_complex_list_and_range() {
+        // "0,15,30,45 9-17 * 1,6,12 1-5"
+        // Every 15 min during business hours, in Jan/Jun/Dec, on weekdays
+        let expr = CronExpr::parse("0,15,30,45 9-17 * 1,6,12 1-5").unwrap();
+        // 2025-06-16 is Monday in June
+        assert!(expr.matches(&utc(2025, 6, 16, 9, 0)));
+        assert!(expr.matches(&utc(2025, 6, 16, 12, 15)));
+        assert!(expr.matches(&utc(2025, 6, 16, 17, 45)));
+        // July should not match (month=7)
+        assert!(!expr.matches(&utc(2025, 7, 14, 9, 0)));
+        // Saturday should not match
+        assert!(!expr.matches(&utc(2025, 6, 21, 9, 0)));
+    }
+
+    #[test]
+    fn test_cron_expr_single_value_with_step() {
+        // "5/10 * * * *" means starting at 5, every 10: 5,15,25,35,45,55
+        let expr = CronExpr::parse("5/10 * * * *").unwrap();
+        let expected: BTreeSet<u32> = [5, 15, 25, 35, 45, 55].into();
+        assert_eq!(expr.minutes, expected);
+    }
+
+    #[test]
+    fn test_cron_expr_all_stars_fields() {
+        let expr = CronExpr::parse("* * * * *").unwrap();
+        assert_eq!(expr.minutes.len(), 60); // 0-59
+        assert_eq!(expr.hours.len(), 24); // 0-23
+        assert_eq!(expr.days_of_month.len(), 31); // 1-31
+        assert_eq!(expr.months.len(), 12); // 1-12
+        assert_eq!(expr.days_of_week.len(), 7); // 0-6
     }
 }
