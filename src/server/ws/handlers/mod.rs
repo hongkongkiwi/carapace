@@ -624,8 +624,8 @@ pub(super) async fn dispatch_method(
         "exec.approvals.set" => handle_exec_approvals_set(params),
         "exec.approvals.node.get" => handle_exec_approvals_node_get(params, state).await,
         "exec.approvals.node.set" => handle_exec_approvals_node_set(params, state).await,
-        "exec.approval.request" => handle_exec_approval_request(params),
-        "exec.approval.resolve" => handle_exec_approval_resolve(params),
+        "exec.approval.request" => handle_exec_approval_request(params, state).await,
+        "exec.approval.resolve" => handle_exec_approval_resolve(params, state),
 
         // Usage
         "usage.status" => handle_usage_status(),

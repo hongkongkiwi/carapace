@@ -563,6 +563,11 @@ impl WsServerState {
         &self.channel_registry
     }
 
+    /// Get the exec approval manager.
+    pub(crate) fn exec_manager(&self) -> &exec::ExecApprovalManager {
+        &self.exec_manager
+    }
+
     fn next_event_seq(&self) -> u64 {
         let mut guard = self.event_seq.lock();
         *guard += 1;
