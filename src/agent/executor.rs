@@ -302,7 +302,9 @@ fn execute_tools_with_guards(
 
 /// Record token usage for a single turn via the usage tracker.
 fn record_turn_usage(session_key: &str, model: &str, usage: &TokenUsage) {
-    let provider_name = if crate::agent::openai::is_openai_model(model) {
+    let provider_name = if crate::agent::venice::is_venice_model(model) {
+        "venice"
+    } else if crate::agent::openai::is_openai_model(model) {
         "openai"
     } else {
         "anthropic"
@@ -616,6 +618,75 @@ pub async fn execute_run(
                 return Err(AgentError::Provider(format!(
                     "Prompt guard pre-flight blocked: {reason}"
                 )));
+            }
+        }
+    }
+
+    // 2c. Classifier (optional, fail-open)
+    if let Some(ref clf_config) = config.classifier {
+        if clf_config.enabled && clf_config.mode != crate::agent::classifier::ClassifierMode::Off {
+            // Get the last user message from session history for classification
+            let last_user_msg = state
+                .session_store()
+                .get_history(&session.id, None, None)
+                .ok()
+                .and_then(|history| {
+                    history
+                        .iter()
+                        .rev()
+                        .find(|m| m.role == MessageRole::User)
+                        .map(|m| m.content.clone())
+                });
+
+            if let Some(user_message) = last_user_msg {
+                match crate::agent::classifier::classify_message(
+                    &user_message,
+                    clf_config,
+                    provider.as_ref(),
+                )
+                .await
+                {
+                    Ok(verdict) if verdict.should_block(clf_config) => {
+                        crate::logging::audit::audit(
+                            crate::logging::audit::AuditEvent::ClassifierBlocked {
+                                category: verdict.category.to_string(),
+                                confidence: verdict.confidence as f64,
+                                reasoning: verdict.reasoning.clone(),
+                                run_id: run_id.clone(),
+                            },
+                        );
+                        return Err(AgentError::ClassifierBlocked(
+                            verdict.category.to_string(),
+                            verdict.reasoning,
+                        ));
+                    }
+                    Ok(verdict) if verdict.should_warn(clf_config) => {
+                        crate::logging::audit::audit(
+                            crate::logging::audit::AuditEvent::ClassifierWarned {
+                                category: verdict.category.to_string(),
+                                confidence: verdict.confidence as f64,
+                                reasoning: verdict.reasoning.clone(),
+                                run_id: run_id.clone(),
+                            },
+                        );
+                        tracing::warn!(
+                            run_id = %run_id,
+                            category = %verdict.category,
+                            confidence = verdict.confidence,
+                            "classifier warned: {}",
+                            verdict.reasoning
+                        );
+                        // Continue execution — warning is logged
+                    }
+                    Ok(_) => { /* clean, proceed */ }
+                    Err(e) => {
+                        tracing::warn!(
+                            run_id = %run_id,
+                            error = %e,
+                            "classifier error (fail-open)"
+                        );
+                    }
+                }
             }
         }
     }

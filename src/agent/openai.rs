@@ -53,7 +53,10 @@ impl OpenAiProvider {
     }
 
     /// Build the JSON body for the OpenAI Chat Completions API.
-    fn build_body(&self, request: &CompletionRequest) -> Value {
+    ///
+    /// Exposed as `pub(crate)` so that providers using composition (e.g. Venice)
+    /// can build the body and inject extra parameters before sending.
+    pub(crate) fn build_body(&self, request: &CompletionRequest) -> Value {
         let mut messages: Vec<Value> = Vec::new();
 
         if let Some(ref system) = request.system {
@@ -85,6 +88,57 @@ impl OpenAiProvider {
         append_tools_openai(&request.tools, &mut body);
 
         body
+    }
+
+    /// Send a pre-built JSON body to the Chat Completions endpoint and stream
+    /// the response.
+    ///
+    /// This is separated from `complete()` so that composition-based providers
+    /// (e.g. Venice) can modify the body (inject extra parameters) before
+    /// sending.
+    pub(crate) async fn complete_with_body(
+        &self,
+        body: Value,
+    ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
+        let url = format!("{}/v1/chat/completions", self.base_url);
+
+        let response = self
+            .client
+            .post(&url)
+            .header("authorization", format!("Bearer {}", self.api_key))
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AgentError::Provider(format!("HTTP request failed: {e}")))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unreadable>".to_string());
+            return Err(AgentError::Provider(format!(
+                "API returned {status}: {body}"
+            )));
+        }
+
+        let (tx, rx) = mpsc::channel(64);
+
+        // Spawn a task to read the SSE stream and forward events
+        let stream = response.bytes_stream();
+        tokio::spawn(async move {
+            if let Err(e) = process_sse_stream(stream, &tx).await {
+                let _ = tx
+                    .send(StreamEvent::Error {
+                        message: e.to_string(),
+                    })
+                    .await;
+            }
+        });
+
+        Ok(rx)
     }
 }
 
@@ -211,45 +265,7 @@ impl LlmProvider for OpenAiProvider {
         request: CompletionRequest,
     ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
         let body = self.build_body(&request);
-        let url = format!("{}/v1/chat/completions", self.base_url);
-
-        let response = self
-            .client
-            .post(&url)
-            .header("authorization", format!("Bearer {}", self.api_key))
-            .header("content-type", "application/json")
-            .header("accept", "text/event-stream")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AgentError::Provider(format!("HTTP request failed: {e}")))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable>".to_string());
-            return Err(AgentError::Provider(format!(
-                "API returned {status}: {body}"
-            )));
-        }
-
-        let (tx, rx) = mpsc::channel(64);
-
-        // Spawn a task to read the SSE stream and forward events
-        let stream = response.bytes_stream();
-        tokio::spawn(async move {
-            if let Err(e) = process_sse_stream(stream, &tx).await {
-                let _ = tx
-                    .send(StreamEvent::Error {
-                        message: e.to_string(),
-                    })
-                    .await;
-            }
-        });
-
-        Ok(rx)
+        self.complete_with_body(body).await
     }
 }
 

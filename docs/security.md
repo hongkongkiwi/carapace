@@ -58,7 +58,8 @@ graph TB
 
     subgraph "Agent Pipeline"
         PromptGuard["Prompt Guard<br/>(pre-flight injection scan,<br/>untrusted content tagging)"]
-        LLM["LLM Provider<br/>(Anthropic, OpenAI, Ollama,<br/>Gemini, Bedrock)"]
+        Classifier["Inbound Classifier<br/>(LLM-based attack detection,<br/>off/warn/block modes)"]
+        LLM["LLM Provider<br/>(Anthropic, OpenAI, Ollama,<br/>Gemini, Bedrock, Venice)"]
         ToolDispatch["Tool Dispatch<br/>(allowlist + deny-list policy)"]
         ExecApproval["Exec Approval<br/>(user consent gate)"]
         Sandbox["OS Sandbox<br/>(Seatbelt / Landlock / rlimits)"]
@@ -69,7 +70,7 @@ graph TB
     subgraph "Data at Rest"
         Secrets["AES-256-GCM Encrypted Secrets<br/>(PBKDF2, 600K iterations)"]
         Sessions["HMAC-SHA256 Session Integrity"]
-        Audit["Append-Only Audit Log<br/>(JSONL, 17 event types)"]
+        Audit["Append-Only Audit Log<br/>(JSONL, 19 event types)"]
         Keychain["Platform Keychain<br/>(macOS / Linux / Windows)"]
     end
 
@@ -81,7 +82,7 @@ graph TB
     end
 
     User --> Bind --> TLS --> RateLimit --> Auth
-    Auth --> PromptGuard --> LLM
+    Auth --> PromptGuard --> Classifier --> LLM
     LLM --> ToolDispatch --> ExecApproval --> Sandbox
     Sandbox --> OutputCSP --> PIIFilter
     PIIFilter --> User
@@ -263,6 +264,10 @@ Even with access controls, prompt injection can occur via:
 - Messages from "trusted" but compromised accounts
 
 **Mitigations** (implemented at agent layer, not gateway):
+- Inbound message classifier (LLM-based, off/warn/block modes) — secondary LLM
+  call classifies messages for prompt injection, social engineering, instruction
+  override, data exfiltration, and tool abuse before the main agent loop. Fail-open
+  on errors. See `src/agent/classifier.rs`.
 - Content from external sources treated as untrusted
 - Sandboxed execution for tool calls
 - Tool allowlists to limit blast radius

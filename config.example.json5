@@ -83,6 +83,20 @@
   //   format: "pretty",       // "pretty" | "json"
   // },
 
+  // --- Venice AI provider ------------------------------------------------
+  // venice: {
+  //   apiKey: "${VENICE_API_KEY}",   // export VENICE_API_KEY="..."
+  //   // baseUrl: "https://api.venice.ai/api",  // override with VENICE_BASE_URL env var
+  // },
+
+  // --- Inbound message classifier ----------------------------------------
+  // classifier: {
+  //   enabled: true,
+  //   mode: "warn",              // "off" | "warn" | "block"
+  //   model: "gpt-4o-mini",     // cheap/fast model for classification
+  //   blockThreshold: 0.8,      // confidence threshold (0.0–1.0)
+  // },
+
   // --- Plugins (WASM) ---------------------------------------------------
   // plugins: {
   //   enabled: true,

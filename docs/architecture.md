@@ -170,6 +170,7 @@ sequenceDiagram
 sequenceDiagram
     participant In as Inbound Message
     participant PG as Prompt Guard
+    participant CLF as Classifier
     participant Ctx as Context Builder
     participant LLM as LLM Provider
     participant TD as Tool Dispatch
@@ -182,7 +183,11 @@ sequenceDiagram
     In->>PG: Raw message
     PG->>PG: Pre-flight injection scan
     PG->>PG: Tag untrusted content
-    PG->>Ctx: Guarded message
+    PG->>CLF: Guarded message
+
+    CLF->>CLF: Classify (optional, fail-open)
+    Note over CLF: Off / Warn / Block mode
+    CLF->>Ctx: Verdict: clean or warned
 
     Ctx->>LLM: Session history + system prompt + tools
 
@@ -230,6 +235,8 @@ sequenceDiagram
 | Messages | `src/messages/outbound.rs` | Outbound message queue |
 | Media | `src/media/` | Media fetch, store, pipeline |
 | Credentials | `src/credentials/mod.rs` | Encrypted credential storage |
+| Venice Provider | `src/agent/venice.rs` | Venice AI provider (OpenAI-compatible composition) |
+| Classifier | `src/agent/classifier.rs` | Inbound message classifier (prompt injection, social engineering) |
 | Logging | `src/logging/mod.rs` | tracing setup, ring buffer, log tail streaming |
 
 ## Design Decisions

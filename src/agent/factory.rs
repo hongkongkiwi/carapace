@@ -191,10 +191,32 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
         |p, url| p.with_base_url(url),
     )?;
 
+    // Venice
+    let venice_api_key = std::env::var("VENICE_API_KEY").ok().or_else(|| {
+        cfg.get("venice")
+            .and_then(|v| v.get("apiKey"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+    let venice_base_url = std::env::var("VENICE_BASE_URL").ok().or_else(|| {
+        cfg.get("venice")
+            .and_then(|v| v.get("baseUrl"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+    let venice_provider = try_build_provider(
+        venice_api_key,
+        venice_base_url,
+        "Venice",
+        agent::venice::VeniceProvider::new,
+        |p, url| p.with_base_url(url),
+    )?;
+
     // Build multi-provider dispatcher
     let multi_provider = MultiProvider::new(anthropic_provider, openai_provider)
         .with_ollama(ollama_provider)
-        .with_gemini(gemini_provider);
+        .with_gemini(gemini_provider)
+        .with_venice(venice_provider);
 
     if multi_provider.has_any_provider() {
         Ok(Some(multi_provider))
@@ -212,6 +234,7 @@ pub struct ProviderFingerprint {
     pub openai: Option<(String, Option<String>)>,
     pub ollama: Option<(bool, Option<String>)>,
     pub gemini: Option<(String, Option<String>)>,
+    pub venice: Option<(String, Option<String>)>,
 }
 
 /// Compute a fingerprint of the provider configuration from config + env vars.
@@ -264,6 +287,19 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
             .map(|s| s.to_string())
     });
 
+    let venice_key = std::env::var("VENICE_API_KEY").ok().or_else(|| {
+        cfg.get("venice")
+            .and_then(|v| v.get("apiKey"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+    let venice_url = std::env::var("VENICE_BASE_URL").ok().or_else(|| {
+        cfg.get("venice")
+            .and_then(|v| v.get("baseUrl"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+
     ProviderFingerprint {
         anthropic: anthropic_key.map(|k| (hash_key_prefix(&k), anthropic_url)),
         openai: openai_key.map(|k| (hash_key_prefix(&k), openai_url)),
@@ -273,6 +309,7 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
             None
         },
         gemini: google_key.map(|k| (hash_key_prefix(&k), google_url)),
+        venice: venice_key.map(|k| (hash_key_prefix(&k), venice_url)),
     }
 }
 
@@ -298,6 +335,7 @@ mod tests {
         assert!(fp.openai.is_none());
         assert!(fp.ollama.is_none());
         assert!(fp.gemini.is_none());
+        assert!(fp.venice.is_none());
     }
 
     #[test]

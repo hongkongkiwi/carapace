@@ -119,6 +119,7 @@ pub struct MultiProvider {
     ollama: Option<std::sync::Arc<dyn LlmProvider>>,
     gemini: Option<std::sync::Arc<dyn LlmProvider>>,
     bedrock: Option<std::sync::Arc<dyn LlmProvider>>,
+    venice: Option<std::sync::Arc<dyn LlmProvider>>,
 }
 
 impl std::fmt::Debug for MultiProvider {
@@ -129,6 +130,7 @@ impl std::fmt::Debug for MultiProvider {
             .field("ollama", &self.ollama.is_some())
             .field("gemini", &self.gemini.is_some())
             .field("bedrock", &self.bedrock.is_some())
+            .field("venice", &self.venice.is_some())
             .finish()
     }
 }
@@ -148,6 +150,7 @@ impl MultiProvider {
             ollama: None,
             gemini: None,
             bedrock: None,
+            venice: None,
         }
     }
 
@@ -169,6 +172,12 @@ impl MultiProvider {
         self
     }
 
+    /// Set the Venice provider for Venice AI models.
+    pub fn with_venice(mut self, venice: Option<std::sync::Arc<dyn LlmProvider>>) -> Self {
+        self.venice = venice;
+        self
+    }
+
     /// Returns `true` if at least one provider is configured.
     pub fn has_any_provider(&self) -> bool {
         self.anthropic.is_some()
@@ -176,21 +185,29 @@ impl MultiProvider {
             || self.ollama.is_some()
             || self.gemini.is_some()
             || self.bedrock.is_some()
+            || self.venice.is_some()
     }
 
     /// Select the appropriate backend provider for the given model.
     ///
     /// Dispatch order:
     /// 1. Models prefixed with `ollama:` or `ollama/` -> Ollama
-    /// 2. Models matching Gemini patterns (gemini-*, gemini/*, models/gemini-*) -> Gemini
-    /// 3. Models matching OpenAI patterns (gpt-*, o1-*, etc.) -> OpenAI
-    /// 4. Models matching Bedrock patterns (bedrock:*, anthropic.claude-*, etc.) -> Bedrock
-    /// 5. Everything else -> Anthropic (default)
+    /// 2. Models prefixed with `venice:` -> Venice
+    /// 3. Models matching Gemini patterns (gemini-*, gemini/*, models/gemini-*) -> Gemini
+    /// 4. Models matching OpenAI patterns (gpt-*, o1-*, etc.) -> OpenAI
+    /// 5. Models matching Bedrock patterns (bedrock:*, anthropic.claude-*, etc.) -> Bedrock
+    /// 6. Everything else -> Anthropic (default)
     fn select_provider(&self, model: &str) -> Result<&dyn LlmProvider, AgentError> {
         if crate::agent::ollama::is_ollama_model(model) {
             self.ollama.as_deref().ok_or_else(|| {
                 AgentError::Provider(format!(
                     "model \"{model}\" requires Ollama provider, but Ollama is not configured"
+                ))
+            })
+        } else if crate::agent::venice::is_venice_model(model) {
+            self.venice.as_deref().ok_or_else(|| {
+                AgentError::Provider(format!(
+                    "model \"{model}\" requires Venice provider, but no VENICE_API_KEY is configured"
                 ))
             })
         } else if crate::agent::gemini::is_gemini_model(model) {
@@ -234,6 +251,12 @@ impl LlmProvider for MultiProvider {
         // so the Ollama server receives the bare model name (e.g. "llama3").
         if crate::agent::ollama::is_ollama_model(&request.model) {
             request.model = crate::agent::ollama::strip_ollama_prefix(&request.model).to_string();
+        }
+
+        // Strip the venice: prefix before forwarding to the provider,
+        // so the Venice API receives the bare model name (e.g. "llama-3.3-70b").
+        if crate::agent::venice::is_venice_model(&request.model) {
+            request.model = crate::agent::venice::strip_venice_prefix(&request.model).to_string();
         }
 
         // Strip the gemini/ or models/ prefix before forwarding to the provider,

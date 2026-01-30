@@ -157,6 +157,20 @@ pub enum AuditEvent {
         file: String,
         action: String,
     },
+    /// Inbound message classifier blocked a message.
+    ClassifierBlocked {
+        category: String,
+        confidence: f64,
+        reasoning: String,
+        run_id: String,
+    },
+    /// Inbound message classifier warned about a message.
+    ClassifierWarned {
+        category: String,
+        confidence: f64,
+        reasoning: String,
+        run_id: String,
+    },
 }
 
 impl AuditEvent {
@@ -185,6 +199,8 @@ impl AuditEvent {
             AuditEvent::SkillSignatureFailed { .. } => "skill_signature_failed",
             AuditEvent::SkillCapabilityDenied { .. } => "skill_capability_denied",
             AuditEvent::SessionIntegrityViolation { .. } => "session_integrity_violation",
+            AuditEvent::ClassifierBlocked { .. } => "classifier_blocked",
+            AuditEvent::ClassifierWarned { .. } => "classifier_warned",
         }
     }
 }
@@ -512,6 +528,18 @@ mod tests {
                 session_id: "s".into(),
                 file: "f".into(),
                 action: "a".into(),
+            },
+            AuditEvent::ClassifierBlocked {
+                category: "prompt_injection".into(),
+                confidence: 0.95,
+                reasoning: "r".into(),
+                run_id: "rid".into(),
+            },
+            AuditEvent::ClassifierWarned {
+                category: "social_engineering".into(),
+                confidence: 0.85,
+                reasoning: "r".into(),
+                run_id: "rid".into(),
             },
         ];
         let names: Vec<&str> = events.iter().map(|e| e.event_name()).collect();

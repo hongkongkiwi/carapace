@@ -12,8 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Core infrastructure:** HTTP/WebSocket gateway server with JSON-RPC protocol.
-- **Multi-provider LLM support:** Anthropic, OpenAI, Ollama, Google Gemini, and
-  AWS Bedrock with MultiProvider dispatch.
+- **Multi-provider LLM support:** Anthropic, OpenAI, Ollama, Google Gemini,
+  AWS Bedrock, and Venice AI with MultiProvider dispatch.
 - **Built-in agent tools:** 10 core tools -- current_time, web_fetch,
   memory_read/write/list, message_send, session_list/read, config_read,
   math_eval.
@@ -75,7 +75,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Resource monitoring:** disk, memory, file descriptor threshold warnings.
 - **Encrypted config secrets:** AES-256-GCM at-rest encryption with PBKDF2 key
   derivation for sensitive configuration values.
-- **Structured audit logging:** append-only JSONL audit trail with 17 event types
+- **Structured audit logging:** append-only JSONL audit trail with 19 event types
   and file rotation at 50 MB.
 - **Secret masking in logs:** regex-based redaction of API keys, bearer tokens,
   passwords, and query parameters in log output.
@@ -106,6 +106,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flac) and base64 encoding.
 - **Self-update installer:** platform-specific binary download with SHA-256
   checksum verification and atomic replacement.
+- **Venice AI provider:** OpenAI-compatible provider wrapping `OpenAiProvider`
+  via composition. Routes `venice:` prefixed models to `https://api.venice.ai/api`.
+  Env: `VENICE_API_KEY`, optional `VENICE_BASE_URL`.
+- **Inbound message classifier:** LLM-based pre-dispatch filter classifying
+  inbound messages for prompt injection, social engineering, instruction override,
+  data exfiltration, and tool abuse. Off by default, fail-open on errors. Three
+  modes: `off`, `warn`, `block`. Configurable model, provider, and block threshold.
 
 ### Security
 
@@ -134,6 +141,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - mTLS with cluster CA for gateway-to-gateway authentication.
 - Fine-grained WASM plugin permission enforcement (URL, credential, media scopes).
 - wasmtime 29 (resolves RUSTSEC-2024-0006, -0007, -0384).
+- Inbound message classifier with structured attack taxonomy and audit logging
+  (`classifier_blocked`, `classifier_warned` events).
 
 [Unreleased]: https://github.com/your-org/carapace/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/your-org/carapace/releases/tag/v0.1.0

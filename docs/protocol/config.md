@@ -120,6 +120,8 @@ All keys are optional. Unknown keys are rejected (strict schema).
 - `gateway` – gateway server settings
 - `skills` – skills registry settings
 - `plugins` – plugin load/allowlist/config
+- `venice` – Venice AI provider settings (apiKey, baseUrl)
+- `classifier` – inbound message classifier (mode, model, blockThreshold)
 
 ### Notable subkeys
 
@@ -135,6 +137,10 @@ This is a condensed map; refer to the JSON schema for full detail.
   - `enabled`, `allow`, `deny`, `load.paths`, `slots`, `entries`, `installs`
 - `auth`
   - `profiles`, `order`, `cooldowns`
+- `venice`
+  - `apiKey`, `baseUrl`
+- `classifier`
+  - `enabled`, `mode` (`off` | `warn` | `block`), `model`, `blockThreshold`
 
 ## Defaults
 

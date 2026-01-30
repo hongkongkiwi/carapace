@@ -25,4 +25,6 @@ openclaw / moltbot / clawdbot.
 | HTTP hooks | [http.md](protocol/http.md#hooks) | Webhook configuration |
 | Token security | [pairing.md](protocol/pairing.md#token-security) | SHA-256 hashing, constant-time comparison |
 | Rate limiting | [security.md](security.md#rate-limiting) | Default limits per endpoint |
+| Inbound classifier | [security.md](security.md#prompt-injection-considerations) | LLM-based attack classification |
+| Venice AI provider | [architecture.md](architecture.md#key-files) | OpenAI-compatible composition wrapper |
 | Session storage | [architecture.md](architecture.md#key-files) | JSONL history, compaction |

@@ -7,6 +7,7 @@ pub mod anthropic;
 pub mod bedrock;
 pub mod builtin_tools;
 pub mod channel_tools;
+pub mod classifier;
 pub mod context;
 pub mod executor;
 pub mod exfiltration;
@@ -20,6 +21,7 @@ pub mod provider;
 pub mod sandbox;
 pub mod tool_policy;
 pub mod tools;
+pub mod venice;
 
 use std::sync::Arc;
 
@@ -63,6 +65,9 @@ pub enum AgentError {
 
     #[error("streaming error: {0}")]
     Stream(String),
+
+    #[error("classifier blocked message ({0}): {1}")]
+    ClassifierBlocked(String, String),
 }
 
 /// Configuration for an agent run.
@@ -94,6 +99,8 @@ pub struct AgentConfig {
     /// Output sanitizer configuration for safe web rendering (CSP, HTML/Markdown
     /// sanitization).
     pub output_sanitizer: output_sanitizer::OutputSanitizerConfig,
+    /// Inbound message classifier configuration (off by default).
+    pub classifier: Option<classifier::ClassifierConfig>,
 }
 
 impl Default for AgentConfig {
@@ -110,6 +117,7 @@ impl Default for AgentConfig {
             prompt_guard: prompt_guard::PromptGuardConfig::default(),
             process_sandbox: sandbox::ProcessSandboxConfig::default(),
             output_sanitizer: output_sanitizer::OutputSanitizerConfig::default(),
+            classifier: None,
         }
     }
 }
