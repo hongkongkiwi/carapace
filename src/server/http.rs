@@ -209,6 +209,8 @@ pub struct AppState {
     pub start_time: i64,
     /// WebSocket server state (for agent dispatch from hooks)
     pub ws_state: Option<Arc<WsServerState>>,
+    /// Health checker for deep diagnostics
+    pub health_checker: Option<Arc<crate::server::health::HealthChecker>>,
 }
 
 /// Middleware configuration for the HTTP server
@@ -299,7 +301,14 @@ pub fn create_router_with_state(
     let start_time = chrono::Utc::now().timestamp();
 
     // Extract LLM provider before moving ws_state into AppState
-    let llm_provider = ws_state.as_ref().and_then(|ws| ws.llm_provider().cloned());
+    let llm_provider = ws_state.as_ref().and_then(|ws| ws.llm_provider());
+
+    // Build health checker if ws_state provides a state directory
+    let health_checker = ws_state.as_ref().map(|_| {
+        Arc::new(crate::server::health::HealthChecker::new(
+            crate::server::ws::resolve_state_dir(),
+        ))
+    });
 
     let state = AppState {
         config: Arc::new(config.clone()),
@@ -308,6 +317,7 @@ pub fn create_router_with_state(
         channel_registry: channel_registry.clone(),
         start_time,
         ws_state,
+        health_checker,
     };
 
     let mut router: Router<AppState> = Router::new();
@@ -324,8 +334,11 @@ pub fn create_router_with_state(
             );
     }
 
-    // Health check (unauthenticated, always enabled)
-    router = router.route("/health", get(health_handler));
+    // Health checks (unauthenticated, always enabled)
+    router = router
+        .route("/health", get(health_handler))
+        .route("/health/live", get(health_handler))
+        .route("/health/ready", get(health_ready_handler));
 
     // Tools API
     router = router.route("/tools/invoke", post(tools_invoke_handler));
@@ -488,6 +501,41 @@ async fn health_handler(State(state): State<AppState>) -> Response {
         StatusCode::OK,
         Json(json!({
             "status": "ok",
+            "version": env!("CARGO_PKG_VERSION"),
+            "uptimeSeconds": uptime,
+        })),
+    )
+        .into_response()
+}
+
+/// GET /health/ready - Readiness probe.
+///
+/// Checks that storage is writable and (if configured) LLM is reachable.
+/// Returns 200 if ready, 503 if not.
+async fn health_ready_handler(State(state): State<AppState>) -> Response {
+    let uptime = chrono::Utc::now().timestamp() - state.start_time;
+    let has_llm = state
+        .ws_state
+        .as_ref()
+        .map(|ws| ws.llm_provider().is_some())
+        .unwrap_or(false);
+
+    let ready = state
+        .health_checker
+        .as_ref()
+        .map(|hc| hc.is_ready(has_llm))
+        .unwrap_or(true);
+
+    let status_code = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (
+        status_code,
+        Json(json!({
+            "status": if ready { "ready" } else { "not_ready" },
             "version": env!("CARGO_PKG_VERSION"),
             "uptimeSeconds": uptime,
         })),
@@ -685,7 +733,7 @@ async fn hooks_agent_handler(
     }
 
     // Spawn agent executor if LLM provider is configured
-    if let Some(provider) = ws.llm_provider().cloned() {
+    if let Some(provider) = ws.llm_provider() {
         let config = crate::agent::AgentConfig {
             model: validated
                 .model

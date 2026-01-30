@@ -446,8 +446,8 @@ pub struct WsServerState {
     pub agent_run_registry: Mutex<handlers::AgentRunRegistry>,
     /// System event history (enqueued via system-event method)
     system_event_history: Mutex<Vec<SystemEvent>>,
-    /// LLM provider for agent execution
-    llm_provider: Option<Arc<dyn agent::LlmProvider>>,
+    /// LLM provider for agent execution (hot-swappable via RwLock)
+    llm_provider: parking_lot::RwLock<Option<Arc<dyn agent::LlmProvider>>>,
     /// Tools registry for agent tool dispatch
     tools_registry: Option<Arc<plugins::ToolsRegistry>>,
     /// Plugin registry for channel/tool/webhook plugins
@@ -461,7 +461,10 @@ impl std::fmt::Debug for WsServerState {
         f.debug_struct("WsServerState")
             .field("config", &self.config)
             .field("start_time", &self.start_time)
-            .field("llm_provider", &self.llm_provider.as_ref().map(|_| ".."))
+            .field(
+                "llm_provider",
+                &self.llm_provider.read().as_ref().map(|_| ".."),
+            )
             .field(
                 "tools_registry",
                 &self.tools_registry.as_ref().map(|_| ".."),
@@ -507,7 +510,7 @@ impl WsServerState {
             cron_scheduler: cron::CronScheduler::in_memory(),
             agent_run_registry: Mutex::new(handlers::AgentRunRegistry::new()),
             system_event_history: Mutex::new(Vec::new()),
-            llm_provider: None,
+            llm_provider: parking_lot::RwLock::new(None),
             tools_registry: None,
             plugin_registry: None,
             connection_tracker,
@@ -551,7 +554,7 @@ impl WsServerState {
             cron_scheduler: cron::CronScheduler::new(state_dir.join("cron"), true),
             agent_run_registry: Mutex::new(handlers::AgentRunRegistry::new()),
             system_event_history: Mutex::new(Vec::new()),
-            llm_provider: None,
+            llm_provider: parking_lot::RwLock::new(None),
             tools_registry: None,
             plugin_registry: None,
             connection_tracker,
@@ -574,8 +577,8 @@ impl WsServerState {
         self
     }
 
-    pub fn with_llm_provider(mut self, provider: Arc<dyn agent::LlmProvider>) -> Self {
-        self.llm_provider = Some(provider);
+    pub fn with_llm_provider(self, provider: Arc<dyn agent::LlmProvider>) -> Self {
+        *self.llm_provider.write() = Some(provider);
         self
     }
 
@@ -605,8 +608,13 @@ impl WsServerState {
     }
 
     /// Get the LLM provider, if configured.
-    pub fn llm_provider(&self) -> Option<&Arc<dyn agent::LlmProvider>> {
-        self.llm_provider.as_ref()
+    pub fn llm_provider(&self) -> Option<Arc<dyn agent::LlmProvider>> {
+        self.llm_provider.read().clone()
+    }
+
+    /// Hot-swap the LLM provider at runtime (e.g. on config reload).
+    pub fn set_llm_provider(&self, provider: Option<Arc<dyn agent::LlmProvider>>) {
+        *self.llm_provider.write() = provider;
     }
 
     /// Get the plugin registry, if configured.

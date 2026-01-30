@@ -10,6 +10,7 @@ pub mod channel_tools;
 pub mod context;
 pub mod executor;
 pub mod exfiltration;
+pub mod factory;
 pub mod gemini;
 pub mod ollama;
 pub mod openai;

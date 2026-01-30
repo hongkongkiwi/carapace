@@ -144,11 +144,13 @@ pub fn spawn_background_tasks(
         config_watcher.start(config_path, shutdown_rx.clone());
     }
 
-    // Bridge config watcher events to WS broadcasts
+    // Bridge config watcher events to WS broadcasts + provider hot-swap
     {
         let mut config_rx = config_watcher.subscribe();
         let ws_state_for_config = ws_state.clone();
         let mut config_shutdown_rx = shutdown_rx.clone();
+        // Track current provider fingerprint for change detection
+        let mut current_fingerprint = crate::agent::factory::fingerprint_providers(raw_config);
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -159,6 +161,34 @@ pub fn spawn_background_tasks(
                                     &ws_state_for_config,
                                     &result.mode,
                                 );
+                                // Hot-swap LLM providers if config changed
+                                if let Ok(new_cfg) = config::load_config() {
+                                    let new_fingerprint =
+                                        crate::agent::factory::fingerprint_providers(&new_cfg);
+                                    if new_fingerprint != current_fingerprint {
+                                        info!("LLM provider configuration changed, rebuilding providers");
+                                        match crate::agent::factory::build_providers(&new_cfg) {
+                                            Ok(Some(mp)) => {
+                                                ws_state_for_config
+                                                    .set_llm_provider(Some(std::sync::Arc::new(mp)));
+                                                info!("LLM providers hot-swapped successfully");
+                                            }
+                                            Ok(None) => {
+                                                ws_state_for_config.set_llm_provider(None);
+                                                info!("LLM providers removed (none configured)");
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    "Failed to rebuild LLM providers: {} (keeping previous)",
+                                                    e
+                                                );
+                                                // Don't update fingerprint on failure
+                                                continue;
+                                            }
+                                        }
+                                        current_fingerprint = new_fingerprint;
+                                    }
+                                }
                             }
                             Ok(config::watcher::ConfigEvent::ReloadFailed(_)) => {}
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {

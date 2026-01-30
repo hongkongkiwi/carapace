@@ -1581,7 +1581,7 @@ pub(super) fn handle_agent(
     }
 
     // Spawn the agent executor if an LLM provider is configured
-    let status = if let Some(provider) = state.llm_provider().cloned() {
+    let status = if let Some(provider) = state.llm_provider() {
         let model = params
             .and_then(|v| v.get("model"))
             .and_then(|v| v.as_str())
@@ -2024,7 +2024,7 @@ pub(super) fn handle_chat_send(
         }
 
         // Spawn the agent executor if an LLM provider is configured
-        let status = if let Some(provider) = state.llm_provider().cloned() {
+        let status = if let Some(provider) = state.llm_provider() {
             let config = crate::agent::AgentConfig {
                 model: crate::agent::DEFAULT_MODEL.to_string(),
                 deliver: true,
