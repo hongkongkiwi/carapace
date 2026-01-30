@@ -16,16 +16,6 @@ openclaw / moltbot / clawdbot.
 - [Configuration](protocol/config.md) — Config file format, environment variables
 - [Credentials](protocol/credentials.md) — Secret storage and migration
 
-## Historical (Migration Reference)
-
-These documents were used during the Node.js → Rust migration, which is now
-complete. Retained for historical context.
-
-- [Migration Plan](refactor/rust-migration.md) — Migration strategy overview
-- [Implementation Plan](refactor/implementation-plan.md) — Phased implementation details
-- [Compatibility Checklist](refactor/compatibility-checklist.md) — Node gateway parity tracking
-- [Critical Path](refactor/critical-path.md) — Agent, channel delivery, cron subsystem designs
-
 ## Quick Links
 
 | Topic | File | Description |
