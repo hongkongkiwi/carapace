@@ -504,6 +504,8 @@ pub struct SessionStore {
     compact_threshold: usize,
     /// Optional HMAC key for session integrity verification.
     hmac_key: Option<[u8; 32]>,
+    /// Action to take when integrity verification fails.
+    integrity_action: super::integrity::IntegrityAction,
 }
 
 impl Default for SessionStore {
@@ -529,6 +531,7 @@ impl SessionStore {
             key_to_id: RwLock::new(HashMap::new()),
             compact_threshold: DEFAULT_COMPACT_THRESHOLD,
             hmac_key: None,
+            integrity_action: super::integrity::IntegrityAction::Warn,
         }
     }
 
@@ -541,6 +544,12 @@ impl SessionStore {
     /// Set the HMAC key for session integrity verification.
     pub fn with_hmac_key(mut self, key: [u8; 32]) -> Self {
         self.hmac_key = Some(key);
+        self
+    }
+
+    /// Set the action to take when integrity verification fails.
+    pub fn with_integrity_action(mut self, action: super::integrity::IntegrityAction) -> Self {
+        self.integrity_action = action;
         self
     }
 
@@ -1536,7 +1545,7 @@ impl SessionStore {
         if let Some(ref key) = self.hmac_key {
             let integrity_config = super::integrity::IntegrityConfig {
                 enabled: true,
-                action: super::integrity::IntegrityAction::Warn,
+                action: self.integrity_action,
             };
             match super::integrity::verify_hmac_file(key, &meta_path, &integrity_config) {
                 Ok(()) => {}

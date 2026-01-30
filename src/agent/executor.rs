@@ -454,21 +454,8 @@ async fn execute_single_turn(
     *total_output_tokens += turn_usage.output_tokens;
     record_turn_usage(session_key, &config.model, &turn_usage);
 
-    // Append assistant message to history
-    if let Some(msg) = build_assistant_message(
-        session_id,
-        &turn_text,
-        &pending_tool_calls,
-        turn_usage.output_tokens,
-    ) {
-        state
-            .session_store()
-            .append_message(msg.clone())
-            .map_err(|e| AgentError::SessionStore(e.to_string()))?;
-        history.push(msg);
-    }
-
-    // Post-flight filtering
+    // Post-flight filtering — MUST run before persistence to avoid storing
+    // unfiltered PII/credentials in session history.
     let turn_text = if config.prompt_guard.enabled && config.prompt_guard.postflight.enabled {
         let postflight_result =
             postflight::filter_output(&turn_text, &config.prompt_guard.postflight);
@@ -494,6 +481,20 @@ async fn execute_single_turn(
     } else {
         turn_text
     };
+
+    // Append assistant message to history (after post-flight filtering)
+    if let Some(msg) = build_assistant_message(
+        session_id,
+        &turn_text,
+        &pending_tool_calls,
+        turn_usage.output_tokens,
+    ) {
+        state
+            .session_store()
+            .append_message(msg.clone())
+            .map_err(|e| AgentError::SessionStore(e.to_string()))?;
+        history.push(msg);
+    }
 
     accumulated_text.push_str(&turn_text);
     *final_stop_reason = stop_reason;

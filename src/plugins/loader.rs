@@ -609,11 +609,21 @@ pub struct PluginLoader {
     plugins: RwLock<HashMap<String, Arc<LoadedPlugin>>>,
     /// Plugins directory
     plugins_dir: PathBuf,
+    /// Signature verification configuration
+    signature_config: super::signature::SignatureConfig,
 }
 
 impl PluginLoader {
     /// Create a new plugin loader
     pub fn new(plugins_dir: PathBuf) -> Result<Self, LoaderError> {
+        Self::with_signature_config(plugins_dir, super::signature::SignatureConfig::default())
+    }
+
+    /// Create a new plugin loader with explicit signature config
+    pub fn with_signature_config(
+        plugins_dir: PathBuf,
+        signature_config: super::signature::SignatureConfig,
+    ) -> Result<Self, LoaderError> {
         // Configure wasmtime engine
         let mut config = Config::new();
         config.wasm_component_model(true);
@@ -625,6 +635,7 @@ impl PluginLoader {
             engine,
             plugins: RwLock::new(HashMap::new()),
             plugins_dir,
+            signature_config,
         })
     }
 
@@ -700,12 +711,11 @@ impl PluginLoader {
         // Verify Ed25519 signature against the skills manifest (if present)
         if let Some(parent_dir) = wasm_path.parent() {
             if let Some(stem) = wasm_path.file_stem().and_then(|s| s.to_str()) {
-                let sig_config = super::signature::SignatureConfig::default();
                 super::signature::verify_skill_signature(
                     stem,
                     &wasm_bytes,
                     parent_dir,
-                    &sig_config,
+                    &self.signature_config,
                 )?;
             }
         }

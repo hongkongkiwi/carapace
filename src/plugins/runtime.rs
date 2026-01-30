@@ -509,6 +509,12 @@ pub enum RuntimeError {
 
     #[error("WASM fuel exhausted (budget: {budget} instructions)")]
     FuelExhausted { budget: u64 },
+
+    #[error("Plugin '{plugin_id}' denied capabilities: {capabilities:?}")]
+    CapabilityDenied {
+        plugin_id: String,
+        capabilities: Vec<String>,
+    },
 }
 
 /// State held in each plugin's wasmtime store
@@ -540,6 +546,9 @@ pub struct PluginRuntime<B: CredentialBackend + 'static> {
 
     /// SSRF configuration
     ssrf_config: SsrfConfig,
+
+    /// Sandbox configuration for capability enforcement
+    sandbox_config: super::sandbox::SandboxConfig,
 
     /// Loaded plugin instances by ID
     instances: RwLock<HashMap<String, Arc<PluginInstanceHandle<B>>>>,
@@ -723,6 +732,23 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
         rate_limiters: Arc<RateLimiterRegistry>,
         ssrf_config: SsrfConfig,
     ) -> Result<Self, RuntimeError> {
+        Self::with_full_config(
+            loader,
+            credential_store,
+            rate_limiters,
+            ssrf_config,
+            super::sandbox::SandboxConfig::default(),
+        )
+    }
+
+    /// Create a new plugin runtime with all configuration including sandbox policy
+    pub fn with_full_config(
+        loader: Arc<PluginLoader>,
+        credential_store: Arc<CredentialStore<B>>,
+        rate_limiters: Arc<RateLimiterRegistry>,
+        ssrf_config: SsrfConfig,
+        sandbox_config: super::sandbox::SandboxConfig,
+    ) -> Result<Self, RuntimeError> {
         // Configure wasmtime engine
         let mut config = Config::new();
         config.wasm_component_model(true);
@@ -739,6 +765,7 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
             credential_store,
             rate_limiters,
             ssrf_config,
+            sandbox_config,
             instances: RwLock::new(HashMap::new()),
             registry: Arc::new(PluginRegistry::new()),
         })
@@ -777,26 +804,27 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
             .get_plugin(plugin_id)
             .ok_or_else(|| RuntimeError::PluginNotFound(plugin_id.to_string()))?;
 
-        // Check capabilities against sandbox policy
+        // Check capabilities against sandbox policy — block if denied
         if let Some(ref discovered) = loaded.discovered_capabilities {
-            let sandbox_config = super::sandbox::SandboxConfig::default();
             if let Err(denied) =
-                super::sandbox::check_capabilities(plugin_id, discovered, &sandbox_config)
+                super::sandbox::check_capabilities(plugin_id, discovered, &self.sandbox_config)
             {
                 let denied_names: Vec<String> = denied.iter().map(|c| c.to_string()).collect();
                 tracing::warn!(
                     plugin_id = %plugin_id,
                     denied = ?denied_names,
-                    "plugin capabilities denied by sandbox policy"
+                    "plugin capabilities denied by sandbox policy — blocking instantiation"
                 );
                 crate::logging::audit::audit(
                     crate::logging::audit::AuditEvent::SkillCapabilityDenied {
                         skill_id: plugin_id.to_string(),
-                        capabilities: denied_names,
+                        capabilities: denied_names.clone(),
                     },
                 );
-                // Default sandbox config denies but doesn't block — only block if explicitly configured
-                // For now, we log and continue (deny-and-warn behavior)
+                return Err(RuntimeError::CapabilityDenied {
+                    plugin_id: plugin_id.to_string(),
+                    capabilities: denied_names,
+                });
             }
         }
 

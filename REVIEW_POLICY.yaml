@@ -98,6 +98,37 @@ review_types:
       frequency: "every_pr"
       severity: "critical"
 
+    crypto:
+      description: "Key derivation, signature verification, HMAC usage, encryption correctness, timing safety"
+      enabled: true
+      frequency: "every_pr"
+      severity: "critical"
+      only_if:
+        - "has_crypto"
+      change_triggers:
+        - "**/integrity*"
+        - "**/signature*"
+        - "**/secrets*"
+        - "**/encrypt*"
+        - "**/crypto*"
+        - "**/hmac*"
+        - "**/auth/profiles*"
+
+    plugin_security:
+      description: "WASM sandbox enforcement, capability policy, signature trust, supply chain"
+      enabled: true
+      frequency: "every_pr"
+      severity: "critical"
+      only_if:
+        - "has_wasm_plugins"
+      change_triggers:
+        - "src/plugins/**"
+        - "**/sandbox*"
+        - "**/signature*"
+        - "**/loader*"
+        - "**/runtime*"
+        - "**/skills*"
+
     dependencies:
       description: "CVEs in dependencies, supply chain risks, outdated packages"
       enabled: true
@@ -116,14 +147,14 @@ review_types:
       only_if:
         - "has_api"
       change_triggers:
-        - "src/api/**"
-        - "src/http/**"
-        - "src/ws/**"
+        - "src/server/http.rs"
+        - "src/server/ws/**"
+        - "src/server/openai/**"
+        - "src/server/control/**"
+        - "src/hooks/**"
         - "**/routes.*"
         - "**/router.*"
-        - "**/endpoints/**"
         - "openapi.*"
-        - "swagger.*"
 
     abstractions:
       description: "Coupling, cohesion, separation of concerns, DRY violations, layering"
@@ -147,6 +178,7 @@ review_types:
       severity: "high"
       only_if:
         - "has_database"
+        - "has_file_store"
       change_triggers:
         - "**/migrations/**"
         - "**/models/**"
@@ -154,6 +186,7 @@ review_types:
         - "**/entities/**"
         - "**/session*"
         - "**/store*"
+        - "**/integrity*"
         - "db/**"
 
     data_flow:
@@ -163,6 +196,7 @@ review_types:
       severity: "high"
       only_if:
         - "has_database"
+        - "has_file_store"
         - "has_api"
         - "handles_pii"
 
@@ -289,10 +323,13 @@ review_types:
 # ============================================================================
 project_flags:
   - "has_api"
-  - "has_database"
+  - "has_file_store"       # File-based session/config storage (not a traditional DB)
   - "public_api"
   - "handles_pii"
+  - "has_wasm_plugins"     # WASM plugin system with signature verification and capability sandbox
+  - "has_crypto"           # HMAC-SHA256, Ed25519 signatures, AES-GCM encryption
   # Uncomment flags that apply to this project:
+  # - "has_database"       # Traditional SQL/NoSQL database
   # - "prototype"
   # - "small_scale"
   # - "internal_only"

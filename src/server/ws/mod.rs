@@ -889,9 +889,56 @@ pub enum WsConfigError {
 }
 
 pub async fn build_ws_state_from_config() -> Result<Arc<WsServerState>, WsConfigError> {
+    let cfg = config::load_config()?;
     let config = build_ws_config_from_files().await?;
     let state_dir = resolve_state_dir();
-    Ok(Arc::new(WsServerState::new_persistent(config, state_dir)?))
+    let mut state = WsServerState::new_persistent(config, state_dir)?;
+
+    // Wire session integrity HMAC key from config
+    let sessions_cfg = cfg.get("sessions").and_then(|s| s.get("integrity"));
+    let integrity_enabled = sessions_cfg
+        .and_then(|i| i.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if integrity_enabled {
+        // Derive HMAC key from the gateway auth token (server secret)
+        let server_secret = std::env::var("MOLTBOT_GATEWAY_TOKEN")
+            .or_else(|_| std::env::var("MOLTBOT_SERVER_SECRET"))
+            .unwrap_or_default();
+
+        if !server_secret.is_empty() {
+            let hmac_key = crate::sessions::integrity::derive_hmac_key(server_secret.as_bytes());
+
+            let integrity_action = sessions_cfg
+                .and_then(|i| i.get("action"))
+                .and_then(|v| v.as_str())
+                .map(|s| match s {
+                    "reject" => crate::sessions::integrity::IntegrityAction::Reject,
+                    _ => crate::sessions::integrity::IntegrityAction::Warn,
+                })
+                .unwrap_or(crate::sessions::integrity::IntegrityAction::Warn);
+
+            let session_store = sessions::SessionStore::with_base_path(
+                state.session_store.base_path().to_path_buf(),
+            )
+            .with_hmac_key(hmac_key)
+            .with_integrity_action(integrity_action);
+            state.session_store = Arc::new(session_store);
+
+            tracing::info!(
+                action = ?integrity_action,
+                "session integrity verification enabled"
+            );
+        } else {
+            tracing::warn!(
+                "sessions.integrity.enabled is true but no server secret found \
+                 (set MOLTBOT_GATEWAY_TOKEN or MOLTBOT_SERVER_SECRET)"
+            );
+        }
+    }
+
+    Ok(Arc::new(state))
 }
 
 pub async fn build_ws_config_from_files() -> Result<WsServerConfig, WsConfigError> {
