@@ -4,6 +4,7 @@
 //! and caching. Matches moltbot's format for drop-in compatibility.
 
 pub mod defaults;
+pub mod schema;
 pub mod secrets;
 pub mod watcher;
 
@@ -428,92 +429,18 @@ pub struct ValidationIssue {
     pub message: String,
 }
 
-/// Validate a config value against basic structural expectations.
-/// Returns a list of validation issues (empty if valid).
+/// Validate a config value against the schema.
+///
+/// Delegates to the typed schema validation in [`schema::validate_schema`]
+/// and converts results to the legacy [`ValidationIssue`] type.
 pub fn validate_config(config: &Value) -> Vec<ValidationIssue> {
-    let mut issues = Vec::new();
-
-    if let Value::Object(obj) = config {
-        // Check for unknown top-level keys
-        let known_keys = [
-            "meta",
-            "env",
-            "wizard",
-            "diagnostics",
-            "logging",
-            "update",
-            "browser",
-            "ui",
-            "auth",
-            "models",
-            "nodeHost",
-            "agents",
-            "tools",
-            "bindings",
-            "broadcast",
-            "audio",
-            "media",
-            "messages",
-            "commands",
-            "approvals",
-            "session",
-            "cron",
-            "hooks",
-            "web",
-            "channels",
-            "discovery",
-            "canvasHost",
-            "talk",
-            "gateway",
-            "skills",
-            "plugins",
-            "anthropic",
-            "sessions",
-            "openai",
-            "google",
-            "providers",
-        ];
-
-        for key in obj.keys() {
-            if !known_keys.contains(&key.as_str()) {
-                issues.push(ValidationIssue {
-                    path: format!(".{}", key),
-                    message: format!("Unknown configuration key: {}", key),
-                });
-            }
-        }
-
-        // Validate gateway section if present
-        if let Some(Value::Object(gateway)) = obj.get("gateway") {
-            if let Some(port) = gateway.get("port") {
-                if !port.is_number() {
-                    issues.push(ValidationIssue {
-                        path: ".gateway.port".to_string(),
-                        message: "port must be a number".to_string(),
-                    });
-                }
-            }
-        }
-
-        // Validate hooks section if present
-        if let Some(Value::Object(hooks)) = obj.get("hooks") {
-            if let Some(max_bytes) = hooks.get("maxBodyBytes") {
-                if !max_bytes.is_number() {
-                    issues.push(ValidationIssue {
-                        path: ".hooks.maxBodyBytes".to_string(),
-                        message: "maxBodyBytes must be a number".to_string(),
-                    });
-                }
-            }
-        }
-    } else if !config.is_object() {
-        issues.push(ValidationIssue {
-            path: ".".to_string(),
-            message: "Config root must be an object".to_string(),
-        });
-    }
-
-    issues
+    schema::validate_schema(config)
+        .into_iter()
+        .map(|si| ValidationIssue {
+            path: si.path,
+            message: si.message,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -800,7 +727,9 @@ mod tests {
         let issues = validate_config(&config);
 
         assert_eq!(issues.len(), 1);
-        assert!(issues[0].message.contains("port must be a number"));
+        assert!(issues[0]
+            .message
+            .contains("port must be a positive integer"));
     }
 
     #[test]

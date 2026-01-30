@@ -106,6 +106,26 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         Value::Object(serde_json::Map::new())
     });
 
+    // 2b. Schema validation — fail fast on errors, log warnings
+    {
+        let schema_issues = config::schema::validate_schema(&cfg);
+        let mut has_errors = false;
+        for issue in &schema_issues {
+            match issue.severity {
+                config::schema::Severity::Error => {
+                    error!("Config error at {}: {}", issue.path, issue.message);
+                    has_errors = true;
+                }
+                config::schema::Severity::Warning => {
+                    warn!("Config warning at {}: {}", issue.path, issue.message);
+                }
+            }
+        }
+        if has_errors {
+            return Err("Configuration contains errors — aborting startup".into());
+        }
+    }
+
     // 3. Ensure state directories exist
     let state_dir = server::ws::resolve_state_dir();
     std::fs::create_dir_all(&state_dir)?;
