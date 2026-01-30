@@ -18,6 +18,7 @@ use std::sync::Arc;
 use crate::auth;
 use crate::channels::{ChannelInfo, ChannelRegistry, ChannelStatus};
 use crate::config;
+use crate::security::{describe_config_change, is_sensitive_path, redact_config_for_response};
 use crate::server::ws::{map_validation_issues, persist_config_file, read_config_snapshot};
 
 /// Control endpoint state
@@ -348,13 +349,24 @@ pub async fn config_handler(
     // Re-read to get the new hash
     let new_snapshot = read_config_snapshot();
 
+    // Redact sensitive fields from the response
+    let redacted_config = redact_config_for_response(&new_snapshot.config);
+
+    // Log the change safely (without exposing secrets)
+    let change_description = describe_config_change(&req.path, &req.value);
+    if is_sensitive_path(&req.path) {
+        tracing::info!("Config update: {} (sensitive field)", change_description);
+    } else {
+        tracing::info!("Config update: {}", change_description);
+    }
+
     let response = ConfigUpdateResponse {
         ok: true,
         error: None,
         applied: Some(json!({
             "path": req.path,
-            "value": req.value,
-            "config": new_snapshot.config,
+            "value": if is_sensitive_path(&req.path) { json!("***REDACTED***") } else { req.value },
+            "config": redacted_config,
         })),
         hash: new_snapshot.hash,
     };

@@ -21,8 +21,16 @@ pub mod webhook;
 pub mod webchat;
 pub mod zalo;
 
-pub use config::*;
-pub use line::*;
+// Re-export key types from config module
+pub use config::ChannelConfig;
+pub use config::ChannelType;
+pub use config::ConfigError;
+pub use config::ConfigValidator;
+pub use config::ConfigResult;
+pub use config::ChannelSchema;
+
+// Re-export LineChannel (but not LineConfig to avoid conflict with config::LineConfig)
+pub use line::LineChannel;
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};

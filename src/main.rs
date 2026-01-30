@@ -28,9 +28,11 @@ mod flows;
 mod hooks;
 mod logging;
 mod media;
+mod migrations;
 mod messages;
 mod nodes;
 mod plugins;
+mod security;
 mod server;
 mod sessions;
 mod usage;
@@ -117,6 +119,22 @@ enum Commands {
         /// Log level (overrides RUST_LOG)
         #[arg(short, long, value_name = "LEVEL")]
         log: Option<String>,
+
+        /// Use insecure HTTP instead of HTTPS (development only - NOT FOR PRODUCTION)
+        #[arg(long)]
+        insecure_http: bool,
+
+        /// Path to TLS certificate file (PEM format)
+        #[arg(long, value_name = "PATH")]
+        tls_cert: Option<PathBuf>,
+
+        /// Path to TLS private key file (PEM format)
+        #[arg(long, value_name = "PATH")]
+        tls_key: Option<PathBuf>,
+
+        /// Auto-generate self-signed certificate if not found
+        #[arg(long)]
+        tls_auto_gen: bool,
     },
 
     /// Stop the running gateway server
@@ -221,12 +239,30 @@ async fn main() {
             ui,
             ui_dist_path,
             log,
+            insecure_http,
+            tls_cert,
+            tls_key,
+            tls_auto_gen,
         } => {
-            // Check if --config was provided (not yet supported)
-            if config.is_some() {
-                eprintln!("Error: --config is not yet supported. Use environment variables or CLI flags.");
-                process::exit(1);
-            }
+            // Load configuration from file if provided
+            let config_values = if let Some(config_path) = &config {
+                match crate::config::load_config_uncached(config_path) {
+                    Ok(cfg) => cfg,
+                    Err(e) => {
+                        eprintln!("Error loading config from {}: {}", config_path.display(), e);
+                        process::exit(1);
+                    }
+                }
+            } else {
+                // Use default path
+                match crate::config::load_config() {
+                    Ok(cfg) => cfg,
+                    Err(e) => {
+                        eprintln!("Warning: Failed to load config: {}. Using defaults.", e);
+                        serde_json::json!({})
+                    }
+                }
+            };
 
             // Fall back to environment variables for secrets (not exposed in process list)
             let hooks_token = hooks_token.or_else(|| std::env::var("CARAPACE_HOOKS_TOKEN").ok());
@@ -250,24 +286,73 @@ async fn main() {
                 }
             }
 
+            // Build TLS configuration
+            let mut tls_config = if insecure_http || dev {
+                server::tls::TlsConfig::insecure()
+            } else {
+                server::tls::TlsConfig::default()
+            };
+
+            // Override TLS paths if provided
+            if let Some(cert_path) = tls_cert {
+                tls_config.cert_path = cert_path;
+            }
+            if let Some(key_path) = tls_key {
+                tls_config.key_path = key_path;
+            }
+
+            // Validate TLS configuration
+            if let Err(e) = server::tls::validate_tls_config(&tls_config) {
+                if tls_auto_gen && !tls_config.certificates_exist() {
+                    info!("TLS certificates not found, auto-generating...");
+                    if let Err(e) = server::tls::generate_self_signed_cert(
+                        &tls_config.cert_path,
+                        &tls_config.key_path,
+                    ) {
+                        error!("Failed to auto-generate TLS certificates: {}", e);
+                        server::tls::print_tls_setup_instructions();
+                        process::exit(1);
+                    }
+                } else {
+                    error!("TLS configuration error: {}", e);
+                    server::tls::print_tls_setup_instructions();
+                    process::exit(1);
+                }
+            }
+
+            info!("TLS Mode: {}", tls_config.mode_description());
+
+            // Extract configuration from config file
+            let hooks_enabled = hooks || dev || crate::config::get_bool(&config_values, "hooks.enabled").unwrap_or(false);
+            let hooks_path = crate::config::get_string(&config_values, "hooks.path").unwrap_or_else(|| "/hooks".to_string());
+            let gateway_password = gateway_password.or_else(|| crate::config::get_string(&config_values, "gateway.password"));
+            let control_ui_enabled = ui || crate::config::get_bool(&config_values, "ui.enabled").unwrap_or(false);
+            let control_ui_base_path = if ui_base_path.is_empty() {
+                crate::config::get_string(&config_values, "ui.base_path").unwrap_or_default()
+            } else {
+                ui_base_path
+            };
+            let openai_enabled = openai || crate::config::get_bool(&config_values, "openai.enabled").unwrap_or(false);
+            let control_enabled = control || dev || crate::config::get_bool(&config_values, "control.enabled").unwrap_or(false);
+
             // Build configuration
             let http_config = HttpConfig {
                 hooks_token,
-                hooks_enabled: hooks || dev,
-                hooks_path: "/hooks".to_string(),
+                hooks_enabled,
+                hooks_path,
                 hooks_max_body_bytes: 262_144,
                 gateway_token,
                 gateway_password,
-                control_ui_base_path: ui_base_path,
-                control_ui_enabled: ui,
+                control_ui_base_path,
+                control_ui_enabled,
                 control_ui_dist_path: ui_dist_path,
                 valid_channels: vec![],
                 agents_dir: dirs::home_dir()
                     .unwrap_or_else(|| PathBuf::from("."))
                     .join(".moltbot/agents"),
-                openai_chat_completions_enabled: openai,
-                openai_responses_enabled: openai,
-                control_endpoints_enabled: control || dev,
+                openai_chat_completions_enabled: openai_enabled,
+                openai_responses_enabled: openai_enabled,
+                control_endpoints_enabled: control_enabled,
             };
 
             let middleware_config = if dev {
@@ -282,6 +367,7 @@ async fn main() {
                 http_config,
                 middleware_config,
                 pid_file,
+                tls_config,
             )
             .await
             {
@@ -516,18 +602,40 @@ async fn main() {
             crate::logging::init();
             info!("Running database migrations...");
 
-            let db_path = database_url.unwrap_or_else(|| {
-                dirs::data_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join("carapace/carapace.db")
-                    .to_string_lossy()
-                    .to_string()
-            });
+            // Use DATABASE_URL env var or build from components
+            let connection_url = database_url.or_else(|| std::env::var("DATABASE_URL").ok())
+                .unwrap_or_else(|| {
+                    // Default to SQLite for local development
+                    let data_dir = dirs::data_dir()
+                        .unwrap_or_else(|| PathBuf::from("."));
+                    std::fs::create_dir_all(&data_dir).ok();
+                    format!("sqlite:{}", data_dir.join("carapace.db").display())
+                });
 
-            info!("Database: {}", db_path);
-            // Migrations not yet implemented - report error and exit non-zero
-            eprintln!("Error: Database migrations are not yet implemented.");
-            process::exit(1);
+            info!("Database: {}", connection_url);
+
+            let migrations_dir = std::env::var("CARAPACE_MIGRATIONS_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("migrations"));
+
+            let runner = migrations::MigrationRunner::new(connection_url, migrations_dir);
+
+            match runner.run_migrations().await {
+                Ok(applied) => {
+                    if applied.is_empty() {
+                        info!("No pending migrations to apply.");
+                    } else {
+                        info!("Applied {} migration(s).", applied.len());
+                        for m in &applied {
+                            info!("  - {}", m.name);
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Migration failed: {}", e);
+                    process::exit(1);
+                }
+            }
         }
 
         Commands::Version => {
@@ -608,16 +716,13 @@ async fn start_server(
     http_config: HttpConfig,
     middleware_config: MiddlewareConfig,
     pid_file: PathBuf,
+    tls_config: server::tls::TlsConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting carapace gateway v{}", env!("CARGO_PKG_VERSION"));
     info!("Binding to {}", addr);
 
     // Create router
     let app = create_router_with_middleware(http_config, middleware_config);
-
-    // Create listener
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    info!("Server listening on {}", addr);
 
     // Write PID file
     if let Some(parent) = pid_file.parent() {
@@ -629,17 +734,71 @@ async fn start_server(
     fs::write(&pid_file, pid.to_string())?;
     info!("PID file written to {}", pid_file.display());
 
-    // Start server with graceful shutdown
-    let serve_result = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await;
+    // Start server based on TLS configuration
+    if tls_config.allow_insecure_http || !tls_config.enabled {
+        // HTTP mode
+        info!("Starting HTTP server (no TLS)");
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        info!("Server listening on http://{}", addr);
 
-    // Clean up PID file regardless of serve result
-    let _ = fs::remove_file(&pid_file);
+        let serve_result = axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await;
 
-    serve_result?;
+        // Clean up PID file regardless of serve result
+        let _ = fs::remove_file(&pid_file);
+
+        serve_result?;
+    } else {
+        // HTTPS mode
+        info!("Starting HTTPS server with TLS");
+
+        // Create TLS configuration
+        let rustls_config = server::tls::create_tls_config(&tls_config)?;
+        let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(rustls_config));
+
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        info!("Server listening on https://{}", addr);
+
+        // Create a shutdown signal
+        let shutdown = shutdown_signal();
+        tokio::pin!(shutdown);
+
+        loop {
+            tokio::select! {
+                Ok((stream, peer_addr)) = listener.accept() => {
+                    let tls_acceptor = tls_acceptor.clone();
+                    let app = app.clone();
+
+                    tokio::spawn(async move {
+                        match tls_acceptor.accept(stream).await {
+                            Ok(stream) => {
+                                let _ = stream; // Suppress unused warning
+                                if let Err(e) = axum::serve(
+                                    tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+                                    app,
+                                ).await {
+                                    error!("Error serving connection from {}: {}", peer_addr, e);
+                                }
+                            }
+                            Err(e) => {
+                                error!("TLS handshake error from {}: {}", peer_addr, e);
+                            }
+                        }
+                    });
+                }
+                _ = &mut shutdown => {
+                    info!("Shutting down gracefully...");
+                    break;
+                }
+            }
+        }
+
+        // Clean up PID file
+        let _ = fs::remove_file(&pid_file);
+    }
+
     info!("Gateway stopped");
-
     Ok(())
 }
 

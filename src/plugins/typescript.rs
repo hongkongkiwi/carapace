@@ -2,13 +2,6 @@
 //
 // This module provides JavaScript/TypeScript plugin support by embedding QuickJS.
 // Plugins are written in JavaScript and run in an isolated context.
-//
-// Architecture:
-// 1. Load QuickJS WASM runtime
-// 2. Initialize JavaScript context
-// 3. Set up host function bindings
-// 4. Load and evaluate plugin code
-// 5. Bridge calls between JS and Rust
 
 use quickjs_wasm_sys::{JSContext, JSRuntime, JSValue};
 use std::cell::RefCell;
@@ -31,12 +24,6 @@ pub struct TsPluginConfig {
     pub allow_network: bool,
     /// Enable eval() function
     pub allow_eval: bool,
-    /// Maximum string length
-    pub max_string_length: usize,
-    /// Maximum array length
-    pub max_array_length: usize,
-    /// Maximum object depth
-    pub max_object_depth: usize,
 }
 
 impl Default for TsPluginConfig {
@@ -47,9 +34,6 @@ impl Default for TsPluginConfig {
             enable_console: true,
             allow_network: false,
             allow_eval: false,
-            max_string_length: 1_000_000,
-            max_array_length: 100_000,
-            max_object_depth: 100,
         }
     }
 }
@@ -89,10 +73,6 @@ struct HostState {
     console_enabled: bool,
     /// Log buffer for capturing console output
     log_buffer: Vec<String>,
-    /// Last error
-    last_error: Option<String>,
-    /// Callbacks for host functions
-    tool_callbacks: HashMap<String, Box<dyn Fn(String) -> Result<String, String> + 'static>>,
 }
 
 /// TypeScript plugin errors
@@ -113,17 +93,11 @@ pub enum TsPluginError {
     #[error("Memory limit exceeded")]
     MemoryLimit,
 
-    #[error("Serialization error: {0}")]
-    SerializationError(String),
-
     #[error("Plugin not found: {0}")]
     PluginNotFound(String),
 
     #[error("Tool not found: {0}")]
     ToolNotFound(String),
-
-    #[error("Invalid argument: {0}")]
-    InvalidArgument(String),
 
     #[error("IO error: {0}")]
     IoError(String),
@@ -163,23 +137,8 @@ impl TsPlugin {
         }
     }
 
-    /// Create a new JavaScript plugin with custom config
-    pub fn with_config(id: String, name: String, code: String, config: TsPluginConfig) -> Self {
-        Self {
-            id,
-            name,
-            code,
-            config,
-            runtime: None,
-            context: None,
-            initialized: false,
-            tools: Vec::new(),
-        }
-    }
-
     /// Initialize the JavaScript plugin
     pub fn init(&mut self) -> Result<(), TsPluginError> {
-        // Create QuickJS runtime
         let runtime = unsafe {
             let rt = quickjs_wasm_sys::JS_NewRuntime();
             if rt.is_null() {
@@ -189,12 +148,11 @@ impl TsPlugin {
         };
 
         // Set memory limit
-        let max_memory_bytes = self.config.max_memory_mb * 1024 * 1024;
+        let max_memory_bytes = (self.config.max_memory_mb * 1024 * 1024) as u64;
         unsafe {
-            quickjs_wasm_sys::JS_SetMemoryLimit(runtime.runtime, max_memory_bytes as i64);
+            quickjs_wasm_sys::JS_SetMemoryLimit(runtime.runtime, max_memory_bytes);
         }
 
-        // Create context
         let context = unsafe {
             let ctx = quickjs_wasm_sys::JS_NewContext(runtime.runtime);
             if ctx.is_null() {
@@ -205,181 +163,23 @@ impl TsPlugin {
                 host_state: RefCell::new(HostState {
                     console_enabled: self.config.enable_console,
                     log_buffer: Vec::new(),
-                    last_error: None,
-                    tool_callbacks: HashMap::new(),
                 }),
             }
         };
 
-        // Set up global functions
-        self.setup_globals(&context)?;
-
         // Load and evaluate plugin code
         self.evaluate_plugin_code(&context)?;
 
-        // Call the plugin's init() function if it exists
+        // Call init if exists
         self.call_init(&context)?;
 
-        // Get available tools
+        // Discover tools
         self.discover_tools(&context)?;
 
         self.runtime = Some(runtime);
         self.context = Some(context);
         self.initialized = true;
 
-        Ok(())
-    }
-
-    /// Set up global functions and objects
-    fn setup_globals(&self, context: &JsContextWrapper) -> Result<(), TsPluginError> {
-        unsafe {
-            let global = quickjs_wasm_sys::JS_GetGlobalObject(context.context);
-
-            // Setup console
-            self.setup_console(context, global)?;
-
-            // Setup carapace global object
-            self.setup_carapace_api(context, global)?;
-
-            // Setup utility functions
-            self.setup_utils(context, global)?;
-
-            quickjs_wasm_sys::JS_FreeValue(context.context, global);
-        }
-        Ok(())
-    }
-
-    /// Set up console object
-    fn setup_console(&self, context: &JsContextWrapper, global: *mut JSValue) -> Result<(), TsPluginError> {
-        if !self.config.enable_console {
-            return Ok(());
-        }
-
-        unsafe {
-            // Create console object
-            let console = quickjs_wasm_sys::JS_NewObject(context.context);
-
-            // log function
-            let log_code = CString::new(include_str!("../js/console_shim.js"))
-                .map_err(|e| TsPluginError::ExecutionError(e.to_string()))?;
-
-            let log_fn = quickjs_wasm_sys::JS_Eval(
-                context.context,
-                log_code.as_ptr(),
-                log_code.as_bytes().len() as i32,
-                CStr::from_ptr(b"<console.log>\0" as *const u8 as *const c_char).as_ptr(),
-                quickjs_wasm_sys::JS_EVAL_TYPE_GLOBAL as i32,
-            );
-
-            if quickjs_wasm_sys::JS_IsException(log_fn) == 1 {
-                let error = self.get_exception_message(context);
-                return Err(TsPluginError::ExecutionError(format!("Console setup failed: {}", error)));
-            }
-
-            quickjs_wasm_sys::JS_SetPropertyStr(
-                context.context,
-                console,
-                CStr::from_ptr(b"log\0" as *const u8 as *const c_char).as_ptr(),
-                log_fn,
-            );
-
-            // info function
-            let info_code = CString::new(
-                r#"function info(){__carapace_console_log("[INFO] "+Array.prototype.slice.call(arguments).map(String).join(" "));}"#,
-            )
-            .map_err(|e| TsPluginError::ExecutionError(e.to_string()))?;
-
-            let info_fn = quickjs_wasm_sys::JS_Eval(
-                context.context,
-                info_code.as_ptr(),
-                info_code.as_bytes().len() as i32,
-                CStr::from_ptr(b"<console.info>\0" as *const u8 as *const c_char).as_ptr(),
-                quickjs_wasm_sys::JS_EVAL_TYPE_GLOBAL as i32,
-            );
-
-            quickjs_wasm_sys::JS_SetPropertyStr(
-                context.context,
-                console,
-                CStr::from_ptr(b"info\0" as *const u8 as *const c_char).as_ptr(),
-                info_fn,
-            );
-
-            // error function
-            let error_code = CString::new(
-                r#"function error(){__carapace_console_log("[ERROR] "+Array.prototype.slice.call(arguments).map(String).join(" "));}"#,
-            )
-            .map_err(|e| TsPluginError::ExecutionError(e.to_string()))?;
-
-            let error_fn = quickjs_wasm_sys::JS_Eval(
-                context.context,
-                error_code.as_ptr(),
-                error_code.as_bytes().len() as i32,
-                CStr::from_ptr(b"<console.error>\0" as *const u8 as *const c_char).as_ptr(),
-                quickjs_wasm_sys::JS_EVAL_TYPE_GLOBAL as i32,
-            );
-
-            quickjs_wasm_sys::JS_SetPropertyStr(
-                context.context,
-                console,
-                CStr::from_ptr(b"error\0" as *const u8 as *const c_char).as_ptr(),
-                error_fn,
-            );
-
-            // Add console to global
-            quickjs_wasm_sys::JS_SetPropertyStr(
-                context.context,
-                global,
-                CStr::from_ptr(b"console\0" as *const u8 as *const c_char).as_ptr(),
-                console,
-            );
-        }
-
-        Ok(())
-    }
-
-    /// Set up carapace API object
-    fn setup_carapace_api(&self, context: &JsContextWrapper, global: *mut JSValue) -> Result<(), TsPluginError> {
-        unsafe {
-            // Create carapace object
-            let carapace = quickjs_wasm_sys::JS_NewObject(context.context);
-
-            // Set plugin ID
-            let plugin_id = CString::new(self.id.clone())
-                .map_err(|e| TsPluginError::ExecutionError(e.to_string()))?;
-            let plugin_id_val = quickjs_wasm_sys::JS_NewString(context.context, plugin_id.as_ptr());
-            quickjs_wasm_sys::JS_SetPropertyStr(
-                context.context,
-                carapace,
-                CStr::from_ptr(b"pluginId\0" as *const u8 as *const c_char).as_ptr(),
-                plugin_id_val,
-            );
-
-            // Set plugin name
-            let plugin_name = CString::new(self.name.clone())
-                .map_err(|e| TsPluginError::ExecutionError(e.to_string()))?;
-            let plugin_name_val = quickjs_wasm_sys::JS_NewString(context.context, plugin_name.as_ptr());
-            quickjs_wasm_sys::JS_SetPropertyStr(
-                context.context,
-                carapace,
-                CStr::from_ptr(b"pluginName\0" as *const u8 as *const c_char).as_ptr(),
-                plugin_name_val,
-            );
-
-            // Add carapace to global
-            quickjs_wasm_sys::JS_SetPropertyStr(
-                context.context,
-                global,
-                CStr::from_ptr(b"__carapace\0" as *const u8 as *const c_char).as_ptr(),
-                carapace,
-            );
-        }
-
-        Ok(())
-    }
-
-    /// Set up utility functions
-    fn setup_utils(&self, context: &JsContextWrapper, global: *mut JSValue) -> Result<(), TsPluginError> {
-        // This setup uses pre-built utilities to avoid eval-like patterns
         Ok(())
     }
 
@@ -394,18 +194,18 @@ impl TsPlugin {
             let result = quickjs_wasm_sys::JS_Eval(
                 context.context,
                 code_cstring.as_ptr(),
-                code_cstring.as_bytes().len() as i32,
+                code_cstring.as_bytes().len() as u64,
                 CStr::from_ptr(b"<plugin>\0" as *const u8 as *const c_char).as_ptr(),
                 quickjs_wasm_sys::JS_EVAL_TYPE_GLOBAL as i32,
             );
 
-            if quickjs_wasm_sys::JS_IsException(result) == 1 {
-                let error = self.get_exception_message(context);
-                quickjs_wasm_sys::JS_FreeValue(context.context, result);
+            if self.is_error(context, result) {
+                let error = self.get_error_message(context);
+                self.free_value(context, result);
                 return Err(TsPluginError::ExecutionError(error));
             }
 
-            quickjs_wasm_sys::JS_FreeValue(context.context, result);
+            self.free_value(context, result);
         }
 
         Ok(())
@@ -432,17 +232,16 @@ impl TsPlugin {
                     std::ptr::null_mut(),
                 );
 
-                if quickjs_wasm_sys::JS_IsException(result) == 1 {
-                    let error = self.get_exception_message(context);
-                    quickjs_wasm_sys::JS_FreeValue(context.context, result);
-                    quickjs_wasm_sys::JS_FreeValue(context.context, init_val);
-                    return Err(TsPluginError::ExecutionError(format!("Init failed: {}", error)));
+                if self.is_error(context, result) {
+                    self.free_value(context, result);
+                    self.free_value(context, init_val);
+                    return Err(TsPluginError::ExecutionError("Init failed".to_string()));
                 }
 
-                quickjs_wasm_sys::JS_FreeValue(context.context, result);
+                self.free_value(context, result);
             }
 
-            quickjs_wasm_sys::JS_FreeValue(context.context, init_val);
+            self.free_value(context, init_val);
         }
 
         Ok(())
@@ -469,33 +268,26 @@ impl TsPlugin {
                     std::ptr::null_mut(),
                 );
 
-                if quickjs_wasm_sys::JS_IsException(result) == 1 {
-                    let error = self.get_exception_message(context);
-                    quickjs_wasm_sys::JS_FreeValue(context.context, result);
-                    quickjs_wasm_sys::JS_FreeValue(context.context, get_info_val);
-                    // Non-fatal - plugin might not have getInfo
-                    return Ok(());
-                }
+                if !self.is_error(context, result) {
+                    let result_str = self.value_to_string(context, result)?;
+                    let info: serde_json::Value = serde_json::from_str(&result_str)
+                        .map_err(|e| TsPluginError::ExecutionError(e.to_string()))?;
 
-                // Parse the result to get tool list
-                let result_str = self.value_to_string(context, result)?;
-                let info: serde_json::Value = serde_json::from_str(&result_str)
-                    .map_err(|e| TsPluginError::ExecutionError(e.to_string()))?;
-
-                if let Some(tools) = info.get("tools") {
-                    if let Some(tools_array) = tools.as_array() {
-                        for tool in tools_array {
-                            if let Some(name) = tool.get("name").and_then(|n| n.as_str()) {
-                                self.tools.push(name.to_string());
+                    if let Some(tools) = info.get("tools") {
+                        if let Some(tools_array) = tools.as_array() {
+                            for tool in tools_array {
+                                if let Some(name) = tool.get("name").and_then(|n| n.as_str()) {
+                                    self.tools.push(name.to_string());
+                                }
                             }
                         }
                     }
                 }
 
-                quickjs_wasm_sys::JS_FreeValue(context.context, result);
+                self.free_value(context, result);
             }
 
-            quickjs_wasm_sys::JS_FreeValue(context.context, get_info_val);
+            self.free_value(context, get_info_val);
         }
 
         Ok(())
@@ -525,11 +317,10 @@ impl TsPlugin {
             );
 
             if quickjs_wasm_sys::JS_IsFunction(context.context, handle_tool_val) != 1 {
-                quickjs_wasm_sys::JS_FreeValue(context.context, handle_tool_val);
+                self.free_value(context, handle_tool_val);
                 return Err(TsPluginError::ToolNotFound(tool_name.to_string()));
             }
 
-            // Create arguments
             let tool_name_cstring = CString::new(tool_name)
                 .map_err(|e| TsPluginError::ExecutionError(e.to_string()))?;
             let args_cstring = CString::new(args)
@@ -548,73 +339,44 @@ impl TsPlugin {
                 argv.as_mut_ptr(),
             );
 
-            quickjs_wasm_sys::JS_FreeValue(context.context, tool_name_val);
-            quickjs_wasm_sys::JS_FreeValue(context.context, args_val);
-            quickjs_wasm_sys::JS_FreeValue(context.context, handle_tool_val);
+            self.free_value(context, tool_name_val);
+            self.free_value(context, args_val);
+            self.free_value(context, handle_tool_val);
 
-            if quickjs_wasm_sys::JS_IsException(result) == 1 {
-                let error = self.get_exception_message(context);
-                quickjs_wasm_sys::JS_FreeValue(context.context, result);
+            if self.is_error(context, result) {
+                let error = self.get_error_message(context);
+                self.free_value(context, result);
                 return Err(TsPluginError::ExecutionError(error));
             }
 
             let result_str = self.value_to_string(context, result)?;
-            quickjs_wasm_sys::JS_FreeValue(context.context, result);
+            self.free_value(context, result);
 
             Ok(result_str)
         }
     }
 
-    /// Execute raw JavaScript code
-    pub fn execute(&self, code: &str) -> Result<String, TsPluginError> {
-        if !self.initialized {
-            return Err(TsPluginError::NotInitialized);
-        }
-
-        let context = self.context.as_ref()
-            .ok_or_else(|| TsPluginError::NotInitialized)?;
-
-        if !self.config.allow_eval {
-            return Err(TsPluginError::ExecutionError("eval is disabled".to_string()));
-        }
-
+    /// Check if a value is an error
+    fn is_error(&self, context: &JsContextWrapper, value: JSValue) -> bool {
         unsafe {
-            let code_cstring = CString::new(code)
-                .map_err(|e| TsPluginError::ExecutionError(e.to_string()))?;
-
-            let result = quickjs_wasm_sys::JS_Eval(
-                context.context,
-                code_cstring.as_ptr(),
-                code_cstring.as_bytes().len() as i32,
-                CStr::from_ptr(b"<eval>\0" as *const u8 as *const c_char).as_ptr(),
-                quickjs_wasm_sys::JS_EVAL_TYPE_GLOBAL as i32,
-            );
-
-            if quickjs_wasm_sys::JS_IsException(result) == 1 {
-                let error = self.get_exception_message(context);
-                quickjs_wasm_sys::JS_FreeValue(context.context, result);
-                return Err(TsPluginError::ExecutionError(error));
-            }
-
-            let result_str = self.value_to_string(context, result)?;
-            quickjs_wasm_sys::JS_FreeValue(context.context, result);
-
-            Ok(result_str)
+            quickjs_wasm_sys::JS_IsError(context.context, value) == 1
         }
     }
 
-    /// Get exception message from QuickJS
-    fn get_exception_message(&self, context: &JsContextWrapper) -> String {
+    /// Free a JS value
+    fn free_value(&self, context: &JsContextWrapper, value: JSValue) {
         unsafe {
-            let global = quickjs_wasm_sys::JS_GetGlobalObject(context.context);
+            quickjs_wasm_sys::__JS_FreeValue(context.context, value);
+        }
+    }
+
+    /// Get error message from QuickJS
+    fn get_error_message(&self, context: &JsContextWrapper) -> String {
+        unsafe {
             let exception = quickjs_wasm_sys::JS_GetException(context.context);
-
             let message = self.value_to_string(context, exception)
                 .unwrap_or_else(|_| "Unknown error".to_string());
-
-            quickjs_wasm_sys::JS_FreeValue(context.context, exception);
-            quickjs_wasm_sys::JS_FreeValue(context.context, global);
-
+            self.free_value(context, exception);
             message
         }
     }
@@ -622,31 +384,20 @@ impl TsPlugin {
     /// Convert JS value to string
     fn value_to_string(&self, context: &JsContextWrapper, value: JSValue) -> Result<String, TsPluginError> {
         unsafe {
-            if quickjs_wasm_sys::JS_IsString(value) == 1 {
-                let ptr = quickjs_wasm_sys::JS_ToCString(context.context, value);
-                if ptr.is_null() {
-                    return Err(TsPluginError::ExecutionError("Failed to get string".to_string()));
-                }
-                let result = CStr::from_ptr(ptr).to_string_lossy().into_owned();
-                quickjs_wasm_sys::JS_FreeCString(context.context, ptr);
-                Ok(result)
-            } else {
-                // JSON stringify
-                let json_str = quickjs_wasm_sys::JS_JSONStringify(
-                    context.context,
-                    value,
-                    quickjs_wasm_sys::JS_GetGlobalObject(context.context),
-                );
-
-                if quickjs_wasm_sys::JS_IsException(json_str) == 1 {
-                    quickjs_wasm_sys::JS_FreeValue(context.context, json_str);
-                    return Err(TsPluginError::ExecutionError("Failed to stringify".to_string()));
-                }
-
-                let result = self.value_to_string(context, json_str)?;
-                quickjs_wasm_sys::JS_FreeValue(context.context, json_str);
-                Ok(result)
+            let str_val = quickjs_wasm_sys::JS_ToString(context.context, value);
+            // JS_ToString returns 0 on error
+            if str_val == 0 {
+                return Err(TsPluginError::ExecutionError("Failed to convert to string".to_string()));
             }
+            let ptr = quickjs_wasm_sys::JS_AtomToCString(context.context, quickjs_wasm_sys::JS_ValueToAtom(context.context, str_val));
+            if ptr.is_null() {
+                self.free_value(context, str_val);
+                return Err(TsPluginError::ExecutionError("Failed to get C string".to_string()));
+            }
+            let result = CStr::from_ptr(ptr).to_string_lossy().into_owned();
+            quickjs_wasm_sys::JS_FreeCString(context.context, ptr);
+            self.free_value(context, str_val);
+            Ok(result)
         }
     }
 
@@ -669,23 +420,12 @@ impl TsPlugin {
     pub fn tools(&self) -> &[String] {
         &self.tools
     }
-
-    /// Get console logs
-    pub fn get_logs(&self) -> Vec<String> {
-        if let Some(ref ctx) = self.context {
-            let state = ctx.host_state.borrow();
-            state.log_buffer.clone()
-        } else {
-            Vec::new()
-        }
-    }
 }
 
 impl Drop for TsPlugin {
     fn drop(&mut self) {
         if self.initialized {
             if let Some(ref context) = self.context {
-                // Call shutdown function
                 unsafe {
                     let shutdown_name = CString::new("shutdown")
                         .expect("Failed to create shutdown string");
@@ -706,7 +446,7 @@ impl Drop for TsPlugin {
                         );
                     }
 
-                    quickjs_wasm_sys::JS_FreeValue(context.context, shutdown_val);
+                    quickjs_wasm_sys::__JS_FreeValue(context.context, shutdown_val);
                 }
             }
         }
@@ -729,16 +469,6 @@ impl TsPluginRegistry {
     /// Get a plugin by ID
     pub fn get(&self, id: &str) -> Option<&Rc<RefCell<TsPlugin>>> {
         self.plugins.get(id)
-    }
-
-    /// Get a plugin mutably by ID
-    pub fn get_mut(&mut self, id: &str) -> Option<&mut Rc<RefCell<TsPlugin>>> {
-        self.plugins.get_mut(id)
-    }
-
-    /// List all plugins
-    pub fn list(&self) -> Vec<&Rc<RefCell<TsPlugin>>> {
-        self.plugins.values().collect()
     }
 
     /// Call a tool on a plugin

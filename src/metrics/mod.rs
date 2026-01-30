@@ -357,6 +357,51 @@ impl Default for Timer {
     }
 }
 
+/// Prometheus metrics exposition
+pub fn prometheus_exposition(registry: &MetricsRegistry) -> String {
+    let mut output = String::new();
+
+    // Uptime
+    output.push_str("# HELP carapace_uptime_seconds Seconds since carapace started\n");
+    output.push_str("# TYPE carapace_uptime_seconds gauge\n");
+    output.push_str("carapace_uptime_seconds 0\n\n");
+
+    // Counters
+    let counters = registry.counters.read().unwrap();
+    for (name, counter) in counters.iter() {
+        let metric_name = name.replace('_', "_");
+        output.push_str(&format!("# HELP {} {}\n", metric_name, name));
+        output.push_str(&format!("# TYPE {} counter\n", metric_name));
+        output.push_str(&format!("{} {}\n\n", metric_name, counter.get()));
+    }
+
+    // Gauges
+    let gauges = registry.gauges.read().unwrap();
+    for (name, gauge) in gauges.iter() {
+        let metric_name = name.replace('_', "_");
+        output.push_str(&format!("# HELP {} {}\n", metric_name, name));
+        output.push_str(&format!("# TYPE {} gauge\n", metric_name));
+        output.push_str(&format!("{} {}\n\n", metric_name, gauge.get()));
+    }
+
+    // Histograms
+    let histograms = registry.histograms.read().unwrap();
+    for (name, hist) in histograms.iter() {
+        let metric_name = name.replace('_', "_");
+        output.push_str(&format!("# HELP {} Latency in milliseconds\n", metric_name));
+        output.push_str(&format!("# TYPE {} histogram\n", metric_name));
+        output.push_str(&format!("{}_sum {}\n", metric_name, hist.sum()));
+        output.push_str(&format!("{}_count {}\n", metric_name, hist.count()));
+
+        for (bound, count) in hist.buckets() {
+            output.push_str(&format!("{}_bucket{{le={}}} {}\n", metric_name, bound, count));
+        }
+        output.push_str(&format!("{}_bucket{{le=+Inf}} {}\n\n", metric_name, hist.count()));
+    }
+
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

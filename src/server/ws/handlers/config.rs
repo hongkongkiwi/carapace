@@ -7,6 +7,9 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
+use crate::config::encryption;
+use crate::security::redact_config_for_response;
+
 use super::super::*;
 
 #[derive(Debug, Serialize)]
@@ -151,7 +154,7 @@ fn require_config_base_hash(
     Ok(())
 }
 
-/// Write a config value to disk atomically. Returns `Err(message)` on failure.
+/// Write a config value to disk atomically with encryption. Returns `Err(message)` on failure.
 /// This is the `pub(crate)` helper so non-WS code (e.g. the control HTTP
 /// endpoint) can persist config without depending on `ErrorShape`.
 pub(crate) fn persist_config_file(path: &PathBuf, config_value: &Value) -> Result<(), String> {
@@ -160,7 +163,27 @@ pub(crate) fn persist_config_file(path: &PathBuf, config_value: &Value) -> Resul
             .map_err(|err| format!("failed to create config dir: {}", err))?;
     }
 
-    let content = serde_json::to_string_pretty(config_value)
+    // Encrypt sensitive fields before saving
+    let encrypted_config = match encryption::get_or_create_master_key() {
+        Ok(master_key) => {
+            match encryption::encrypt_config(config_value, &master_key) {
+                Ok(encrypted) => {
+                    tracing::debug!("Config encrypted successfully");
+                    encrypted
+                }
+                Err(e) => {
+                    tracing::error!("Failed to encrypt config: {}", e);
+                    return Err(format!("failed to encrypt config: {}", e));
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!("Failed to get master key: {}", e);
+            return Err(format!("failed to get master key: {}", e));
+        }
+    };
+
+    let content = serde_json::to_string_pretty(&encrypted_config)
         .map_err(|err| format!("failed to serialize config: {}", err))?;
     let tmp_path = path.with_extension("json.tmp");
     {
@@ -213,19 +236,25 @@ pub(super) fn handle_config_get(params: Option<&Value>) -> Result<Value, ErrorSh
 
     if let Some(key) = key {
         let value = get_value_at_path(&snapshot.config, key).unwrap_or(Value::Null);
+        // Redact secrets even for single key lookups
+        let redacted_value = redact_config_for_response(&value);
         return Ok(json!({
             "key": key,
-            "value": value
+            "value": redacted_value
         }));
     }
+
+    // Redact sensitive fields from all config responses
+    let redacted_config = redact_config_for_response(&snapshot.config);
+    let redacted_parsed = redact_config_for_response(&snapshot.parsed);
 
     Ok(json!({
         "path": snapshot.path,
         "exists": snapshot.exists,
-        "raw": snapshot.raw,
-        "parsed": snapshot.parsed,
+        "raw": snapshot.raw.as_ref().map(|_| "***REDACTED***".to_string()),
+        "parsed": redacted_parsed,
         "valid": snapshot.valid,
-        "config": snapshot.config,
+        "config": redacted_config,
         "hash": snapshot.hash,
         "issues": snapshot.issues,
         "warnings": [],

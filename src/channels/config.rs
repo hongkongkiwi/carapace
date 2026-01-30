@@ -6,7 +6,10 @@
 //! - Configuration validation and defaults
 //! - Migration helpers for config versions
 
-use crate::channels::{DiscordConfig, SlackConfig, TelegramConfig, WhatsAppConfig};
+use crate::channels::discord::DiscordConfig;
+use crate::channels::slack::SlackConfig;
+use crate::channels::telegram::TelegramConfig;
+use crate::channels::whatsapp::WhatsAppConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -557,7 +560,7 @@ impl ChannelSchema {
         })
     }
 
-    fn generic_schema(channel_type: &ChannelType) -> serde_json::Value {
+    fn generic_schema(_channel_type: &ChannelType) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
@@ -686,13 +689,16 @@ pub fn migrate_config(
     }
 }
 
-/// Export re-exports for convenience
-pub use super::{DiscordConfig, SlackConfig, TelegramConfig, WhatsAppConfig};
+// Note: DiscordConfig, SlackConfig, TelegramConfig, WhatsAppConfig are available
+// from their respective modules: crate::channels::discord, crate::channels::slack, etc.
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channels::{DiscordConfig, SlackConfig, TelegramConfig, WhatsAppConfig};
+    use crate::channels::discord::DiscordConfig;
+    use crate::channels::slack::SlackConfig;
+    use crate::channels::telegram::TelegramConfig;
+    use crate::channels::whatsapp::WhatsAppConfig;
 
     #[test]
     fn test_channel_type_display() {
