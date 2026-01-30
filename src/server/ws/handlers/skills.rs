@@ -213,13 +213,73 @@ fn write_skills_manifest(skills_dir: &Path, manifest: &Value) -> Result<(), Erro
     Ok(())
 }
 
+/// Compute the SHA-256 hash of the given bytes and return it as a lowercase hex string.
+fn compute_sha256_hex(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let hash = hasher.finalize();
+    hex::encode(hash)
+}
+
+/// Verify that a skill's WASM bytes match the expected SHA-256 hash stored in the manifest.
+///
+/// If the manifest entry has no `sha256` field (legacy entry), verification is skipped with
+/// a warning log. Returns `Ok(())` on success or if no hash is recorded, or an error if the
+/// hash does not match.
+fn verify_skill_hash(
+    skill_name: &str,
+    wasm_bytes: &[u8],
+    skills_dir: &Path,
+) -> Result<(), ErrorShape> {
+    let manifest = read_skills_manifest(skills_dir);
+    let expected_hash = manifest
+        .get(skill_name)
+        .and_then(|entry| entry.get("sha256"))
+        .and_then(|v| v.as_str());
+
+    match expected_hash {
+        Some(expected) => {
+            let actual = compute_sha256_hex(wasm_bytes);
+            if actual != expected {
+                tracing::error!(
+                    skill = %skill_name,
+                    expected = %expected,
+                    actual = %actual,
+                    "skill hash mismatch — possible tampering detected"
+                );
+                return Err(error_shape(
+                    ERROR_INVALID_REQUEST,
+                    &format!(
+                        "skill '{}' hash mismatch: expected {}, got {}",
+                        skill_name, expected, actual
+                    ),
+                    None,
+                ));
+            }
+            tracing::debug!(
+                skill = %skill_name,
+                sha256 = %actual,
+                "skill hash verification passed"
+            );
+            Ok(())
+        }
+        None => {
+            tracing::warn!(
+                skill = %skill_name,
+                "no sha256 hash in manifest for skill, skipping verification (legacy entry)"
+            );
+            Ok(())
+        }
+    }
+}
+
 /// Download a WASM binary from the given URL and save it atomically to the skills
-/// directory.  Returns the final file path on success.
+/// directory.  Returns the final file path and the raw bytes on success.
 fn download_skill_wasm(
     url: &url::Url,
     skills_dir: &Path,
     file_name: &str,
-) -> Result<PathBuf, ErrorShape> {
+) -> Result<(PathBuf, Vec<u8>), ErrorShape> {
     // Validate URL against SSRF attacks (blocks localhost, private IPs, metadata endpoints)
     SsrfProtection::validate_url(url.as_str()).map_err(|e| {
         error_shape(
@@ -330,7 +390,7 @@ fn download_skill_wasm(
         )
     })?;
 
-    Ok(dest_path)
+    Ok((dest_path, bytes.to_vec()))
 }
 
 pub(super) fn handle_skills_status() -> Result<Value, ErrorShape> {
@@ -442,9 +502,11 @@ fn handle_skills_install_inner(
 
     // If URL is provided, download and validate the WASM binary
     let mut wasm_path: Option<PathBuf> = None;
+    let mut wasm_hash: Option<String> = None;
     if let Some(raw_url) = url_str {
         let parsed_url = validate_url(raw_url)?;
-        let dest = download_skill_wasm(&parsed_url, skills_dir, &wasm_file_name)?;
+        let (dest, wasm_bytes) = download_skill_wasm(&parsed_url, skills_dir, &wasm_file_name)?;
+        wasm_hash = Some(compute_sha256_hex(&wasm_bytes));
         wasm_path = Some(dest);
     }
 
@@ -468,6 +530,9 @@ fn handle_skills_install_inner(
             "path".to_string(),
             Value::String(p.to_string_lossy().to_string()),
         );
+    }
+    if let Some(ref hash) = wasm_hash {
+        entry_obj.insert("sha256".to_string(), Value::String(hash.clone()));
     }
     if let Some(raw_url) = url_str {
         entry_obj.insert("url".to_string(), Value::String(raw_url.to_string()));
@@ -575,7 +640,8 @@ fn handle_skills_update_inner(
 
     let parsed_url = validate_url(url_str)?;
     let wasm_file_name = format!("{}.wasm", name);
-    let dest = download_skill_wasm(&parsed_url, skills_dir, &wasm_file_name)?;
+    let (dest, wasm_bytes) = download_skill_wasm(&parsed_url, skills_dir, &wasm_file_name)?;
+    let wasm_hash = compute_sha256_hex(&wasm_bytes);
     let updated_at = now_ms();
 
     // Update the manifest entry
@@ -593,6 +659,7 @@ fn handle_skills_update_inner(
         "path".to_string(),
         Value::String(dest.to_string_lossy().to_string()),
     );
+    entry_obj.insert("sha256".to_string(), Value::String(wasm_hash));
     entry_obj.insert("url".to_string(), Value::String(url_str.to_string()));
     write_skills_manifest(skills_dir, &manifest)?;
 
@@ -1143,6 +1210,133 @@ mod tests {
             err.message.contains("SSRF"),
             "127.0.0.1 should be blocked by SSRF protection, got: {}",
             err.message
+        );
+    }
+
+    // ---- SHA-256 hash pinning tests ----
+
+    #[test]
+    fn test_skill_hash_computed_on_install() {
+        // Simulate an install without a URL (no download) but manually write a WASM
+        // file and manifest entry with a hash, then verify the hash is present.
+        let dir = TempDir::new().unwrap();
+        let skills_dir = dir.path().join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+
+        // Create a fake WASM binary with valid magic bytes
+        let mut wasm_bytes = WASM_MAGIC.to_vec();
+        wasm_bytes.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // version 1
+        wasm_bytes.extend_from_slice(b"test payload for hashing");
+
+        // Compute expected hash
+        let expected_hash = compute_sha256_hex(&wasm_bytes);
+        assert!(!expected_hash.is_empty());
+        assert_eq!(expected_hash.len(), 64); // SHA-256 produces 64 hex chars
+
+        // Write the WASM file
+        std::fs::write(skills_dir.join("my-skill.wasm"), &wasm_bytes).unwrap();
+
+        // Write a manifest entry that includes the sha256 field (simulating post-install)
+        let manifest = json!({
+            "my-skill": {
+                "name": "my-skill",
+                "version": "1.0.0",
+                "installed_at": 1700000000000u64,
+                "sha256": expected_hash
+            }
+        });
+        write_skills_manifest(&skills_dir, &manifest).unwrap();
+
+        // Read back and verify hash is stored
+        let read_back = read_skills_manifest(&skills_dir);
+        let stored_hash = read_back["my-skill"]["sha256"].as_str().unwrap();
+        assert_eq!(stored_hash, expected_hash);
+        assert_eq!(stored_hash.len(), 64);
+        // Verify it is lowercase hex
+        assert!(stored_hash
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn test_skill_hash_mismatch_rejected() {
+        let dir = TempDir::new().unwrap();
+        let skills_dir = dir.path();
+
+        // Create a WASM binary
+        let mut wasm_bytes = WASM_MAGIC.to_vec();
+        wasm_bytes.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+        wasm_bytes.extend_from_slice(b"original content");
+
+        // Write the manifest with a WRONG hash
+        let wrong_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+        let manifest = json!({
+            "my-skill": {
+                "name": "my-skill",
+                "sha256": wrong_hash
+            }
+        });
+        write_skills_manifest(skills_dir, &manifest).unwrap();
+
+        // Verify should fail
+        let result = verify_skill_hash("my-skill", &wasm_bytes, skills_dir);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("hash mismatch"),
+            "expected hash mismatch error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_skill_hash_valid_accepted() {
+        let dir = TempDir::new().unwrap();
+        let skills_dir = dir.path();
+
+        // Create a WASM binary
+        let mut wasm_bytes = WASM_MAGIC.to_vec();
+        wasm_bytes.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+        wasm_bytes.extend_from_slice(b"valid content");
+
+        // Compute the correct hash and store it in the manifest
+        let correct_hash = compute_sha256_hex(&wasm_bytes);
+        let manifest = json!({
+            "my-skill": {
+                "name": "my-skill",
+                "sha256": correct_hash
+            }
+        });
+        write_skills_manifest(skills_dir, &manifest).unwrap();
+
+        // Verify should succeed
+        let result = verify_skill_hash("my-skill", &wasm_bytes, skills_dir);
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+    }
+
+    #[test]
+    fn test_skill_hash_missing_legacy_compat() {
+        let dir = TempDir::new().unwrap();
+        let skills_dir = dir.path();
+
+        // Create a manifest entry WITHOUT a sha256 field (legacy entry)
+        let manifest = json!({
+            "legacy-skill": {
+                "name": "legacy-skill",
+                "version": "0.9.0"
+            }
+        });
+        write_skills_manifest(skills_dir, &manifest).unwrap();
+
+        // Create some WASM bytes
+        let mut wasm_bytes = WASM_MAGIC.to_vec();
+        wasm_bytes.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+
+        // Verification should succeed (skip with warning) for legacy entries
+        let result = verify_skill_hash("legacy-skill", &wasm_bytes, skills_dir);
+        assert!(
+            result.is_ok(),
+            "legacy entries without sha256 should pass verification"
         );
     }
 }

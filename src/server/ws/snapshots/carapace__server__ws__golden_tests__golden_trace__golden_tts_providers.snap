@@ -6,7 +6,7 @@ expression: normalized
 {
   "ok": true,
   "result": {
-    "current": null,
+    "current": "<TTS_CURRENT>",
     "providers": [
       {
         "available": true,

@@ -223,6 +223,12 @@ mod golden_trace {
                         }
                     }
                 }
+                // tts.providers response — "current" depends on global TTS state.
+                if map.contains_key("current") && map.contains_key("providers") {
+                    if let Some(val) = map.get_mut("current") {
+                        *val = json!("<TTS_CURRENT>");
+                    }
+                }
                 if map.contains_key("active") && map.contains_key("availableModes") {
                     // talk.status response - mutable fields from global state.
                     for talk_key in &[

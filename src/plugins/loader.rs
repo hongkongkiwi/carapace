@@ -15,6 +15,7 @@
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -49,6 +50,15 @@ pub enum LoaderError {
 
     #[error("Wasmtime engine error: {0}")]
     EngineError(String),
+
+    #[error(
+        "Skill hash verification failed for '{skill_name}': expected {expected}, got {actual}"
+    )]
+    HashVerificationFailed {
+        skill_name: String,
+        expected: String,
+        actual: String,
+    },
 }
 
 /// Plugin kinds supported by the gateway
@@ -505,6 +515,77 @@ fn derive_manifest(
     }
 }
 
+/// Name of the skills manifest file stored alongside WASM binaries.
+const SKILLS_MANIFEST_FILE: &str = "skills-manifest.json";
+
+/// Compute the SHA-256 hash of the given bytes and return it as a lowercase hex string.
+fn compute_sha256_hex(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let hash = hasher.finalize();
+    hex::encode(hash)
+}
+
+/// Verify that a skill's WASM bytes match the expected SHA-256 hash stored in the
+/// skills manifest in the given directory.
+///
+/// If no manifest entry or no `sha256` field exists for the skill (legacy entry),
+/// verification is skipped with a warning log and `Ok(())` is returned.
+pub fn verify_skill_hash_on_load(
+    skill_name: &str,
+    wasm_bytes: &[u8],
+    skills_dir: &Path,
+) -> Result<(), LoaderError> {
+    let manifest_path = skills_dir.join(SKILLS_MANIFEST_FILE);
+    let manifest: serde_json::Value = match fs::read_to_string(&manifest_path) {
+        Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
+        Err(_) => {
+            tracing::warn!(
+                skill = %skill_name,
+                "no skills manifest found, skipping hash verification"
+            );
+            return Ok(());
+        }
+    };
+
+    let expected_hash = manifest
+        .get(skill_name)
+        .and_then(|entry| entry.get("sha256"))
+        .and_then(|v| v.as_str());
+
+    match expected_hash {
+        Some(expected) => {
+            let actual = compute_sha256_hex(wasm_bytes);
+            if actual != expected {
+                tracing::error!(
+                    skill = %skill_name,
+                    expected = %expected,
+                    actual = %actual,
+                    "skill hash mismatch — possible tampering detected"
+                );
+                return Err(LoaderError::HashVerificationFailed {
+                    skill_name: skill_name.to_string(),
+                    expected: expected.to_string(),
+                    actual,
+                });
+            }
+            tracing::debug!(
+                skill = %skill_name,
+                sha256 = %actual,
+                "skill hash verification passed"
+            );
+            Ok(())
+        }
+        None => {
+            tracing::warn!(
+                skill = %skill_name,
+                "no sha256 hash in manifest for skill, skipping verification (legacy entry)"
+            );
+            Ok(())
+        }
+    }
+}
+
 /// Plugin loader that manages discovery and loading of WASM plugins
 pub struct PluginLoader {
     /// Wasmtime engine (shared across all plugins)
@@ -593,6 +674,13 @@ impl PluginLoader {
             path: wasm_path.display().to_string(),
             message: e.to_string(),
         })?;
+
+        // Verify SHA-256 hash against the skills manifest (if present)
+        if let Some(parent_dir) = wasm_path.parent() {
+            if let Some(stem) = wasm_path.file_stem().and_then(|s| s.to_str()) {
+                verify_skill_hash_on_load(stem, &wasm_bytes, parent_dir)?;
+            }
+        }
 
         // Compile the module
         let module =

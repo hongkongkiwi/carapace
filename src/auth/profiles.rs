@@ -17,6 +17,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+use crate::config::secrets::{is_encrypted, SecretStore};
+
 /// Maximum number of auth profiles that can be stored.
 const MAX_PROFILES: usize = 20;
 
@@ -552,22 +554,61 @@ pub async fn fetch_user_info(
 ///
 /// Profiles are stored as a JSON array in `{state_dir}/auth_profiles.json`.
 /// Uses `parking_lot::RwLock` for synchronous interior mutability.
+///
+/// When a `SecretStore` is provided, sensitive token fields (`access_token`,
+/// `refresh_token`) are encrypted at rest using AES-256-GCM.  Plaintext
+/// values loaded from disk (backward-compatible) are transparently encrypted
+/// on the next save.
 pub struct ProfileStore {
     profiles: RwLock<Vec<AuthProfile>>,
     state_path: PathBuf,
+    secret_store: Option<SecretStore>,
+    /// Password bytes kept for `decrypt_rekey` (values on disk may have been
+    /// encrypted with a different salt than the current `SecretStore`).
+    encryption_password: Option<Vec<u8>>,
 }
 
 impl ProfileStore {
     /// Create a new profile store that persists to `{state_dir}/auth_profiles.json`.
+    ///
+    /// Token fields are stored as plaintext.  Use [`with_encryption`](Self::with_encryption)
+    /// to enable at-rest encryption.
     pub fn new(state_dir: PathBuf) -> Self {
         let state_path = state_dir.join("auth_profiles.json");
         Self {
             profiles: RwLock::new(Vec::new()),
             state_path,
+            secret_store: None,
+            encryption_password: None,
+        }
+    }
+
+    /// Create a new profile store with at-rest encryption for token fields.
+    ///
+    /// When a `SecretStore` is provided, `access_token` and `refresh_token`
+    /// values are encrypted before being written to disk and decrypted when
+    /// loaded.  Existing plaintext values are accepted on load (backward
+    /// compatible) and will be encrypted on the next save.
+    ///
+    /// The `password` is retained so that values encrypted with a different
+    /// salt (e.g. from a previous run) can still be decrypted via key
+    /// re-derivation.
+    pub fn with_encryption(state_dir: PathBuf, password: &[u8]) -> Self {
+        let state_path = state_dir.join("auth_profiles.json");
+        let secret_store = SecretStore::new(password);
+        Self {
+            profiles: RwLock::new(Vec::new()),
+            state_path,
+            secret_store: Some(secret_store),
+            encryption_password: Some(password.to_vec()),
         }
     }
 
     /// Load profiles from disk. Replaces any in-memory data.
+    ///
+    /// If a `SecretStore` is configured, encrypted token fields are decrypted
+    /// transparently.  Plaintext values (no `enc:v1:` prefix) are left as-is
+    /// for backward compatibility.
     pub fn load(&self) -> Result<(), AuthProfileError> {
         if !self.state_path.exists() {
             return Ok(());
@@ -576,8 +617,16 @@ impl ProfileStore {
         let content = fs::read_to_string(&self.state_path)
             .map_err(|e| AuthProfileError::IoError(e.to_string()))?;
 
-        let profiles: Vec<AuthProfile> = serde_json::from_str(&content)
+        let mut profiles: Vec<AuthProfile> = serde_json::from_str(&content)
             .map_err(|e| AuthProfileError::SerializationError(e.to_string()))?;
+
+        // Decrypt token fields if we have a SecretStore
+        if let Some(ref store) = self.secret_store {
+            let password = self.encryption_password.as_deref().unwrap_or(&[]);
+            for profile in profiles.iter_mut() {
+                Self::decrypt_tokens(&mut profile.tokens, store, password);
+            }
+        }
 
         let mut guard = self.profiles.write();
         *guard = profiles;
@@ -585,11 +634,25 @@ impl ProfileStore {
     }
 
     /// Save profiles to disk atomically (write temp file, fsync, rename).
+    ///
+    /// If a `SecretStore` is configured, `access_token` and `refresh_token`
+    /// fields are encrypted before serialization.  In-memory profiles remain
+    /// in plaintext so that callers never see encrypted values.
     pub fn save(&self) -> Result<(), AuthProfileError> {
         let guard = self.profiles.read();
-        let content = serde_json::to_string_pretty(&*guard)
-            .map_err(|e| AuthProfileError::SerializationError(e.to_string()))?;
+        // Clone so we can encrypt without mutating in-memory state
+        let mut to_save = guard.clone();
         drop(guard);
+
+        // Encrypt token fields if we have a SecretStore
+        if let Some(ref store) = self.secret_store {
+            for profile in to_save.iter_mut() {
+                Self::encrypt_tokens(&mut profile.tokens, store);
+            }
+        }
+
+        let content = serde_json::to_string_pretty(&to_save)
+            .map_err(|e| AuthProfileError::SerializationError(e.to_string()))?;
 
         // Ensure parent directory exists
         if let Some(parent) = self.state_path.parent() {
@@ -611,6 +674,48 @@ impl ProfileStore {
             .map_err(|e| AuthProfileError::IoError(e.to_string()))?;
 
         Ok(())
+    }
+
+    // -- private helpers for token encryption/decryption --
+
+    /// Encrypt sensitive token fields in-place.  Already-encrypted values
+    /// (prefixed with `enc:v1:`) are skipped to avoid double-encryption.
+    fn encrypt_tokens(tokens: &mut OAuthTokens, store: &SecretStore) {
+        if !is_encrypted(&tokens.access_token) {
+            tokens.access_token = store.encrypt(&tokens.access_token);
+        }
+        if let Some(ref rt) = tokens.refresh_token {
+            if !is_encrypted(rt) {
+                tokens.refresh_token = Some(store.encrypt(rt));
+            }
+        }
+    }
+
+    /// Decrypt sensitive token fields in-place.  Plaintext values (no
+    /// `enc:v1:` prefix) are left as-is for backward compatibility.
+    ///
+    /// Uses `decrypt_rekey` so that values encrypted with a different salt
+    /// (e.g. from a previous `SecretStore` instance) are still decryptable
+    /// as long as the same password is used.
+    fn decrypt_tokens(tokens: &mut OAuthTokens, store: &SecretStore, password: &[u8]) {
+        if is_encrypted(&tokens.access_token) {
+            match store.decrypt_rekey(&tokens.access_token, password) {
+                Ok(plaintext) => tokens.access_token = plaintext,
+                Err(e) => {
+                    tracing::warn!("Failed to decrypt access_token for profile: {}", e);
+                }
+            }
+        }
+        if let Some(ref rt) = tokens.refresh_token {
+            if is_encrypted(rt) {
+                match store.decrypt_rekey(rt, password) {
+                    Ok(plaintext) => tokens.refresh_token = Some(plaintext),
+                    Err(e) => {
+                        tracing::warn!("Failed to decrypt refresh_token for profile: {}", e);
+                    }
+                }
+            }
+        }
     }
 
     /// Add a profile. Fails if MAX_PROFILES would be exceeded.
@@ -1393,5 +1498,178 @@ mod tests {
         assert_eq!(url_encode("a+b"), "a%2Bb");
         assert_eq!(url_encode("key=val&x=y"), "key%3Dval%26x%3Dy");
         assert_eq!(url_encode("safe-chars_here.ok~"), "safe-chars_here.ok~");
+    }
+
+    // -----------------------------------------------------------------------
+    // At-rest encryption tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_encrypted_profile_store_roundtrip() {
+        let dir = tempdir().unwrap();
+        let password = b"test-encryption-pw";
+
+        // Create an encrypted store, add a profile, and save
+        {
+            let store = ProfileStore::with_encryption(dir.path().to_path_buf(), password);
+
+            store.add(sample_profile("enc-1")).unwrap();
+        }
+
+        // Read the raw file and verify tokens are encrypted on disk
+        let raw = std::fs::read_to_string(dir.path().join("auth_profiles.json")).unwrap();
+        assert!(
+            !raw.contains("access-123"),
+            "access_token must not appear in plaintext on disk"
+        );
+        assert!(
+            !raw.contains("refresh-456"),
+            "refresh_token must not appear in plaintext on disk"
+        );
+        assert!(
+            raw.contains("enc:v1:"),
+            "encrypted tokens should be present on disk"
+        );
+
+        // Load the profiles back with a new store derived from the same password
+        let store2 = ProfileStore::with_encryption(dir.path().to_path_buf(), password);
+        store2.load().unwrap();
+
+        let profile = store2.get("enc-1").unwrap();
+        assert_eq!(
+            profile.tokens.access_token, "access-123",
+            "access_token should be decrypted correctly"
+        );
+        assert_eq!(
+            profile.tokens.refresh_token,
+            Some("refresh-456".to_string()),
+            "refresh_token should be decrypted correctly"
+        );
+    }
+
+    #[test]
+    fn test_encrypted_profile_store_backward_compat_plaintext_load() {
+        let dir = tempdir().unwrap();
+
+        // First, write profiles using a plaintext store (no encryption)
+        {
+            let store = ProfileStore::new(dir.path().to_path_buf());
+            store.add(sample_profile("plain-1")).unwrap();
+        }
+
+        // Verify it's plaintext on disk
+        let raw = std::fs::read_to_string(dir.path().join("auth_profiles.json")).unwrap();
+        assert!(
+            raw.contains("access-123"),
+            "plaintext store should write tokens in clear"
+        );
+
+        // Now load with an encrypted store -- plaintext values should be read fine
+        let store2 = ProfileStore::with_encryption(dir.path().to_path_buf(), b"encryption-pw");
+        store2.load().unwrap();
+
+        let profile = store2.get("plain-1").unwrap();
+        assert_eq!(
+            profile.tokens.access_token, "access-123",
+            "plaintext access_token should load correctly in encrypted store"
+        );
+        assert_eq!(
+            profile.tokens.refresh_token,
+            Some("refresh-456".to_string()),
+            "plaintext refresh_token should load correctly in encrypted store"
+        );
+
+        // Trigger a save -- tokens should now be encrypted
+        store2.update_last_used("plain-1");
+
+        let raw2 = std::fs::read_to_string(dir.path().join("auth_profiles.json")).unwrap();
+        assert!(
+            !raw2.contains("access-123"),
+            "after save, access_token should be encrypted"
+        );
+        assert!(
+            raw2.contains("enc:v1:"),
+            "after save, encrypted tokens should be on disk"
+        );
+    }
+
+    #[test]
+    fn test_no_secret_store_saves_plaintext() {
+        let dir = tempdir().unwrap();
+        let store = ProfileStore::new(dir.path().to_path_buf());
+
+        store.add(sample_profile("pt-1")).unwrap();
+
+        let raw = std::fs::read_to_string(dir.path().join("auth_profiles.json")).unwrap();
+        assert!(
+            raw.contains("access-123"),
+            "without SecretStore, tokens should remain plaintext"
+        );
+        assert!(
+            raw.contains("refresh-456"),
+            "without SecretStore, refresh_token should remain plaintext"
+        );
+        assert!(
+            !raw.contains("enc:v1:"),
+            "without SecretStore, no encryption prefix should appear"
+        );
+    }
+
+    #[test]
+    fn test_encrypted_store_no_double_encryption() {
+        let dir = tempdir().unwrap();
+        let password = b"double-enc-test";
+
+        // Save a profile (tokens get encrypted on disk)
+        {
+            let store = ProfileStore::with_encryption(dir.path().to_path_buf(), password);
+            store.add(sample_profile("de-1")).unwrap();
+        }
+
+        // Load and save again -- should not double-encrypt
+        let store2 = ProfileStore::with_encryption(dir.path().to_path_buf(), password);
+        store2.load().unwrap();
+
+        // In-memory tokens should be plaintext
+        let profile = store2.get("de-1").unwrap();
+        assert_eq!(profile.tokens.access_token, "access-123");
+
+        // Force a re-save
+        store2.update_last_used("de-1");
+
+        // Load yet again to verify
+        let store3 = ProfileStore::with_encryption(dir.path().to_path_buf(), password);
+        store3.load().unwrap();
+
+        let profile2 = store3.get("de-1").unwrap();
+        assert_eq!(
+            profile2.tokens.access_token, "access-123",
+            "tokens should survive multiple save/load cycles"
+        );
+        assert_eq!(
+            profile2.tokens.refresh_token,
+            Some("refresh-456".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_encrypted_store_no_refresh_token() {
+        let dir = tempdir().unwrap();
+        let password = b"no-refresh-test";
+
+        // Create a profile without a refresh token
+        let mut profile = sample_profile("nrt-1");
+        profile.tokens.refresh_token = None;
+
+        let store = ProfileStore::with_encryption(dir.path().to_path_buf(), password);
+        store.add(profile).unwrap();
+
+        // Reload and verify
+        let store2 = ProfileStore::with_encryption(dir.path().to_path_buf(), password);
+        store2.load().unwrap();
+
+        let loaded = store2.get("nrt-1").unwrap();
+        assert_eq!(loaded.tokens.access_token, "access-123");
+        assert_eq!(loaded.tokens.refresh_token, None);
     }
 }
