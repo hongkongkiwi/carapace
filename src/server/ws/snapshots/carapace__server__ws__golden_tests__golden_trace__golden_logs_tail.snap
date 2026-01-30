@@ -7,7 +7,7 @@ expression: normalized
   "ok": true,
   "result": {
     "cursor": 0,
-    "file": "/Users/zera/.moltbot/logs/moltbot.log",
+    "file": "<PATH>",
     "lines": [],
     "reset": false,
     "size": 0,

@@ -6,12 +6,12 @@ expression: normalized
 {
   "ok": true,
   "result": {
-    "exists": true,
+    "exists": "<APPROVALS_EXISTS>",
     "file": {
-      "mode": "deny",
+      "mode": "<APPROVALS_MODE>",
       "rules": []
     },
-    "hash": "736b32d7cd392d37c42c4432ff60d86190509fec34e0e05eb2079205aa150526",
+    "hash": "<APPROVALS_HASH>",
     "path": "<PATH>"
   }
 }

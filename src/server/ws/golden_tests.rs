@@ -166,6 +166,25 @@ mod golden_trace {
                     }
                 }
 
+                // exec.approvals.get response — depends on whether the approvals
+                // file exists on disk.
+                if map.contains_key("exists")
+                    && map.contains_key("file")
+                    && map.contains_key("hash")
+                {
+                    map.insert("exists".to_string(), json!("<APPROVALS_EXISTS>"));
+                    if let Some(hash) = map.get("hash") {
+                        if hash.is_string() || hash.is_null() {
+                            map.insert("hash".to_string(), json!("<APPROVALS_HASH>"));
+                        }
+                    }
+                    if let Some(Value::Object(file_obj)) = map.get_mut("file") {
+                        if let Some(mode) = file_obj.get_mut("mode") {
+                            *mode = json!("<APPROVALS_MODE>");
+                        }
+                    }
+                }
+
                 // Normalize config key lookup responses (config.get with a key param).
                 // The value depends on config file content on disk.
                 if map.contains_key("key") && map.contains_key("value") {
@@ -276,6 +295,7 @@ mod golden_trace {
 
                     // Replace file-system paths with a placeholder.
                     if key == "path"
+                        || key == "file"
                         || key == "storePath"
                         || key == "workspaceDir"
                         || key == "managedSkillsDir"
