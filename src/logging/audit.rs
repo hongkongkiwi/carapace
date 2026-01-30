@@ -130,6 +130,32 @@ pub enum AuditEvent {
         gateway_id: String,
         reason: String,
     },
+    /// Prompt guard blocked a prompt or output.
+    PromptGuardBlocked {
+        layer: String,
+        reason: String,
+        run_id: String,
+    },
+    /// Skill signature verified successfully.
+    SkillSignatureVerified {
+        skill_id: String,
+    },
+    /// Skill signature verification failed.
+    SkillSignatureFailed {
+        skill_id: String,
+        reason: String,
+    },
+    /// Skill capability denied by sandbox.
+    SkillCapabilityDenied {
+        skill_id: String,
+        capabilities: Vec<String>,
+    },
+    /// Session integrity violation detected.
+    SessionIntegrityViolation {
+        session_id: String,
+        file: String,
+        action: String,
+    },
 }
 
 impl AuditEvent {
@@ -153,6 +179,11 @@ impl AuditEvent {
             AuditEvent::RateLimitHit { .. } => "rate_limit_hit",
             AuditEvent::GatewayConnected { .. } => "gateway_connected",
             AuditEvent::GatewayDisconnected { .. } => "gateway_disconnected",
+            AuditEvent::PromptGuardBlocked { .. } => "prompt_guard_blocked",
+            AuditEvent::SkillSignatureVerified { .. } => "skill_signature_verified",
+            AuditEvent::SkillSignatureFailed { .. } => "skill_signature_failed",
+            AuditEvent::SkillCapabilityDenied { .. } => "skill_capability_denied",
+            AuditEvent::SessionIntegrityViolation { .. } => "session_integrity_violation",
         }
     }
 }
@@ -459,6 +490,27 @@ mod tests {
             AuditEvent::GatewayDisconnected {
                 gateway_id: "g".into(),
                 reason: "timeout".into(),
+            },
+            AuditEvent::PromptGuardBlocked {
+                layer: "l".into(),
+                reason: "r".into(),
+                run_id: "rid".into(),
+            },
+            AuditEvent::SkillSignatureVerified {
+                skill_id: "s".into(),
+            },
+            AuditEvent::SkillSignatureFailed {
+                skill_id: "s".into(),
+                reason: "r".into(),
+            },
+            AuditEvent::SkillCapabilityDenied {
+                skill_id: "s".into(),
+                capabilities: vec!["http".into()],
+            },
+            AuditEvent::SessionIntegrityViolation {
+                session_id: "s".into(),
+                file: "f".into(),
+                action: "a".into(),
             },
         ];
         let names: Vec<&str> = events.iter().map(|e| e.event_name()).collect();

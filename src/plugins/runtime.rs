@@ -777,6 +777,29 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
             .get_plugin(plugin_id)
             .ok_or_else(|| RuntimeError::PluginNotFound(plugin_id.to_string()))?;
 
+        // Check capabilities against sandbox policy
+        if let Some(ref discovered) = loaded.discovered_capabilities {
+            let sandbox_config = super::sandbox::SandboxConfig::default();
+            if let Err(denied) =
+                super::sandbox::check_capabilities(plugin_id, discovered, &sandbox_config)
+            {
+                let denied_names: Vec<String> = denied.iter().map(|c| c.to_string()).collect();
+                tracing::warn!(
+                    plugin_id = %plugin_id,
+                    denied = ?denied_names,
+                    "plugin capabilities denied by sandbox policy"
+                );
+                crate::logging::audit::audit(
+                    crate::logging::audit::AuditEvent::SkillCapabilityDenied {
+                        skill_id: plugin_id.to_string(),
+                        capabilities: denied_names,
+                    },
+                );
+                // Default sandbox config denies but doesn't block — only block if explicitly configured
+                // For now, we log and continue (deny-and-warn behavior)
+            }
+        }
+
         // Create host context for this plugin
         let host_ctx = Arc::new(PluginHostContext::with_ssrf_config(
             plugin_id.to_string(),

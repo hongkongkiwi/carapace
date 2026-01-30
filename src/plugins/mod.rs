@@ -40,6 +40,8 @@ pub mod dispatch;
 pub mod host;
 pub mod loader;
 pub mod runtime;
+pub mod sandbox;
+pub mod signature;
 pub mod tools;
 
 pub mod caps;

@@ -502,6 +502,8 @@ pub struct SessionStore {
     key_to_id: RwLock<HashMap<String, String>>,
     /// Compaction threshold
     compact_threshold: usize,
+    /// Optional HMAC key for session integrity verification.
+    hmac_key: Option<[u8; 32]>,
 }
 
 impl Default for SessionStore {
@@ -526,12 +528,19 @@ impl SessionStore {
             sessions: RwLock::new(HashMap::new()),
             key_to_id: RwLock::new(HashMap::new()),
             compact_threshold: DEFAULT_COMPACT_THRESHOLD,
+            hmac_key: None,
         }
     }
 
     /// Set the compaction threshold
     pub fn with_compact_threshold(mut self, threshold: usize) -> Self {
         self.compact_threshold = threshold;
+        self
+    }
+
+    /// Set the HMAC key for session integrity verification.
+    pub fn with_hmac_key(mut self, key: [u8; 32]) -> Self {
+        self.hmac_key = Some(key);
         self
     }
 
@@ -1522,6 +1531,31 @@ impl SessionStore {
         }
 
         let content = fs::read_to_string(&meta_path)?;
+
+        // Verify session integrity if HMAC key is configured
+        if let Some(ref key) = self.hmac_key {
+            let integrity_config = super::integrity::IntegrityConfig {
+                enabled: true,
+                action: super::integrity::IntegrityAction::Warn,
+            };
+            match super::integrity::verify_hmac_file(key, &meta_path, &integrity_config) {
+                Ok(()) => {}
+                Err(super::integrity::IntegrityError::Rejected { file }) => {
+                    return Err(SessionStoreError::Io(format!(
+                        "session integrity verification failed for {}",
+                        file
+                    )));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "session integrity verification issue"
+                    );
+                }
+            }
+        }
+
         let session: Session = serde_json::from_str(&content)?;
 
         // Update caches
@@ -1607,6 +1641,17 @@ impl SessionStore {
 
         // Atomic rename
         fs::rename(&temp_path, &meta_path)?;
+
+        // Write HMAC sidecar if integrity is enabled
+        if let Some(ref key) = self.hmac_key {
+            if let Err(e) = super::integrity::write_hmac_file(key, &meta_path) {
+                tracing::warn!(
+                    session_id = %session.id,
+                    error = %e,
+                    "failed to write session HMAC sidecar"
+                );
+            }
+        }
 
         Ok(())
     }

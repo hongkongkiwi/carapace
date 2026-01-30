@@ -59,6 +59,9 @@ pub enum LoaderError {
         expected: String,
         actual: String,
     },
+
+    #[error("Skill signature verification failed for '{skill_name}': {reason}")]
+    SignatureVerificationFailed { skill_name: String, reason: String },
 }
 
 /// Plugin kinds supported by the gateway
@@ -163,6 +166,8 @@ pub struct LoadedPlugin {
     pub module: Module,
     /// Raw WASM bytes (for component instantiation)
     pub wasm_bytes: Vec<u8>,
+    /// Discovered WASM capabilities (from import enumeration).
+    pub discovered_capabilities: Option<super::sandbox::DiscoveredCapabilities>,
 }
 
 impl std::fmt::Debug for LoadedPlugin {
@@ -171,6 +176,7 @@ impl std::fmt::Debug for LoadedPlugin {
             .field("manifest", &self.manifest)
             .field("wasm_path", &self.wasm_path)
             .field("wasm_bytes_len", &self.wasm_bytes.len())
+            .field("discovered_capabilities", &self.discovered_capabilities)
             .finish()
     }
 }
@@ -691,12 +697,28 @@ impl PluginLoader {
             }
         }
 
+        // Verify Ed25519 signature against the skills manifest (if present)
+        if let Some(parent_dir) = wasm_path.parent() {
+            if let Some(stem) = wasm_path.file_stem().and_then(|s| s.to_str()) {
+                let sig_config = super::signature::SignatureConfig::default();
+                super::signature::verify_skill_signature(
+                    stem,
+                    &wasm_bytes,
+                    parent_dir,
+                    &sig_config,
+                )?;
+            }
+        }
+
         // Compile the module
         let module =
             Module::new(&self.engine, &wasm_bytes).map_err(|e| LoaderError::WasmCompileError {
                 path: wasm_path.display().to_string(),
                 message: e.to_string(),
             })?;
+
+        // Enumerate WASM capabilities for sandbox checking
+        let discovered_capabilities = Some(super::sandbox::enumerate_capabilities(&module));
 
         // For now, we extract the plugin ID from the filename
         // In a full implementation, we would instantiate the module and call get_manifest()
@@ -728,6 +750,7 @@ impl PluginLoader {
             wasm_path: wasm_path.to_path_buf(),
             module,
             wasm_bytes,
+            discovered_capabilities,
         };
 
         // Store the plugin
@@ -763,6 +786,9 @@ impl PluginLoader {
                 message: e.to_string(),
             })?;
 
+        // Enumerate WASM capabilities for sandbox checking
+        let discovered_capabilities = Some(super::sandbox::enumerate_capabilities(&module));
+
         let plugin_id = manifest.id.clone();
 
         // Create loaded plugin
@@ -771,6 +797,7 @@ impl PluginLoader {
             wasm_path: PathBuf::new(), // No file path for byte-loaded plugins
             module,
             wasm_bytes: wasm_bytes.to_vec(),
+            discovered_capabilities,
         };
 
         // Store the plugin

@@ -5,6 +5,7 @@
 //! append-friendly history operations.
 
 pub mod file_lock;
+pub mod integrity;
 pub mod retention;
 pub mod scoping;
 mod store;

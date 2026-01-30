@@ -607,6 +607,16 @@ fn handle_skills_install_inner(
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    let publisher_key = params
+        .and_then(|v| v.get("publisherKey"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let signature = params
+        .and_then(|v| v.get("signature"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
     let wasm_file_name = format!("{}.wasm", name);
     let installed_at = now_ms();
@@ -644,6 +654,12 @@ fn handle_skills_install_inner(
     }
     if let Some(ref hash) = wasm_hash {
         entry_obj.insert("sha256".to_string(), Value::String(hash.clone()));
+    }
+    if let Some(ref pk) = publisher_key {
+        entry_obj.insert("publisher_key".to_string(), Value::String(pk.clone()));
+    }
+    if let Some(ref sig) = signature {
+        entry_obj.insert("signature".to_string(), Value::String(sig.clone()));
     }
     if let Some(raw_url) = url_str {
         entry_obj.insert("url".to_string(), Value::String(raw_url.to_string()));
@@ -685,6 +701,8 @@ fn handle_skills_install_inner(
         "installed_at": installed_at,
         "path": wasm_path.map(|p| p.to_string_lossy().to_string()),
         "skills_dir": skills_dir.to_string_lossy(),
+        "publisher_key": publisher_key,
+        "signature": signature,
     }))
 }
 
@@ -713,6 +731,16 @@ fn handle_skills_update_inner(
         .filter(|s| !s.is_empty());
     let version = params
         .and_then(|v| v.get("version"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let publisher_key = params
+        .and_then(|v| v.get("publisherKey"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let signature = params
+        .and_then(|v| v.get("signature"))
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
@@ -771,6 +799,12 @@ fn handle_skills_update_inner(
         Value::String(dest.to_string_lossy().to_string()),
     );
     entry_obj.insert("sha256".to_string(), Value::String(wasm_hash));
+    if let Some(ref pk) = publisher_key {
+        entry_obj.insert("publisher_key".to_string(), Value::String(pk.clone()));
+    }
+    if let Some(ref sig) = signature {
+        entry_obj.insert("signature".to_string(), Value::String(sig.clone()));
+    }
     entry_obj.insert("url".to_string(), Value::String(url_str.to_string()));
     write_skills_manifest(skills_dir, &manifest)?;
 
@@ -781,6 +815,8 @@ fn handle_skills_update_inner(
         "updated_at": updated_at,
         "path": dest.to_string_lossy(),
         "skills_dir": skills_dir.to_string_lossy(),
+        "publisher_key": publisher_key,
+        "signature": signature,
     }))
 }
 

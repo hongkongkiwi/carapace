@@ -14,6 +14,7 @@ pub mod factory;
 pub mod gemini;
 pub mod ollama;
 pub mod openai;
+pub mod prompt_guard;
 pub mod provider;
 pub mod tool_policy;
 pub mod tools;
@@ -84,6 +85,8 @@ pub struct AgentConfig {
     /// levels.  This prevents prompt-injection attacks from silently
     /// exfiltrating user data.  Default: `false` (backward-compatible).
     pub exfiltration_guard: bool,
+    /// Prompt guard configuration for defense-in-depth filtering.
+    pub prompt_guard: prompt_guard::PromptGuardConfig,
 }
 
 impl Default for AgentConfig {
@@ -97,6 +100,7 @@ impl Default for AgentConfig {
             deliver: false,
             tool_policy: ToolPolicy::default(),
             exfiltration_guard: false,
+            prompt_guard: prompt_guard::PromptGuardConfig::default(),
         }
     }
 }

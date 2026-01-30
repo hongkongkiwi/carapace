@@ -95,6 +95,28 @@ pub fn validate_schema(config: &Value) -> Vec<SchemaIssue> {
     validate_agents(obj, &mut issues);
     validate_session(obj, &mut issues);
     validate_cron(obj, &mut issues);
+    validate_prompt_guard(obj, &mut issues);
+    validate_skills_signature(obj, &mut issues);
+    validate_skills_sandbox(obj, &mut issues);
+    validate_session_integrity(obj, &mut issues);
+
+    // Run agent config lint if prompt guard config lint is enabled
+    if let Some(agents) = obj.get("agents") {
+        let lint_enabled = obj
+            .get("agents")
+            .and_then(|a| a.get("promptGuard"))
+            .and_then(|pg| pg.get("configLint"))
+            .and_then(|cl| cl.get("enabled"))
+            .and_then(|e| e.as_bool())
+            .unwrap_or(false);
+
+        if lint_enabled {
+            let lint_config = crate::agent::prompt_guard::ConfigLintConfig { enabled: true };
+            let lint_issues =
+                crate::agent::prompt_guard::config_lint::lint_agent_configs(agents, &lint_config);
+            issues.extend(lint_issues);
+        }
+    }
 
     issues
 }
@@ -333,6 +355,150 @@ fn validate_cron(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIs
                     message: "payload must be an object".to_string(),
                 });
             }
+        }
+    }
+}
+
+fn validate_prompt_guard(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
+    let pg = match obj
+        .get("agents")
+        .and_then(|a| a.get("promptGuard"))
+        .and_then(|v| v.as_object())
+    {
+        Some(pg) => pg,
+        None => return,
+    };
+
+    if let Some(enabled) = pg.get("enabled") {
+        if !enabled.is_boolean() {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: ".agents.promptGuard.enabled".to_string(),
+                message: "enabled must be a boolean".to_string(),
+            });
+        }
+    }
+
+    // Validate sub-sections have boolean enabled fields
+    for section in &["preflight", "tagging", "postflight", "configLint"] {
+        if let Some(sub) = pg.get(*section).and_then(|v| v.as_object()) {
+            if let Some(enabled) = sub.get("enabled") {
+                if !enabled.is_boolean() {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Warning,
+                        path: format!(".agents.promptGuard.{}.enabled", section),
+                        message: "enabled must be a boolean".to_string(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn validate_skills_signature(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
+    let sig = match obj
+        .get("skills")
+        .and_then(|s| s.get("signature"))
+        .and_then(|v| v.as_object())
+    {
+        Some(s) => s,
+        None => return,
+    };
+
+    if let Some(enabled) = sig.get("enabled") {
+        if !enabled.is_boolean() {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: ".skills.signature.enabled".to_string(),
+                message: "enabled must be a boolean".to_string(),
+            });
+        }
+    }
+
+    if let Some(require) = sig.get("requireSignature") {
+        if !require.is_boolean() {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: ".skills.signature.requireSignature".to_string(),
+                message: "requireSignature must be a boolean".to_string(),
+            });
+        }
+    }
+
+    if let Some(publishers) = sig.get("trustedPublishers") {
+        if !publishers.is_array() {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: ".skills.signature.trustedPublishers".to_string(),
+                message: "trustedPublishers must be an array".to_string(),
+            });
+        }
+    }
+}
+
+fn validate_skills_sandbox(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
+    let sandbox = match obj
+        .get("skills")
+        .and_then(|s| s.get("sandbox"))
+        .and_then(|v| v.as_object())
+    {
+        Some(s) => s,
+        None => return,
+    };
+
+    if let Some(enabled) = sandbox.get("enabled") {
+        if !enabled.is_boolean() {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: ".skills.sandbox.enabled".to_string(),
+                message: "enabled must be a boolean".to_string(),
+            });
+        }
+    }
+
+    if let Some(defaults) = sandbox.get("defaults").and_then(|v| v.as_object()) {
+        for key in &["allowHttp", "allowCredentials", "allowMedia"] {
+            if let Some(val) = defaults.get(*key) {
+                if !val.is_boolean() {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Warning,
+                        path: format!(".skills.sandbox.defaults.{}", key),
+                        message: format!("{} must be a boolean", key),
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn validate_session_integrity(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
+    let integrity = match obj
+        .get("sessions")
+        .and_then(|s| s.get("integrity"))
+        .and_then(|v| v.as_object())
+    {
+        Some(i) => i,
+        None => return,
+    };
+
+    if let Some(enabled) = integrity.get("enabled") {
+        if !enabled.is_boolean() {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: ".sessions.integrity.enabled".to_string(),
+                message: "enabled must be a boolean".to_string(),
+            });
+        }
+    }
+
+    if let Some(action) = integrity.get("action").and_then(|v| v.as_str()) {
+        let valid = ["warn", "reject"];
+        if !valid.contains(&action) {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: ".sessions.integrity.action".to_string(),
+                message: format!("action should be one of warn/reject, got \"{}\"", action),
+            });
         }
     }
 }

@@ -1,5 +1,7 @@
 //! Context builder: converts session history into LLM messages.
 
+use crate::agent::prompt_guard::tagging::{self, ContentSource};
+use crate::agent::prompt_guard::TaggingConfig;
 use crate::agent::provider::{ContentBlock, LlmMessage, LlmRole};
 use crate::sessions::{ChatMessage, MessageRole};
 
@@ -12,6 +14,15 @@ use crate::sessions::{ChatMessage, MessageRole};
 pub fn build_context(
     history: &[ChatMessage],
     system_prompt: Option<&str>,
+) -> (Option<String>, Vec<LlmMessage>) {
+    build_context_with_tagging(history, system_prompt, &TaggingConfig { enabled: false })
+}
+
+/// Convert session chat history into LLM messages with untrusted content tagging.
+pub fn build_context_with_tagging(
+    history: &[ChatMessage],
+    system_prompt: Option<&str>,
+    tagging_config: &TaggingConfig,
 ) -> (Option<String>, Vec<LlmMessage>) {
     let mut system_parts: Vec<String> = Vec::new();
     let mut messages: Vec<LlmMessage> = Vec::new();
@@ -62,11 +73,14 @@ pub fn build_context(
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
 
+                let tagged_content =
+                    tagging::tag_content(&msg.content, ContentSource::ToolResult, tagging_config);
+
                 messages.push(LlmMessage {
                     role: LlmRole::User,
                     content: vec![ContentBlock::ToolResult {
                         tool_use_id,
-                        content: msg.content.clone(),
+                        content: tagged_content,
                         is_error,
                     }],
                 });

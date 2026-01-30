@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::agent::context::build_context;
+use crate::agent::context::{build_context, build_context_with_tagging};
+use crate::agent::prompt_guard::{postflight, preflight};
 use crate::agent::provider::*;
 use crate::agent::tools::{self, ToolCallResult};
 use crate::agent::{AgentConfig, AgentError};
@@ -315,7 +316,15 @@ fn build_turn_request(
     config: &AgentConfig,
     state: &Arc<WsServerState>,
 ) -> CompletionRequest {
-    let (system, messages) = build_context(history, config.system.as_deref());
+    let (system, messages) = if config.prompt_guard.enabled && config.prompt_guard.tagging.enabled {
+        build_context_with_tagging(
+            history,
+            config.system.as_deref(),
+            &config.prompt_guard.tagging,
+        )
+    } else {
+        build_context(history, config.system.as_deref())
+    };
 
     let tools = if let Some(tools_registry) = state.tools_registry() {
         let all_tools = tools::list_provider_tools(tools_registry);
@@ -459,6 +468,33 @@ async fn execute_single_turn(
         history.push(msg);
     }
 
+    // Post-flight filtering
+    let turn_text = if config.prompt_guard.enabled && config.prompt_guard.postflight.enabled {
+        let postflight_result =
+            postflight::filter_output(&turn_text, &config.prompt_guard.postflight);
+        if !postflight_result.is_clean() {
+            let finding_count = postflight_result.findings.len();
+            tracing::warn!(
+                run_id = %run_id,
+                findings = finding_count,
+                blocked = postflight_result.blocked,
+                "prompt guard post-flight detected sensitive content in output"
+            );
+            if postflight_result.blocked {
+                crate::logging::audit::audit(
+                    crate::logging::audit::AuditEvent::PromptGuardBlocked {
+                        layer: "postflight".to_string(),
+                        reason: format!("{finding_count} findings (output sanitized)"),
+                        run_id: run_id.to_string(),
+                    },
+                );
+            }
+        }
+        postflight_result.sanitized
+    } else {
+        turn_text
+    };
+
     accumulated_text.push_str(&turn_text);
     *final_stop_reason = stop_reason;
 
@@ -519,6 +555,37 @@ pub async fn execute_run(
         .session_store()
         .get_session_by_key(&session_key)
         .map_err(|e| AgentError::SessionNotFound(format!("{session_key}: {e}")))?;
+
+    // 2b. Pre-flight system prompt check
+    if config.prompt_guard.enabled && config.prompt_guard.preflight.enabled {
+        if let Some(ref system) = config.system {
+            let preflight_result =
+                preflight::analyze_system_prompt(system, &config.prompt_guard.preflight);
+            if preflight_result.has_critical() {
+                let reasons: Vec<String> = preflight_result
+                    .findings
+                    .iter()
+                    .map(|f| f.description.clone())
+                    .collect();
+                let reason = reasons.join("; ");
+                tracing::warn!(
+                    run_id = %run_id,
+                    findings = %reason,
+                    "prompt guard pre-flight blocked system prompt"
+                );
+                crate::logging::audit::audit(
+                    crate::logging::audit::AuditEvent::PromptGuardBlocked {
+                        layer: "preflight".to_string(),
+                        reason: reason.clone(),
+                        run_id: run_id.clone(),
+                    },
+                );
+                return Err(AgentError::Provider(format!(
+                    "Prompt guard pre-flight blocked: {reason}"
+                )));
+            }
+        }
+    }
 
     // 3. Main agentic loop
     let mut accumulated_text = String::new();
