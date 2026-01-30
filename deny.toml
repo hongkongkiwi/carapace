@@ -1,0 +1,113 @@
+# cargo-deny configuration for the carapace project
+# https://embarkstudios.github.io/cargo-deny/
+#
+# Run all checks:      cargo deny check
+# Run specific check:  cargo deny check advisories
+# List licenses:       cargo deny list
+
+[graph]
+# If empty, all targets are checked.
+targets = []
+# Exclude dev-only dependencies from license and ban checks.
+exclude-dev = true
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Advisory checks — RustSec advisory database
+# https://embarkstudios.github.io/cargo-deny/checks/advisories/cfg.html
+# ──────────────────────────────────────────────────────────────────────────────
+[advisories]
+# Scope for unmaintained advisory checks.
+# Valid values: "all", "workspace", "transitive", "none".
+# "none" = do not fail on unmaintained crates (informational only).
+# Change to "workspace" to fail if direct dependencies are unmaintained.
+unmaintained = "none"
+
+# Threshold for yanked crate detection.
+# "deny" = fail on yanked crates, "warn" = warn only.
+yanked = "deny"
+
+# Advisories to ignore (add RUSTSEC IDs with justification if needed).
+# wasmtime 18.0.4 has known advisories; upgrade to 24+ is tracked separately
+# as it requires significant API migration. WASM plugins run in a sandboxed
+# engine with limited capabilities, reducing practical impact.
+ignore = [
+    { id = "RUSTSEC-2024-0438", reason = "wasmtime 18→24+ upgrade tracked separately; Windows-only device filename issue" },
+    { id = "RUSTSEC-2025-0046", reason = "wasmtime 18→24+ upgrade tracked separately; fd_renumber panic in WASIp1" },
+    { id = "RUSTSEC-2025-0118", reason = "wasmtime 18→24+ upgrade tracked separately; shared linear memory unsoundness" },
+]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# License checks — allowlist of acceptable licenses
+# https://embarkstudios.github.io/cargo-deny/checks/licenses/cfg.html
+# ──────────────────────────────────────────────────────────────────────────────
+[licenses]
+# Confidence threshold for license file detection (0.0 to 1.0).
+confidence-threshold = 0.8
+
+# Licenses we consider acceptable for this project.
+# All licenses are denied unless explicitly listed here.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "CC0-1.0",
+    "Zlib",
+    "OpenSSL",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+]
+
+# Per-crate license exceptions for crates that need licenses not in the
+# global allow list. Use this sparingly — prefer adding to the allow list
+# unless the license should not be blanket-allowed.
+# [[licenses.exceptions]]
+# allow = ["LicenseRef-ring"]
+# name = "ring"
+
+# ring uses a non-standard license format that cargo-deny cannot detect via
+# SPDX expression alone. We add an explicit clarification for it.
+[[licenses.clarify]]
+name = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [
+    { path = "LICENSE", hash = 0xbd0eed23 },
+]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Dependency bans — block specific problematic crates
+# https://embarkstudios.github.io/cargo-deny/checks/bans/cfg.html
+# ──────────────────────────────────────────────────────────────────────────────
+[bans]
+# Warn when multiple versions of the same crate appear in the dependency tree.
+multiple-versions = "warn"
+# Deny wildcard version requirements (e.g., version = "*").
+wildcards = "deny"
+# Show all duplicate crate dependency trees when multiple versions are found.
+highlight = "all"
+# Allow wildcard versions for path/git deps in private crates.
+allow-wildcard-paths = true
+
+# Specific crates to deny (uncomment and add problematic crates as needed).
+# deny = [
+#     { crate = "openssl-sys", reason = "Use rustls instead of OpenSSL" },
+# ]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Source restrictions — only allow crates from crates.io
+# https://embarkstudios.github.io/cargo-deny/checks/sources/cfg.html
+# ──────────────────────────────────────────────────────────────────────────────
+[sources]
+# Deny crates from unknown registries (only crates.io is allowed by default).
+unknown-registry = "deny"
+# Deny crates from git repositories.
+unknown-git = "deny"
+# Only the default crates.io registry is allowed.
+# allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# No git sources allowed.
+allow-git = []

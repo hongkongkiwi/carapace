@@ -1,0 +1,39 @@
+[package]
+name = "carapace-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+
+[dependencies.carapace]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_ssrf_url_validation"
+path = "fuzz_targets/fuzz_ssrf_url_validation.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_secret_format_parsing"
+path = "fuzz_targets/fuzz_secret_format_parsing.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_redact_patterns"
+path = "fuzz_targets/fuzz_redact_patterns.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_jsonrpc_dispatch"
+path = "fuzz_targets/fuzz_jsonrpc_dispatch.rs"
+doc = false

@@ -8,3 +8,8 @@ GTM.md
 # AI Review System
 .review_state.yaml
 .review_history/
+
+# Fuzz testing artifacts
+fuzz/target
+fuzz/corpus
+fuzz/artifacts
