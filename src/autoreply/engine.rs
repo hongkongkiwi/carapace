@@ -172,7 +172,8 @@ impl AutoReplyEngine {
             // Try to match the trigger
             if let Some(variables) = self.match_trigger(&rule.trigger, ctx) {
                 // Generate response
-                if let Some(response_text) = self.generate_response(&rule.response, ctx, &variables) {
+                if let Some(response_text) = self.generate_response(&rule.response, ctx, &variables)
+                {
                     // Record cooldown
                     self.record_trigger(rule, &ctx.user_id);
 
@@ -302,14 +303,19 @@ impl AutoReplyEngine {
                 variables.insert("matched_text".to_string(), text.to_string());
                 Some(variables)
             }
-            TriggerType::Join => None, // Handled at channel level
+            TriggerType::Join => None,  // Handled at channel level
             TriggerType::Leave => None, // Handled at channel level
             TriggerType::Command(cmd) => {
                 let prefixes = ["/", "!"];
                 for prefix in &prefixes {
                     let full_cmd = format!("{}{}", prefix, cmd);
                     if text.to_lowercase().starts_with(&full_cmd.to_lowercase()) {
-                        let rest = text.chars().skip(full_cmd.len()).collect::<String>().trim().to_string();
+                        let rest = text
+                            .chars()
+                            .skip(full_cmd.len())
+                            .collect::<String>()
+                            .trim()
+                            .to_string();
                         variables.insert("command".to_string(), cmd.to_string());
                         variables.insert("args".to_string(), rest);
                         variables.insert("matched_text".to_string(), text.to_string());
@@ -412,10 +418,12 @@ impl AutoReplyEngine {
         let mut cooldowns = self.cooldowns.write();
         let user_cooldowns = cooldowns.entry(rule.id.clone()).or_default();
 
-        let entry = user_cooldowns.entry(user_id.to_string()).or_insert(CooldownEntry {
-            last_triggered: Instant::now(),
-            use_count: 0,
-        });
+        let entry = user_cooldowns
+            .entry(user_id.to_string())
+            .or_insert(CooldownEntry {
+                last_triggered: Instant::now(),
+                use_count: 0,
+            });
 
         entry.last_triggered = Instant::now();
         entry.use_count += 1;
@@ -460,10 +468,7 @@ impl AutoReplyEngine {
             .map(|m| m.values().map(|e| e.use_count).sum())
             .unwrap_or(0);
 
-        let recent_matches = log
-            .iter()
-            .filter(|e| e.rule_id == rule_id)
-            .count();
+        let recent_matches = log.iter().filter(|e| e.rule_id == rule_id).count();
 
         RuleStats {
             trigger_count,
@@ -540,8 +545,7 @@ mod tests {
     #[test]
     fn test_contains_match() {
         let engine = create_test_engine();
-        let ctx = MatchContext::new("telegram", "user1", "well hello there")
-            .with_username("Alice");
+        let ctx = MatchContext::new("telegram", "user1", "well hello there").with_username("Alice");
 
         let results = engine.process_message(&ctx);
         assert_eq!(results.len(), 1);

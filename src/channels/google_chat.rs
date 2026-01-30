@@ -101,7 +101,10 @@ impl GoogleChatChannel {
                 method.parse().expect("Invalid HTTP method"),
                 self.api_url(path),
             )
-            .header("Authorization", format!("Bearer {}", self.config.access_token))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.config.access_token),
+            )
             .header("Content-Type", "application/json; charset=UTF-8");
 
         if let Some(body) = body {
@@ -128,8 +131,7 @@ impl GoogleChatChannel {
             return Err(GoogleChatError::Api(error.to_string()));
         }
 
-        serde_json::from_value(json)
-            .map_err(|e| GoogleChatError::Parse(e.to_string()))
+        serde_json::from_value(json).map_err(|e| GoogleChatError::Parse(e.to_string()))
     }
 
     /// Send a simple text message
@@ -148,7 +150,9 @@ impl GoogleChatChannel {
     /// Send a message to the default space
     pub async fn send_default(&self, text: &str) -> Result<String, GoogleChatError> {
         if self.config.default_space.is_empty() {
-            return Err(GoogleChatError::Space("No default space configured".to_string()));
+            return Err(GoogleChatError::Space(
+                "No default space configured".to_string(),
+            ));
         }
         self.send_message(&self.config.default_space, text).await
     }
@@ -174,24 +178,26 @@ impl GoogleChatChannel {
     }
 
     /// Create a new space
-    pub async fn create_space(&self, name: &str, space_type: &str) -> Result<String, GoogleChatError> {
+    pub async fn create_space(
+        &self,
+        name: &str,
+        space_type: &str,
+    ) -> Result<String, GoogleChatError> {
         let body = serde_json::json!({
             "displayName": name,
             "spaceType": space_type, // "SPACE" or "GROUP_CHAT" or "DIRECT_MESSAGE"
         });
 
-        let response: GoogleChatSpaceResponse = self
-            .api_request("POST", "/spaces", Some(body))
-            .await?;
+        let response: GoogleChatSpaceResponse =
+            self.api_request("POST", "/spaces", Some(body)).await?;
 
         Ok(response.name)
     }
 
     /// List all spaces the bot is in
     pub async fn list_spaces(&self) -> Result<Vec<GoogleChatSpace>, GoogleChatError> {
-        let response: GoogleChatSpacesListResponse = self
-            .api_request("GET", "/spaces", None)
-            .await?;
+        let response: GoogleChatSpacesListResponse =
+            self.api_request("GET", "/spaces", None).await?;
 
         Ok(response.spaces)
     }
@@ -203,7 +209,10 @@ impl GoogleChatChannel {
     }
 
     /// List members in a space
-    pub async fn list_members(&self, space: &str) -> Result<Vec<GoogleChatMember>, GoogleChatError> {
+    pub async fn list_members(
+        &self,
+        space: &str,
+    ) -> Result<Vec<GoogleChatMember>, GoogleChatError> {
         let response: GoogleChatMembersListResponse = self
             .api_request("GET", &format!("/spaces/{}/members", space), None)
             .await?;
@@ -230,15 +239,15 @@ impl GoogleChatChannel {
 
 #[derive(Debug, Deserialize)]
 struct GoogleChatMessageResponse {
-    pub name: String,          // Format: spaces/{space}/messages/{message}
+    pub name: String, // Format: spaces/{space}/messages/{message}
     pub thread: Option<String>,
     pub create_time: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct GoogleChatSpaceResponse {
-    pub name: String,          // Format: spaces/{space}
-    pub r#type: String,        // "SPACE", "GROUP_CHAT", "DIRECT_MESSAGE"
+    pub name: String,   // Format: spaces/{space}
+    pub r#type: String, // "SPACE", "GROUP_CHAT", "DIRECT_MESSAGE"
     pub display_name: String,
 }
 
@@ -271,21 +280,11 @@ pub struct GoogleChatMember {
 }
 
 /// Google Chat Card for rich UI
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GoogleChatCard {
     pub header: Option<GoogleChatCardHeader>,
     pub sections: Vec<GoogleChatCardSection>,
     pub actions: Vec<GoogleChatCardAction>,
-}
-
-impl Default for GoogleChatCard {
-    fn default() -> Self {
-        Self {
-            header: None,
-            sections: Vec::new(),
-            actions: Vec::new(),
-        }
-    }
 }
 
 impl GoogleChatCard {
@@ -320,12 +319,16 @@ impl GoogleChatCard {
         }
 
         if !self.sections.is_empty() {
-            json["sections"] = serde_json::json!(self.sections.iter().map(|s| {
-                serde_json::json!({
-                    "header": s.header.clone().unwrap_or_default(),
-                    "widgets": s.widgets.iter().map(|w| w.to_json()).collect::<Vec<_>>(),
+            json["sections"] = serde_json::json!(self
+                .sections
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "header": s.header.clone().unwrap_or_default(),
+                        "widgets": s.widgets.iter().map(|w| w.to_json()).collect::<Vec<_>>(),
+                    })
                 })
-            }).collect::<Vec<_>>());
+                .collect::<Vec<_>>());
         }
 
         json
@@ -375,7 +378,10 @@ pub enum GoogleChatWidget {
     #[serde(rename = "textParagraph")]
     TextParagraph { text: String },
     #[serde(rename = "image")]
-    Image { image_url: String, on_click: Option<GoogleChatOnClick> },
+    Image {
+        image_url: String,
+        on_click: Option<GoogleChatOnClick>,
+    },
     #[serde(rename = "keyValue")]
     KeyValue {
         top_label: Option<String>,
@@ -401,7 +407,10 @@ impl GoogleChatWidget {
             GoogleChatWidget::TextParagraph { text } => {
                 serde_json::json!({ "textParagraph": { "text": text } })
             }
-            GoogleChatWidget::Image { image_url, on_click } => {
+            GoogleChatWidget::Image {
+                image_url,
+                on_click,
+            } => {
                 serde_json::json!({
                     "image": {
                         "imageUrl": image_url,
@@ -436,7 +445,12 @@ impl GoogleChatWidget {
                     }
                 })
             }
-            GoogleChatWidget::DecoratedText { text, start_icon, end_icon, button } => {
+            GoogleChatWidget::DecoratedText {
+                text,
+                start_icon,
+                end_icon,
+                button,
+            } => {
                 serde_json::json!({
                     "decoratedText": {
                         "text": text,

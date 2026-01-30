@@ -34,16 +34,28 @@ bytes = "1"
 getrandom = "0.2"
 hex = "0.4"
 sha2 = "0.10"
+hmac = "0.12"
+aes-gcm = "0.10"
 serde_yaml = "0.9"
 glob = "0.3"
 tempfile = "3"
-quickjs-wasm-sys = "1.2"
+quickjs-wasm-sys = { version = "1.2", optional = true }
+lazy_static = "1"
+rand = "0.8"
 
 # Database drivers
 postgres = "0.19"
 redis = "0.25"
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio"] }
 
 clap = { version = "4", features = ["derive"] }
+
+# TLS support
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = "0.26"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls-pemfile = "2"
+rcgen = "0.13"
 
 # Leptos web framework
 leptos = "0.8"
@@ -67,6 +79,8 @@ tower = { version = "0.5", features = ["util"] }
 keychain-tests = []
 secret-service-tests = []
 macos = []
+# Enable TypeScript/JavaScript plugin support (requires wasi-sdk)
+typescript = ["dep:quickjs-wasm-sys"]
 
 [lib]
 name = "carapace"

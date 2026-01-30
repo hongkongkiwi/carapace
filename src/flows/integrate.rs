@@ -218,7 +218,12 @@ impl FlowIntegration {
                     FlowEvent::Schedule { cron, timestamp } => {
                         debug!("Schedule event: {} at {:?}", cron, timestamp);
                     }
-                    FlowEvent::Webhook { path, method, body: _, headers: _ } => {
+                    FlowEvent::Webhook {
+                        path,
+                        method,
+                        body: _,
+                        headers: _,
+                    } => {
                         debug!("Webhook event: {} {}", method, path);
                     }
                     FlowEvent::UserJoin { channel, user } => {
@@ -228,10 +233,18 @@ impl FlowIntegration {
                         debug!("User leave event: {} left {}", user, channel);
                     }
                     FlowEvent::Custom { event_type, data } => {
-                        debug!("Custom event: {} with {} data points", event_type, data.len());
+                        debug!(
+                            "Custom event: {} with {} data points",
+                            event_type,
+                            data.len()
+                        );
                     }
                     FlowEvent::Manual { flow_id, data } => {
-                        debug!("Manual trigger: {} with {} data points", flow_id, data.len());
+                        debug!(
+                            "Manual trigger: {} with {} data points",
+                            flow_id,
+                            data.len()
+                        );
                     }
                 }
             }

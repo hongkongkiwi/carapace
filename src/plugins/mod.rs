@@ -38,10 +38,12 @@ pub mod bindings;
 pub mod capabilities;
 pub mod dispatch;
 pub mod host;
+pub mod hotreload;
 pub mod loader;
 pub mod runtime;
-pub mod typescript;
 pub mod tools;
+#[cfg(feature = "typescript")]
+pub mod typescript;
 
 pub mod caps;
 

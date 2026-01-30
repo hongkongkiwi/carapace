@@ -9,6 +9,7 @@ pub mod headers;
 pub mod http;
 pub mod openai;
 pub mod ratelimit;
+pub mod tls;
 pub mod ws;
 
 // Re-export key types

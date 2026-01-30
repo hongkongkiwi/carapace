@@ -114,7 +114,10 @@ impl MatrixChannel {
                 method.parse().expect("Invalid HTTP method"),
                 self.api_url(path),
             )
-            .header("Authorization", format!("Bearer {}", self.config.access_token))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.config.access_token),
+            )
             .header("Content-Type", "application/json");
 
         if let Some(body) = body {
@@ -132,7 +135,10 @@ impl MatrixChannel {
             .map_err(|e| MatrixError::Parse(e.to_string()))?;
 
         if let Some(err_code) = json.get("errcode").and_then(|v| v.as_str()) {
-            let msg = json.get("error").and_then(|v| v.as_str()).unwrap_or("Unknown error");
+            let msg = json
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown error");
             return Err(match err_code {
                 "M_FORBIDDEN" => MatrixError::Auth(msg.to_string()),
                 "M_UNKNOWN" | "M_NOT_FOUND" => MatrixError::Room(msg.to_string()),
@@ -140,23 +146,22 @@ impl MatrixChannel {
             });
         }
 
-        serde_json::from_value(json)
-            .map_err(|e| MatrixError::Parse(e.to_string()))
+        serde_json::from_value(json).map_err(|e| MatrixError::Parse(e.to_string()))
     }
 
     /// Send a text message to a room
-    pub async fn send_message(
-        &self,
-        room_id: &str,
-        text: &str,
-    ) -> Result<String, MatrixError> {
+    pub async fn send_message(&self, room_id: &str, text: &str) -> Result<String, MatrixError> {
         let body = serde_json::json!({
             "msgtype": "m.text",
             "body": text,
         });
 
         let response: MatrixSendResponse = self
-            .api_request("POST", &format!("/rooms/{}/send/m.room.message", room_id), Some(body))
+            .api_request(
+                "POST",
+                &format!("/rooms/{}/send/m.room.message", room_id),
+                Some(body),
+            )
             .await?;
 
         Ok(response.event_id)
@@ -185,7 +190,11 @@ impl MatrixChannel {
         });
 
         let response: MatrixSendResponse = self
-            .api_request("POST", &format!("/rooms/{}/send/m.room.message", room_id), Some(body))
+            .api_request(
+                "POST",
+                &format!("/rooms/{}/send/m.room.message", room_id),
+                Some(body),
+            )
             .await?;
 
         Ok(response.event_id)
@@ -216,27 +225,21 @@ impl MatrixChannel {
     }
 
     /// Create a new room
-    pub async fn create_room(
-        &self,
-        name: &str,
-        is_private: bool,
-    ) -> Result<String, MatrixError> {
+    pub async fn create_room(&self, name: &str, is_private: bool) -> Result<String, MatrixError> {
         let body = serde_json::json!({
             "name": name,
             "visibility": if is_private { "private" } else { "public" },
         });
 
-        let response: MatrixRoomResponse = self
-            .api_request("POST", "/createRoom", Some(body))
-            .await?;
+        let response: MatrixRoomResponse =
+            self.api_request("POST", "/createRoom", Some(body)).await?;
 
         Ok(response.room_id)
     }
 
     /// Get user info
     pub async fn get_user_info(&self) -> Result<MatrixUser, MatrixError> {
-        self.api_request("GET", "/account/whoami", None)
-            .await
+        self.api_request("GET", "/account/whoami", None).await
     }
 
     /// Connect to Matrix

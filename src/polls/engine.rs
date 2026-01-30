@@ -2,9 +2,7 @@
 //!
 //! Handles poll creation, voting, and result calculation.
 
-use super::config::{
-    PollConfig, PollFilter, PollResults, PollType, PollVisibility, PollVote,
-};
+use super::config::{PollConfig, PollFilter, PollResults, PollType, PollVisibility, PollVote};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -63,7 +61,11 @@ impl PollEngine {
     }
 
     /// Update a poll
-    pub fn update_poll(&self, poll_id: &str, updater: impl FnOnce(&mut PollConfig)) -> Result<PollConfig, String> {
+    pub fn update_poll(
+        &self,
+        poll_id: &str,
+        updater: impl FnOnce(&mut PollConfig),
+    ) -> Result<PollConfig, String> {
         let mut polls = self.polls.write();
         if let Some(poll) = polls.get_mut(poll_id) {
             updater(poll);
@@ -135,11 +137,7 @@ impl PollEngine {
                 results.len()
             };
 
-            results = results
-                .into_iter()
-                .skip(offset)
-                .take(limit)
-                .collect();
+            results = results.into_iter().skip(offset).take(limit).collect();
         }
 
         // Sort by creation date (newest first)
@@ -193,10 +191,7 @@ impl PollEngine {
     }
 
     /// Validate a vote against poll configuration
-    fn validate_vote(&self,
-        poll: &PollConfig,
-        vote: &PollVote,
-    ) -> Result<(), String> {
+    fn validate_vote(&self, poll: &PollConfig, vote: &PollVote) -> Result<(), String> {
         match poll.poll_type {
             super::config::PollType::SingleChoice => {
                 if vote.selected_options.len() != 1 {
@@ -247,13 +242,8 @@ impl PollEngine {
     }
 
     /// Validate that selected options exist in the poll
-    fn validate_options_exist(
-        &self,
-        poll: &PollConfig,
-        options: &[String],
-    ) -> Result<(), String> {
-        let valid_ids: std::collections::HashSet<_> =
-            poll.options.iter().map(|o| &o.id).collect();
+    fn validate_options_exist(&self, poll: &PollConfig, options: &[String]) -> Result<(), String> {
+        let valid_ids: std::collections::HashSet<_> = poll.options.iter().map(|o| &o.id).collect();
         for option_id in options {
             if !valid_ids.contains(option_id) {
                 return Err(format!("Invalid option ID: {}", option_id));
@@ -450,7 +440,10 @@ impl PollEngine {
         let votes = self.votes.read();
 
         let total_polls = polls.len();
-        let active_polls = polls.values().filter(|p| p.is_active && !p.is_closed).count();
+        let active_polls = polls
+            .values()
+            .filter(|p| p.is_active && !p.is_closed)
+            .count();
         let closed_polls = polls.values().filter(|p| p.is_closed).count();
         let total_votes: usize = votes.values().map(|v| v.len()).sum();
 
@@ -572,11 +565,21 @@ mod tests {
         engine.create_poll(poll).unwrap();
 
         // Valid vote with 2 selections
-        let vote = PollVote::new_choice("vote1", "poll1", "user1", vec!["red".to_string(), "blue".to_string()]);
+        let vote = PollVote::new_choice(
+            "vote1",
+            "poll1",
+            "user1",
+            vec!["red".to_string(), "blue".to_string()],
+        );
         assert!(engine.cast_vote(vote).is_ok());
 
         // Too many selections should fail
-        let vote2 = PollVote::new_choice("vote2", "poll1", "user2", vec!["red".to_string(), "blue".to_string(), "green".to_string()]);
+        let vote2 = PollVote::new_choice(
+            "vote2",
+            "poll1",
+            "user2",
+            vec!["red".to_string(), "blue".to_string(), "green".to_string()],
+        );
         assert!(engine.cast_vote(vote2).is_err());
     }
 
@@ -628,9 +631,30 @@ mod tests {
         engine.create_poll(poll).unwrap();
 
         // Cast some votes
-        engine.cast_vote(PollVote::new_choice("v1", "poll1", "user1", vec!["red".to_string()])).unwrap();
-        engine.cast_vote(PollVote::new_choice("v2", "poll1", "user2", vec!["red".to_string()])).unwrap();
-        engine.cast_vote(PollVote::new_choice("v3", "poll1", "user3", vec!["blue".to_string()])).unwrap();
+        engine
+            .cast_vote(PollVote::new_choice(
+                "v1",
+                "poll1",
+                "user1",
+                vec!["red".to_string()],
+            ))
+            .unwrap();
+        engine
+            .cast_vote(PollVote::new_choice(
+                "v2",
+                "poll1",
+                "user2",
+                vec!["red".to_string()],
+            ))
+            .unwrap();
+        engine
+            .cast_vote(PollVote::new_choice(
+                "v3",
+                "poll1",
+                "user3",
+                vec!["blue".to_string()],
+            ))
+            .unwrap();
 
         let results = engine.get_results("poll1").unwrap();
         assert_eq!(results.total_votes, 3);
@@ -647,9 +671,15 @@ mod tests {
             .with_rating_range(1, 5);
         engine.create_poll(poll).unwrap();
 
-        engine.cast_vote(PollVote::new_rating("v1", "poll1", "user1", 5)).unwrap();
-        engine.cast_vote(PollVote::new_rating("v2", "poll1", "user2", 3)).unwrap();
-        engine.cast_vote(PollVote::new_rating("v3", "poll1", "user3", 4)).unwrap();
+        engine
+            .cast_vote(PollVote::new_rating("v1", "poll1", "user1", 5))
+            .unwrap();
+        engine
+            .cast_vote(PollVote::new_rating("v2", "poll1", "user2", 3))
+            .unwrap();
+        engine
+            .cast_vote(PollVote::new_rating("v3", "poll1", "user3", 4))
+            .unwrap();
 
         let results = engine.get_results("poll1").unwrap();
         assert_eq!(results.total_votes, 3);
@@ -665,7 +695,14 @@ mod tests {
 
         assert!(!engine.has_voted("poll1", "user1"));
 
-        engine.cast_vote(PollVote::new_choice("v1", "poll1", "user1", vec!["red".to_string()])).unwrap();
+        engine
+            .cast_vote(PollVote::new_choice(
+                "v1",
+                "poll1",
+                "user1",
+                vec!["red".to_string()],
+            ))
+            .unwrap();
 
         assert!(engine.has_voted("poll1", "user1"));
         assert!(!engine.has_voted("poll1", "user2"));
@@ -677,7 +714,14 @@ mod tests {
         let poll = create_test_poll();
         engine.create_poll(poll).unwrap();
 
-        engine.cast_vote(PollVote::new_choice("v1", "poll1", "user1", vec!["red".to_string()])).unwrap();
+        engine
+            .cast_vote(PollVote::new_choice(
+                "v1",
+                "poll1",
+                "user1",
+                vec!["red".to_string()],
+            ))
+            .unwrap();
 
         let vote = engine.get_user_vote("poll1", "user1");
         assert!(vote.is_some());
@@ -690,7 +734,14 @@ mod tests {
         let poll = create_test_poll().allow_change_vote(true);
         engine.create_poll(poll).unwrap();
 
-        engine.cast_vote(PollVote::new_choice("v1", "poll1", "user1", vec!["red".to_string()])).unwrap();
+        engine
+            .cast_vote(PollVote::new_choice(
+                "v1",
+                "poll1",
+                "user1",
+                vec!["red".to_string()],
+            ))
+            .unwrap();
         assert!(engine.has_voted("poll1", "user1"));
 
         assert!(engine.revoke_vote("poll1", "user1").unwrap());
@@ -703,7 +754,14 @@ mod tests {
         let poll = create_test_poll(); // allow_change_vote = false
         engine.create_poll(poll).unwrap();
 
-        engine.cast_vote(PollVote::new_choice("v1", "poll1", "user1", vec!["red".to_string()])).unwrap();
+        engine
+            .cast_vote(PollVote::new_choice(
+                "v1",
+                "poll1",
+                "user1",
+                vec!["red".to_string()],
+            ))
+            .unwrap();
 
         let result = engine.revoke_vote("poll1", "user1");
         assert!(result.is_err());
@@ -713,12 +771,24 @@ mod tests {
     fn test_list_polls_with_filter() {
         let engine = PollEngine::new();
 
-        engine.create_poll(PollConfig::new("p1", "Poll 1", "telegram", "user1")
-            .with_options(vec![PollOption::new("a", "A"), PollOption::new("b", "B")])).unwrap();
-        engine.create_poll(PollConfig::new("p2", "Poll 2", "discord", "user1")
-            .with_options(vec![PollOption::new("a", "A"), PollOption::new("b", "B")])).unwrap();
-        engine.create_poll(PollConfig::new("p3", "Poll 3", "telegram", "user2")
-            .with_options(vec![PollOption::new("a", "A"), PollOption::new("b", "B")])).unwrap();
+        engine
+            .create_poll(
+                PollConfig::new("p1", "Poll 1", "telegram", "user1")
+                    .with_options(vec![PollOption::new("a", "A"), PollOption::new("b", "B")]),
+            )
+            .unwrap();
+        engine
+            .create_poll(
+                PollConfig::new("p2", "Poll 2", "discord", "user1")
+                    .with_options(vec![PollOption::new("a", "A"), PollOption::new("b", "B")]),
+            )
+            .unwrap();
+        engine
+            .create_poll(
+                PollConfig::new("p3", "Poll 3", "telegram", "user2")
+                    .with_options(vec![PollOption::new("a", "A"), PollOption::new("b", "B")]),
+            )
+            .unwrap();
 
         // Filter by channel
         let filter = PollFilter::new().in_channel("telegram");
@@ -735,8 +805,7 @@ mod tests {
     #[test]
     fn test_private_visibility() {
         let engine = PollEngine::new();
-        let poll = create_test_poll()
-            .with_visibility(PollVisibility::Private);
+        let poll = create_test_poll().with_visibility(PollVisibility::Private);
         engine.create_poll(poll).unwrap();
 
         // Creator can see results
@@ -749,11 +818,17 @@ mod tests {
     #[test]
     fn test_hidden_visibility() {
         let engine = PollEngine::new();
-        let poll = create_test_poll()
-            .with_visibility(PollVisibility::Hidden);
+        let poll = create_test_poll().with_visibility(PollVisibility::Hidden);
         engine.create_poll(poll).unwrap();
 
-        engine.cast_vote(PollVote::new_choice("v1", "poll1", "user1", vec!["red".to_string()])).unwrap();
+        engine
+            .cast_vote(PollVote::new_choice(
+                "v1",
+                "poll1",
+                "user1",
+                vec!["red".to_string()],
+            ))
+            .unwrap();
 
         // Cannot see results while poll is open
         assert!(engine.get_results_visible("poll1", "user1").is_none());
@@ -812,15 +887,26 @@ mod tests {
 
         // Create polls
         engine.create_poll(create_test_poll()).unwrap();
-        engine.create_poll(PollConfig::new("p2", "Poll 2", "telegram", "user1")
-            .with_options(vec![PollOption::new("a", "A"), PollOption::new("b", "B")])).unwrap();
+        engine
+            .create_poll(
+                PollConfig::new("p2", "Poll 2", "telegram", "user1")
+                    .with_options(vec![PollOption::new("a", "A"), PollOption::new("b", "B")]),
+            )
+            .unwrap();
 
         let stats = engine.get_stats();
         assert_eq!(stats.total_polls, 2);
         assert_eq!(stats.active_polls, 2);
 
         // Add votes
-        engine.cast_vote(PollVote::new_choice("v1", "poll1", "user1", vec!["red".to_string()])).unwrap();
+        engine
+            .cast_vote(PollVote::new_choice(
+                "v1",
+                "poll1",
+                "user1",
+                vec!["red".to_string()],
+            ))
+            .unwrap();
 
         let stats = engine.get_stats();
         assert_eq!(stats.total_votes, 1);

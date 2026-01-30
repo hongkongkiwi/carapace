@@ -2,7 +2,7 @@
 //!
 //! Text-to-speech provider implementations.
 
-use super::{TtsConfig, TtsError, TtsProvider, TtsMode, Result};
+use super::{Result, TtsConfig, TtsError, TtsMode, TtsProvider};
 use async_trait::async_trait;
 
 /// TTS provider trait
@@ -120,7 +120,8 @@ impl OpenAiTtsProvider {
 #[async_trait]
 impl TtsProviderTrait for OpenAiTtsProvider {
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>> {
-        let response = self.client
+        let response = self
+            .client
             .post("https://api.openai.com/v1/audio/speech")
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&serde_json::json!({
@@ -133,7 +134,10 @@ impl TtsProviderTrait for OpenAiTtsProvider {
 
         if !response.status().is_success() {
             let error = response.text().await.unwrap_or_default();
-            return Err(TtsError::ProviderError(format!("OpenAI TTS error: {}", error)));
+            return Err(TtsError::ProviderError(format!(
+                "OpenAI TTS error: {}",
+                error
+            )));
         }
 
         let bytes = response.bytes().await?;
@@ -204,7 +208,9 @@ impl TtsManager {
         let provider: Box<dyn TtsProviderTrait> = match config.provider {
             TtsProvider::Edge => Box::new(EdgeTtsProvider::new()),
             TtsProvider::OpenAi => {
-                let api_key = config.openai_api_key.clone()
+                let api_key = config
+                    .openai_api_key
+                    .clone()
                     .ok_or_else(|| TtsError::ConfigError("OpenAI API key required".to_string()))?;
                 Box::new(OpenAiTtsProvider::new(api_key))
             }

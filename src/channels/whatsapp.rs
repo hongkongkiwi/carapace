@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 /// WhatsApp channel configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WhatsAppConfig {
     /// Twilio Account SID
     pub account_sid: String,
@@ -21,18 +21,6 @@ pub struct WhatsAppConfig {
     pub webhook_url: Option<String>,
     /// Media URL base (for media messages)
     pub media_base_url: Option<String>,
-}
-
-impl Default for WhatsAppConfig {
-    fn default() -> Self {
-        Self {
-            account_sid: String::new(),
-            auth_token: String::new(),
-            from_number: String::new(),
-            webhook_url: None,
-            media_base_url: None,
-        }
-    }
 }
 
 /// WhatsApp channel error
@@ -63,11 +51,20 @@ impl WhatsAppChannel {
             .build()
             .expect("Failed to build reqwest client");
 
-        Self { config, client, event_tx }
+        Self {
+            config,
+            client,
+            event_tx,
+        }
     }
 
     /// Send a WhatsApp message via Twilio
-    pub async fn send_message(&self, to: &str, body: &str, media_url: Option<&str>) -> Result<String, WhatsAppError> {
+    pub async fn send_message(
+        &self,
+        to: &str,
+        body: &str,
+        media_url: Option<&str>,
+    ) -> Result<String, WhatsAppError> {
         let to_value = format!("whatsapp:{}", to);
         let from_value = self.config.from_number.clone();
         let body_value = body.to_string();
@@ -84,7 +81,10 @@ impl WhatsAppChannel {
 
         let response = self
             .client
-            .post(format!("https://api.twilio.com/2010-04-01/Accounts/{}/Messages.json", self.config.account_sid))
+            .post(format!(
+                "https://api.twilio.com/2010-04-01/Accounts/{}/Messages.json",
+                self.config.account_sid
+            ))
             .basic_auth(&self.config.account_sid, Some(&self.config.auth_token))
             .multipart(form)
             .send()
@@ -92,11 +92,17 @@ impl WhatsAppChannel {
             .map_err(|e| WhatsAppError::Network(e.to_string()))?;
 
         if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(WhatsAppError::Api(error_text));
         }
 
-        let json: serde_json::Value = response.json().await.map_err(|e| WhatsAppError::Parse(e.to_string()))?;
+        let json: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| WhatsAppError::Parse(e.to_string()))?;
         json.get("sid")
             .and_then(|s| s.as_str())
             .map(|s| s.to_string())
@@ -110,14 +116,19 @@ impl WhatsAppChannel {
         // Verify credentials by making a test request
         let response = self
             .client
-            .get(format!("https://api.twilio.com/2010-04-01/Accounts/{}.json", self.config.account_sid))
+            .get(format!(
+                "https://api.twilio.com/2010-04-01/Accounts/{}.json",
+                self.config.account_sid
+            ))
             .basic_auth(&self.config.account_sid, Some(&self.config.auth_token))
             .send()
             .await
             .map_err(|e| WhatsAppError::Network(e.to_string()))?;
 
         if !response.status().is_success() {
-            return Err(WhatsAppError::Authentication("Invalid Twilio credentials".to_string()));
+            return Err(WhatsAppError::Authentication(
+                "Invalid Twilio credentials".to_string(),
+            ));
         }
 
         info!("WhatsApp connected successfully");

@@ -6,7 +6,5 @@
 pub mod config;
 pub mod engine;
 
-pub use config::{
-    ActionType, AutoReplyConfig, AutoReplyRule, ResponseType, TriggerType,
-};
+pub use config::{ActionType, AutoReplyConfig, AutoReplyRule, ResponseType, TriggerType};
 pub use engine::{create_engine, AutoReplyEngine, MatchContext, MatchResult, RuleStats};

@@ -182,11 +182,7 @@ impl VoiceChannel {
     }
 
     /// Make a call and play TTS message
-    pub async fn call_and_play(
-        &mut self,
-        to: &str,
-        _message: &str,
-    ) -> Result<String, VoiceError> {
+    pub async fn call_and_play(&mut self, to: &str, _message: &str) -> Result<String, VoiceError> {
         self.make_call(to, None, None).await
     }
 
@@ -202,11 +198,7 @@ impl VoiceChannel {
     }
 
     /// Send DTMF tones to a call
-    pub async fn send_dtmf(
-        &mut self,
-        call_id: &str,
-        tones: &[DtmfTone],
-    ) -> Result<(), VoiceError> {
+    pub async fn send_dtmf(&mut self, call_id: &str, tones: &[DtmfTone]) -> Result<(), VoiceError> {
         let tones_str: String = tones.iter().map(|t| t.as_str()).collect();
         debug!("Sending DTMF to {}: {}", call_id, tones_str);
         Ok(())
@@ -264,7 +256,12 @@ impl VoiceChannel {
 /// Voice provider trait for abstraction
 #[async_trait::async_trait]
 pub trait VoiceProvider {
-    async fn make_call(&self, to: &str, from: &str, twiml: Option<&str>) -> Result<String, VoiceError>;
+    async fn make_call(
+        &self,
+        to: &str,
+        from: &str,
+        twiml: Option<&str>,
+    ) -> Result<String, VoiceError>;
     async fn end_call(&self, call_id: &str) -> Result<(), VoiceError>;
     async fn send_dtmf(&self, call_id: &str, tones: &[DtmfTone]) -> Result<(), VoiceError>;
     async fn get_call_status(&self, call_id: &str) -> Result<VoiceCallStatus, VoiceError>;

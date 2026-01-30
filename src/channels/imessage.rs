@@ -69,10 +69,7 @@ impl ImessageChannel {
     /// Check if iMessage is available on this system
     pub fn is_available() -> bool {
         // Check if we can run AppleScript
-        let output = Command::new("osascript")
-            .arg("-e")
-            .arg("return 1")
-            .output();
+        let output = Command::new("osascript").arg("-e").arg("return 1").output();
 
         match output {
             Ok(output) => output.status.success(),
@@ -96,16 +93,21 @@ impl ImessageChannel {
             recipient, sanitized_text
         );
 
-        let _ = self.run_applescript(&script).map_err(|e| ImessageError::Send(e.to_string()))?;
+        let _ = self
+            .run_applescript(&script)
+            .map_err(|e| ImessageError::Send(e.to_string()))?;
         Ok(())
     }
 
     /// Send a message to the default recipient
     pub async fn send_default(&self, text: &str) -> Result<(), ImessageError> {
         if self.config.default_recipient.is_empty() {
-            return Err(ImessageError::Send("No default recipient configured".to_string()));
+            return Err(ImessageError::Send(
+                "No default recipient configured".to_string(),
+            ));
         }
-        self.send_message(&self.config.default_recipient, text).await
+        self.send_message(&self.config.default_recipient, text)
+            .await
     }
 
     /// Send an SMS message (to phone number)
@@ -124,7 +126,9 @@ impl ImessageChannel {
             phone, sanitized_text
         );
 
-        let _ = self.run_applescript(&script).map_err(|e| ImessageError::Send(e.to_string()))?;
+        let _ = self
+            .run_applescript(&script)
+            .map_err(|e| ImessageError::Send(e.to_string()))?;
         Ok(())
     }
 

@@ -46,6 +46,6 @@ pub mod config;
 pub mod engine;
 pub mod integrate;
 
-pub use config::{Action, Condition, Flow, FlowConfig, FlowCondition, FlowTrigger, TriggerType};
+pub use config::{Action, Condition, Flow, FlowCondition, FlowConfig, FlowTrigger, TriggerType};
 pub use engine::{create_engine, FlowEngine, FlowResult};
 pub use integrate::{create_flow_integration, FlowIntegration, FlowIntegrationError, FlowStats};

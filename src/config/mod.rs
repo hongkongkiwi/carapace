@@ -147,6 +147,28 @@ pub fn load_config_uncached(path: &Path) -> Result<Value, ConfigError> {
 
     let mut value = parse_json5(&content, path)?;
 
+    // Check if config contains encrypted values and decrypt them
+    if encryption::has_encrypted_values(&value) {
+        tracing::debug!("Config contains encrypted values, decrypting...");
+        match encryption::get_or_create_master_key() {
+            Ok(master_key) => {
+                match encryption::decrypt_config(&value, &master_key) {
+                    Ok(decrypted) => {
+                        value = decrypted;
+                        tracing::debug!("Config decrypted successfully");
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to decrypt config: {}", e);
+                        // Return the encrypted config as-is, the user will need to fix this
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to get master key for decryption: {}", e);
+            }
+        }
+    }
+
     // Resolve $include directives
     let mut visited = HashSet::new();
     visited.insert(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
@@ -378,6 +400,131 @@ pub fn clear_cache() {
     *cache = None;
 }
 
+/// Get a string config value by dot-separated key path.
+/// Returns None if the key doesn't exist or has wrong type.
+pub fn get_string(config: &serde_json::Value, key: &str) -> Option<String> {
+    let keys: Vec<&str> = key.split('.').collect();
+    let mut value = config;
+
+    for (i, k) in keys.iter().enumerate() {
+        match value {
+            serde_json::Value::Object(obj) => {
+                if let Some(v) = obj.get(*k) {
+                    value = v;
+                } else {
+                    return None;
+                }
+            }
+            _ => {
+                if i == keys.len() - 1 {
+                    // Last key - try to convert
+                    if let Some(s) = value.as_str() {
+                        return Some(s.to_string());
+                    }
+                }
+                return None;
+            }
+        }
+    }
+
+    value.as_str().map(|s| s.to_string())
+}
+
+/// Get a boolean config value by dot-separated key path.
+/// Returns None if the key doesn't exist or has wrong type.
+pub fn get_bool(config: &serde_json::Value, key: &str) -> Option<bool> {
+    let keys: Vec<&str> = key.split('.').collect();
+    let mut value = config;
+
+    for (i, k) in keys.iter().enumerate() {
+        match value {
+            serde_json::Value::Object(obj) => {
+                if let Some(v) = obj.get(*k) {
+                    value = v;
+                } else {
+                    return None;
+                }
+            }
+            _ => {
+                if i == keys.len() - 1 {
+                    return value.as_bool();
+                }
+                return None;
+            }
+        }
+    }
+
+    value.as_bool()
+}
+
+/// Get an integer config value by dot-separated key path.
+/// Returns None if the key doesn't exist or has wrong type.
+pub fn get_i64(config: &serde_json::Value, key: &str) -> Option<i64> {
+    let keys: Vec<&str> = key.split('.').collect();
+    let mut value = config;
+
+    for (i, k) in keys.iter().enumerate() {
+        match value {
+            serde_json::Value::Object(obj) => {
+                if let Some(v) = obj.get(*k) {
+                    value = v;
+                } else {
+                    return None;
+                }
+            }
+            _ => {
+                if i == keys.len() - 1 {
+                    return value.as_i64();
+                }
+                return None;
+            }
+        }
+    }
+
+    value.as_i64()
+}
+
+/// Get a string array config value by dot-separated key path.
+/// Returns None if the key doesn't exist or has wrong type.
+pub fn get_string_array(config: &serde_json::Value, key: &str) -> Option<Vec<String>> {
+    let keys: Vec<&str> = key.split('.').collect();
+    let mut value = config;
+
+    for (i, k) in keys.iter().enumerate() {
+        match value {
+            serde_json::Value::Object(obj) => {
+                if let Some(v) = obj.get(*k) {
+                    value = v;
+                } else {
+                    return None;
+                }
+            }
+            _ => {
+                if i == keys.len() - 1 {
+                    if let Some(arr) = value.as_array() {
+                        return Some(
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect(),
+                        );
+                    }
+                }
+                return None;
+            }
+        }
+    }
+
+    if let Some(arr) = value.as_array() {
+        Some(
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect(),
+        )
+    } else {
+        None
+    }
+}
+
 /// Validation error with path context
 #[derive(Debug)]
 pub struct ValidationIssue {
@@ -468,6 +615,22 @@ pub fn validate_config(config: &Value) -> Vec<ValidationIssue> {
     }
 
     issues
+}
+
+/// Configuration encryption at rest
+pub mod encryption;
+
+/// JSON Schema generation for configuration
+pub mod schema;
+
+/// Generate JSON schema for carapace configuration
+pub fn generate_config_schema() -> serde_json::Value {
+    schema::generate_config_schema()
+}
+
+/// Get JSON schema as a string
+pub fn get_config_schema_string() -> String {
+    serde_json::to_string_pretty(&generate_config_schema()).unwrap_or_else(|_| "{}".to_string())
 }
 
 #[cfg(test)]

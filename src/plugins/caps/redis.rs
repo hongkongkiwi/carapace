@@ -6,8 +6,7 @@
 //! Security: Password retrieved via credential_get() - never hardcoded.
 
 use crate::plugins::bindings::{
-    ToolDefinition, ToolPluginInstance, ToolContext, ToolResult,
-    BindingError,
+    BindingError, ToolContext, ToolDefinition, ToolPluginInstance, ToolResult,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -85,10 +84,14 @@ impl std::fmt::Debug for RedisClient {
 impl RedisClient {
     /// Create a new Redis client
     pub fn new(config: RedisConfig) -> Result<Self, BindingError> {
-        let client = redis::Client::open(format!("redis://{}:{}/{}", config.host, config.port, config.db))
-            .map_err(|e| BindingError::CallError(format!("Redis connection failed: {}", e)))?;
+        let client = redis::Client::open(format!(
+            "redis://{}:{}/{}",
+            config.host, config.port, config.db
+        ))
+        .map_err(|e| BindingError::CallError(format!("Redis connection failed: {}", e)))?;
 
-        let conn = client.get_connection()
+        let conn = client
+            .get_connection()
             .map_err(|e| BindingError::CallError(format!("Redis connection failed: {}", e)))?;
 
         Ok(Self {
@@ -99,17 +102,23 @@ impl RedisClient {
 
     /// Get a value
     pub fn get(&self, key: &str) -> Result<Option<String>, BindingError> {
-        let mut guard = self.conn.lock()
+        let mut guard = self
+            .conn
+            .lock()
             .map_err(|e| BindingError::CallError(format!("Mutex lock failed: {}", e)))?;
         let conn = &mut *guard;
 
-        redis::cmd("GET").arg(key).query(conn)
+        redis::cmd("GET")
+            .arg(key)
+            .query(conn)
             .map_err(|e| BindingError::CallError(format!("GET failed: {}", e)))
     }
 
     /// Set a value with optional expiry
     pub fn set(&self, key: &str, value: &str, expiry: Option<u64>) -> Result<(), BindingError> {
-        let mut guard = self.conn.lock()
+        let mut guard = self
+            .conn
+            .lock()
             .map_err(|e| BindingError::CallError(format!("Mutex lock failed: {}", e)))?;
         let conn = &mut *guard;
 
@@ -124,53 +133,75 @@ impl RedisClient {
 
     /// Delete a key
     pub fn delete(&self, key: &str) -> Result<bool, BindingError> {
-        let mut guard = self.conn.lock()
+        let mut guard = self
+            .conn
+            .lock()
             .map_err(|e| BindingError::CallError(format!("Mutex lock failed: {}", e)))?;
         let conn = &mut *guard;
 
-        let result: i32 = redis::cmd("DEL").arg(key).query(conn)
+        let result: i32 = redis::cmd("DEL")
+            .arg(key)
+            .query(conn)
             .map_err(|e| BindingError::CallError(format!("DEL failed: {}", e)))?;
         Ok(result > 0)
     }
 
     /// Check if key exists
     pub fn exists(&self, key: &str) -> Result<bool, BindingError> {
-        let mut guard = self.conn.lock()
+        let mut guard = self
+            .conn
+            .lock()
             .map_err(|e| BindingError::CallError(format!("Mutex lock failed: {}", e)))?;
         let conn = &mut *guard;
 
-        let result: bool = redis::cmd("EXISTS").arg(key).query(conn)
+        let result: bool = redis::cmd("EXISTS")
+            .arg(key)
+            .query(conn)
             .map_err(|e| BindingError::CallError(format!("EXISTS failed: {}", e)))?;
         Ok(result)
     }
 
     /// Set hash field
     pub fn hset(&self, key: &str, field: &str, value: &str) -> Result<(), BindingError> {
-        let mut guard = self.conn.lock()
+        let mut guard = self
+            .conn
+            .lock()
             .map_err(|e| BindingError::CallError(format!("Mutex lock failed: {}", e)))?;
         let conn = &mut *guard;
 
-        redis::cmd("HSET").arg(key).arg(field).arg(value).query(conn)
+        redis::cmd("HSET")
+            .arg(key)
+            .arg(field)
+            .arg(value)
+            .query(conn)
             .map_err(|e| BindingError::CallError(format!("HSET failed: {}", e)))
     }
 
     /// Get hash field
     pub fn hget(&self, key: &str, field: &str) -> Result<Option<String>, BindingError> {
-        let mut guard = self.conn.lock()
+        let mut guard = self
+            .conn
+            .lock()
             .map_err(|e| BindingError::CallError(format!("Mutex lock failed: {}", e)))?;
         let conn = &mut *guard;
 
-        redis::cmd("HGET").arg(key).arg(field).query(conn)
+        redis::cmd("HGET")
+            .arg(key)
+            .arg(field)
+            .query(conn)
             .map_err(|e| BindingError::CallError(format!("HGET failed: {}", e)))
     }
 
     /// Ping for health check
     pub fn ping(&self) -> Result<String, BindingError> {
-        let mut guard = self.conn.lock()
+        let mut guard = self
+            .conn
+            .lock()
             .map_err(|e| BindingError::CallError(format!("Mutex lock failed: {}", e)))?;
         let conn = &mut *guard;
 
-        redis::cmd("PING").query(conn)
+        redis::cmd("PING")
+            .query(conn)
             .map_err(|e| BindingError::CallError(format!("PING failed: {}", e)))
     }
 }
@@ -235,8 +266,15 @@ impl ToolPluginInstance for RedisTool {
         ])
     }
 
-    fn invoke(&self, name: &str, params: &str, _ctx: ToolContext) -> Result<ToolResult, BindingError> {
-        let client = self.client.as_ref()
+    fn invoke(
+        &self,
+        name: &str,
+        params: &str,
+        _ctx: ToolContext,
+    ) -> Result<ToolResult, BindingError> {
+        let client = self
+            .client
+            .as_ref()
             .ok_or_else(|| BindingError::CallError("Redis tool not initialized".to_string()))?;
 
         match name {
@@ -246,7 +284,9 @@ impl ToolPluginInstance for RedisTool {
                 let result = client.get(&input.key)?;
                 Ok(ToolResult {
                     success: true,
-                    result: Some(serde_json::to_string(&result).unwrap_or_else(|_| "null".to_string())),
+                    result: Some(
+                        serde_json::to_string(&result).unwrap_or_else(|_| "null".to_string()),
+                    ),
                     error: None,
                 })
             }
@@ -286,7 +326,9 @@ impl ToolPluginInstance for RedisTool {
                 let result = client.hget(&input.key, &input.field)?;
                 Ok(ToolResult {
                     success: true,
-                    result: Some(serde_json::to_string(&result).unwrap_or_else(|_| "null".to_string())),
+                    result: Some(
+                        serde_json::to_string(&result).unwrap_or_else(|_| "null".to_string()),
+                    ),
                     error: None,
                 })
             }
@@ -306,31 +348,56 @@ impl ToolPluginInstance for RedisTool {
 // Input types
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetInput { pub key: String }
+pub struct GetInput {
+    pub key: String,
+}
 impl GetInput {
-    fn schema() -> serde_json::Value { json!({"type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"]}) }
+    fn schema() -> serde_json::Value {
+        json!({"type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"]})
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SetInput { pub key: String, pub value: String, pub expiry: Option<u64> }
+pub struct SetInput {
+    pub key: String,
+    pub value: String,
+    pub expiry: Option<u64>,
+}
 impl SetInput {
-    fn schema() -> serde_json::Value { json!({"type": "object", "properties": {"key": {"type": "string"}, "value": {"type": "string"}, "expiry": {"type": "integer"}}, "required": ["key", "value"]}) }
+    fn schema() -> serde_json::Value {
+        json!({"type": "object", "properties": {"key": {"type": "string"}, "value": {"type": "string"}, "expiry": {"type": "integer"}}, "required": ["key", "value"]})
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeleteInput { pub key: String }
+pub struct DeleteInput {
+    pub key: String,
+}
 impl DeleteInput {
-    fn schema() -> serde_json::Value { json!({"type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"]}) }
+    fn schema() -> serde_json::Value {
+        json!({"type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"]})
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HSetInput { pub key: String, pub field: String, pub value: String }
+pub struct HSetInput {
+    pub key: String,
+    pub field: String,
+    pub value: String,
+}
 impl HSetInput {
-    fn schema() -> serde_json::Value { json!({"type": "object", "properties": {"key": {"type": "string"}, "field": {"type": "string"}, "value": {"type": "string"}}, "required": ["key", "field", "value"]}) }
+    fn schema() -> serde_json::Value {
+        json!({"type": "object", "properties": {"key": {"type": "string"}, "field": {"type": "string"}, "value": {"type": "string"}}, "required": ["key", "field", "value"]})
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HGetInput { pub key: String, pub field: String }
+pub struct HGetInput {
+    pub key: String,
+    pub field: String,
+}
 impl HGetInput {
-    fn schema() -> serde_json::Value { json!({"type": "object", "properties": {"key": {"type": "string"}, "field": {"type": "string"}}, "required": ["key", "field"]}) }
+    fn schema() -> serde_json::Value {
+        json!({"type": "object", "properties": {"key": {"type": "string"}, "field": {"type": "string"}}, "required": ["key", "field"]})
+    }
 }

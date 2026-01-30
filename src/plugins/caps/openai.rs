@@ -6,8 +6,7 @@
 //! Security: API key is retrieved via credential_get() - never hardcoded.
 
 use crate::plugins::bindings::{
-    ToolDefinition, ToolPluginInstance, ToolContext, ToolResult,
-    BindingError,
+    BindingError, ToolContext, ToolDefinition, ToolPluginInstance, ToolResult,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -126,13 +125,12 @@ impl OpenAIClient {
 
     /// Get the authorization headers
     fn auth_headers(&self) -> Result<Vec<(String, String)>, BindingError> {
-        let api_key = self.config.api_key.as_ref()
-            .ok_or_else(|| BindingError::CallError("OpenAI API key not configured".to_string()))?;
+        let api_key =
+            self.config.api_key.as_ref().ok_or_else(|| {
+                BindingError::CallError("OpenAI API key not configured".to_string())
+            })?;
 
-        let mut headers = vec![(
-            "Authorization".to_string(),
-            format!("Bearer {}", api_key),
-        )];
+        let mut headers = vec![("Authorization".to_string(), format!("Bearer {}", api_key))];
 
         if let Some(org) = &self.config.organization {
             headers.push(("OpenAI-Organization".to_string(), org.clone()));
@@ -164,7 +162,9 @@ impl OpenAIClient {
         });
 
         let response: serde_json::Value = self.api_request_sync("/chat/completions", &body)?;
-        response.try_into().map_err(|e| BindingError::CallError(format!("Parse error: {}", e)))
+        response
+            .try_into()
+            .map_err(|e| BindingError::CallError(format!("Parse error: {}", e)))
     }
 
     // ============ Embeddings ============
@@ -183,7 +183,9 @@ impl OpenAIClient {
         });
 
         let response: serde_json::Value = self.api_request_sync("/embeddings", &body)?;
-        response.try_into().map_err(|e| BindingError::CallError(format!("Parse error: {}", e)))
+        response
+            .try_into()
+            .map_err(|e| BindingError::CallError(format!("Parse error: {}", e)))
     }
 
     // ============ Images ============
@@ -215,11 +217,17 @@ impl OpenAIClient {
         }
 
         let response: serde_json::Value = self.api_request_sync("/images/generations", &body)?;
-        response.try_into().map_err(|e| BindingError::CallError(format!("Parse error: {}", e)))
+        response
+            .try_into()
+            .map_err(|e| BindingError::CallError(format!("Parse error: {}", e)))
     }
 
     /// Make a synchronous API request using blocking API
-    fn api_request_sync(&self, endpoint: &str, body: &serde_json::Value) -> Result<serde_json::Value, BindingError> {
+    fn api_request_sync(
+        &self,
+        endpoint: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, BindingError> {
         let url = format!("{}{}", self.config.base_url, endpoint);
 
         let mut request = self.http_client.post(&url);
@@ -228,13 +236,17 @@ impl OpenAIClient {
             request = request.header(key, value);
         }
 
-        request = request.header("Content-Type", "application/json").json(body);
+        request = request
+            .header("Content-Type", "application/json")
+            .json(body);
 
-        let response = request.send()
+        let response = request
+            .send()
             .map_err(|e| BindingError::CallError(format!("Request failed: {}", e)))?;
 
         if !response.status().is_success() {
-            let error_text = response.text()
+            let error_text = response
+                .text()
                 .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(BindingError::CallError(format!(
                 "OpenAI API error: {}",
@@ -242,7 +254,8 @@ impl OpenAIClient {
             )));
         }
 
-        response.json()
+        response
+            .json()
             .map_err(|e| BindingError::CallError(format!("Parse error: {}", e)))
     }
 }
@@ -303,7 +316,9 @@ impl ToolPluginInstance for OpenAITool {
         params: &str,
         _ctx: ToolContext,
     ) -> Result<ToolResult, BindingError> {
-        let client = self.client.as_ref()
+        let client = self
+            .client
+            .as_ref()
             .ok_or_else(|| BindingError::CallError("OpenAI tool not initialized".to_string()))?;
 
         match name {
@@ -311,18 +326,24 @@ impl ToolPluginInstance for OpenAITool {
                 let input: ChatCompletionInput = serde_json::from_str(params)
                     .map_err(|e| BindingError::CallError(format!("Invalid params: {}", e)))?;
 
-                let messages: Vec<ChatMessage> = input.messages.iter().map(|m| m.clone().into()).collect();
+                let messages: Vec<ChatMessage> =
+                    input.messages.iter().map(|m| m.clone().into()).collect();
 
-                let response = client.chat_completions(
-                    &messages,
-                    input.model.as_deref(),
-                    input.temperature,
-                    input.max_tokens,
-                ).map_err(|e| BindingError::CallError(e.to_string()))?;
+                let response = client
+                    .chat_completions(
+                        &messages,
+                        input.model.as_deref(),
+                        input.temperature,
+                        input.max_tokens,
+                    )
+                    .map_err(|e| BindingError::CallError(e.to_string()))?;
 
                 Ok(ToolResult {
                     success: true,
-                    result: Some(serde_json::to_string(&response).map_err(|e| BindingError::CallError(e.to_string()))?),
+                    result: Some(
+                        serde_json::to_string(&response)
+                            .map_err(|e| BindingError::CallError(e.to_string()))?,
+                    ),
                     error: None,
                 })
             }
@@ -330,14 +351,16 @@ impl ToolPluginInstance for OpenAITool {
                 let input: EmbeddingInput = serde_json::from_str(params)
                     .map_err(|e| BindingError::CallError(format!("Invalid params: {}", e)))?;
 
-                let response = client.create_embeddings(
-                    &input.input,
-                    input.model.as_deref(),
-                ).map_err(|e| BindingError::CallError(e.to_string()))?;
+                let response = client
+                    .create_embeddings(&input.input, input.model.as_deref())
+                    .map_err(|e| BindingError::CallError(e.to_string()))?;
 
                 Ok(ToolResult {
                     success: true,
-                    result: Some(serde_json::to_string(&response).map_err(|e| BindingError::CallError(e.to_string()))?),
+                    result: Some(
+                        serde_json::to_string(&response)
+                            .map_err(|e| BindingError::CallError(e.to_string()))?,
+                    ),
                     error: None,
                 })
             }
@@ -345,17 +368,22 @@ impl ToolPluginInstance for OpenAITool {
                 let input: ImageGenerationInput = serde_json::from_str(params)
                     .map_err(|e| BindingError::CallError(format!("Invalid params: {}", e)))?;
 
-                let response = client.generate_images(
-                    &input.prompt,
-                    input.model.as_deref(),
-                    input.size.as_deref(),
-                    input.quality.as_deref(),
-                    input.n,
-                ).map_err(|e| BindingError::CallError(e.to_string()))?;
+                let response = client
+                    .generate_images(
+                        &input.prompt,
+                        input.model.as_deref(),
+                        input.size.as_deref(),
+                        input.quality.as_deref(),
+                        input.n,
+                    )
+                    .map_err(|e| BindingError::CallError(e.to_string()))?;
 
                 Ok(ToolResult {
                     success: true,
-                    result: Some(serde_json::to_string(&response).map_err(|e| BindingError::CallError(e.to_string()))?),
+                    result: Some(
+                        serde_json::to_string(&response)
+                            .map_err(|e| BindingError::CallError(e.to_string()))?,
+                    ),
                     error: None,
                 })
             }

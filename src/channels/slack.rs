@@ -65,7 +65,11 @@ impl SlackChannel {
             .build()
             .expect("Failed to build reqwest client");
 
-        Self { config, client, event_tx }
+        Self {
+            config,
+            client,
+            event_tx,
+        }
     }
 
     /// Get the API base URL
@@ -74,7 +78,11 @@ impl SlackChannel {
     }
 
     /// Send a request to the Slack API
-    async fn api_request<T: for<'de> Deserialize<'de>>(&self, method: &str, body: Option<serde_json::Value>) -> Result<T, SlackError> {
+    async fn api_request<T: for<'de> Deserialize<'de>>(
+        &self,
+        method: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<T, SlackError> {
         let mut request = self
             .client
             .post(self.api_url(method))
@@ -96,7 +104,10 @@ impl SlackChannel {
             .map_err(|e| SlackError::Parse(e.to_string()))?;
 
         if json.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            let error_msg = json.get("error").and_then(|v| v.as_str()).unwrap_or("Unknown error");
+            let error_msg = json
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown error");
             return Err(SlackError::Api(error_msg.to_string()));
         }
 
@@ -105,14 +116,20 @@ impl SlackChannel {
     }
 
     /// Send a text message
-    pub async fn send_message(&self, channel: &str, text: &str, blocks: Option<Vec<SlackBlock>>) -> Result<String, SlackError> {
+    pub async fn send_message(
+        &self,
+        channel: &str,
+        text: &str,
+        blocks: Option<Vec<SlackBlock>>,
+    ) -> Result<String, SlackError> {
         let mut body = serde_json::json!({
             "channel": channel,
             "text": text,
         });
 
         if let Some(blocks) = blocks {
-            body["blocks"] = serde_json::json!(blocks.iter().map(|b| b.to_json()).collect::<Vec<_>>());
+            body["blocks"] =
+                serde_json::json!(blocks.iter().map(|b| b.to_json()).collect::<Vec<_>>());
         }
 
         self.api_request::<SlackMessageResponse>("chat.postMessage", Some(body))
@@ -142,7 +159,10 @@ impl SlackChannel {
             .map_err(|e| SlackError::Parse(e.to_string()))?;
 
         if json.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            let error_msg = json.get("error").and_then(|v| v.as_str()).unwrap_or("Unknown error");
+            let error_msg = json
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown error");
             return Err(SlackError::Api(error_msg.to_string()));
         }
 
@@ -282,28 +302,32 @@ impl SlackBlock {
         }
 
         if !self.elements.is_empty() {
-            json["elements"] = serde_json::json!(self.elements.iter().map(|e| {
-                let mut ejson = serde_json::json!({
-                    "type": e.type_,
-                });
-                if let Some(text) = &e.text {
-                    ejson["text"] = serde_json::json!({
-                        "type": text.type_,
-                        "text": text.text,
-                        "emoji": text.emoji.unwrap_or(false),
+            json["elements"] = serde_json::json!(self
+                .elements
+                .iter()
+                .map(|e| {
+                    let mut ejson = serde_json::json!({
+                        "type": e.type_,
                     });
-                }
-                if let Some(action_id) = &e.action_id {
-                    ejson["action_id"] = serde_json::json!(action_id.as_str());
-                }
-                if let Some(value) = &e.value {
-                    ejson["value"] = serde_json::json!(value.as_str());
-                }
-                if let Some(style) = &e.style {
-                    ejson["style"] = serde_json::json!(style.as_str());
-                }
-                ejson
-            }).collect::<Vec<_>>());
+                    if let Some(text) = &e.text {
+                        ejson["text"] = serde_json::json!({
+                            "type": text.type_,
+                            "text": text.text,
+                            "emoji": text.emoji.unwrap_or(false),
+                        });
+                    }
+                    if let Some(action_id) = &e.action_id {
+                        ejson["action_id"] = serde_json::json!(action_id.as_str());
+                    }
+                    if let Some(value) = &e.value {
+                        ejson["value"] = serde_json::json!(value.as_str());
+                    }
+                    if let Some(style) = &e.style {
+                        ejson["style"] = serde_json::json!(style.as_str());
+                    }
+                    ejson
+                })
+                .collect::<Vec<_>>());
         }
 
         json

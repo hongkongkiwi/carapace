@@ -126,8 +126,7 @@ impl ZaloChannel {
             });
         }
 
-        serde_json::from_value(json)
-            .map_err(|e| ZaloError::Parse(e.to_string()))
+        serde_json::from_value(json).map_err(|e| ZaloError::Parse(e.to_string()))
     }
 
     /// Send a text message to a user
@@ -139,9 +138,8 @@ impl ZaloChannel {
             }
         });
 
-        let response: ZaloSendResponse = self
-            .api_request("POST", "/oa/message", Some(body))
-            .await?;
+        let response: ZaloSendResponse =
+            self.api_request("POST", "/oa/message", Some(body)).await?;
 
         Ok(response.message_id)
     }
@@ -171,9 +169,8 @@ impl ZaloChannel {
             "message": message,
         });
 
-        let response: ZaloSendResponse = self
-            .api_request("POST", "/oa/message", Some(body))
-            .await?;
+        let response: ZaloSendResponse =
+            self.api_request("POST", "/oa/message", Some(body)).await?;
 
         Ok(response.message_id)
     }
@@ -199,21 +196,16 @@ impl ZaloChannel {
             }
         });
 
-        let response: ZaloSendResponse = self
-            .api_request("POST", "/oa/message", Some(body))
-            .await?;
+        let response: ZaloSendResponse =
+            self.api_request("POST", "/oa/message", Some(body)).await?;
 
         Ok(response.message_id)
     }
 
     /// Get user info
     pub async fn get_user_info(&self, user_id: &str) -> Result<ZaloUser, ZaloError> {
-        self.api_request(
-            "GET",
-            &format!("/oa/getprofile?user_id={}", user_id),
-            None,
-        )
-        .await
+        self.api_request("GET", &format!("/oa/getprofile?user_id={}", user_id), None)
+            .await
     }
 
     /// Send a message to the default user (from context)

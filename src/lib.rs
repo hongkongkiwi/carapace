@@ -21,12 +21,15 @@ pub mod logging;
 pub mod media;
 pub mod messages;
 pub mod metrics;
+pub mod migrations;
 pub mod nodes;
 pub mod plugins;
 pub mod polls;
+pub mod security;
 pub mod server;
 pub mod sessions;
-pub mod skills;
+pub mod tracing;
+// pub mod skills; // Disabled: requires leptos_router 0.8 API update
 pub mod tts;
-// pub mod ui; // Temporarily disabled - requires leptos_router 0.8 API update
+// pub mod ui; // Disabled: requires leptos_router 0.8 API update
 pub mod usage;
