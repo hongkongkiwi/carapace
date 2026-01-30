@@ -1,0 +1,8 @@
+# Hadolint configuration for the carapace Dockerfile
+# https://github.com/hadolint/hadolint
+
+ignored:
+  # DL3008: Pin versions in apt-get install.
+  # We deliberately use unpinned versions for ca-certificates and curl
+  # to always get the latest security patches in the runtime image.
+  - DL3008

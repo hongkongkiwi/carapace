@@ -1,0 +1,29 @@
+# Gitleaks configuration for the carapace project
+# https://github.com/gitleaks/gitleaks
+#
+# Run manually:  gitleaks git --staged --verbose
+# Pre-commit:    automatic via .githooks/pre-commit
+
+title = "carapace gitleaks config"
+
+# Extend the default gitleaks rules (built-in detectors for AWS keys,
+# GitHub tokens, Slack webhooks, generic API keys, etc.)
+[extend]
+
+# Paths to exclude from scanning
+[allowlist]
+paths = [
+    '''fuzz/Cargo\.lock''',
+    '''Cargo\.lock''',
+    '''\.snap$''',
+    '''deny\.toml''',
+    '''config\.example\.json5''',
+]
+
+# Additional rules for patterns specific to this project
+[[rules]]
+id = "enc-v1-test-values"
+description = "Test enc:v1: encrypted values in test code"
+regex = '''enc:v1:[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+'''
+[rules.allowlist]
+paths = ['''_test''', '''tests/''', '''\.rs$''']
