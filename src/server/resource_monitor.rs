@@ -96,6 +96,29 @@ impl ResourceMonitor {
         check_memory_threshold(&diag, thresholds);
         check_fd_threshold(&diag, thresholds);
     }
+
+    /// Sample current resource usage, update gauges, and check thresholds in one pass.
+    pub fn sample_and_check(&self, thresholds: &ResourceThresholds) {
+        let diag = self.health_checker.gather_diagnostics(false);
+
+        // Update gauges
+        if let Some(v) = diag.disk_free_bytes {
+            self.disk_free_bytes.set(v as f64);
+        }
+        if let Some(v) = diag.memory_rss_bytes {
+            self.memory_rss_bytes.set(v as f64);
+        }
+        if let Some(v) = diag.open_fds {
+            self.open_fds.set(v as f64);
+        }
+        self.uptime_seconds
+            .set(self.start_time.elapsed().as_secs_f64());
+
+        // Check thresholds
+        check_disk_threshold(&diag, thresholds);
+        check_memory_threshold(&diag, thresholds);
+        check_fd_threshold(&diag, thresholds);
+    }
 }
 
 /// Warn if disk free space is below the configured threshold.
@@ -183,8 +206,7 @@ pub async fn run_resource_monitor(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                monitor.sample();
-                monitor.check_thresholds(&thresholds);
+                monitor.sample_and_check(&thresholds);
             }
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
@@ -249,6 +271,15 @@ mod tests {
             rss_warn_bytes: 1, // 1 byte — will always trigger
         };
         monitor.check_thresholds(&thresholds);
+    }
+
+    #[test]
+    fn test_sample_and_check() {
+        let (_dir, monitor) = make_monitor();
+        let thresholds = ResourceThresholds::default();
+        // Should not panic and should update gauges
+        monitor.sample_and_check(&thresholds);
+        assert!(monitor.uptime_seconds.get() >= 0.0);
     }
 
     #[test]

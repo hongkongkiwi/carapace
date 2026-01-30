@@ -52,6 +52,7 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 262144;
 pub const DEFAULT_HOOKS_PATH: &str = "/hooks";
 
 /// HTTP server configuration
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct HttpConfig {
     /// Hooks token for authentication
@@ -196,6 +197,7 @@ pub fn build_http_config(cfg: &Value) -> HttpConfig {
 }
 
 /// Shared state for HTTP handlers
+#[non_exhaustive]
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<HttpConfig>,

@@ -51,6 +51,7 @@ const AUDIT_ROTATED_NAME: &str = "audit.jsonl.1";
 // ---------------------------------------------------------------------------
 
 /// Security-relevant events tracked by the audit log.
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AuditEvent {

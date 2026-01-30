@@ -103,6 +103,11 @@ fn luhn_check(digits: &str) -> bool {
 }
 
 /// Filter LLM output for PII and credential patterns.
+///
+/// Uses a single-pass approach: all pattern matches are collected with their
+/// byte ranges, sorted, merged for overlaps, and the sanitized string is built
+/// in one sweep. Custom regex patterns are pre-compiled once per call rather
+/// than inside the match loop.
 pub fn filter_output(text: &str, config: &PostflightConfig) -> PostflightResult {
     if !config.enabled {
         return PostflightResult {
@@ -112,139 +117,198 @@ pub fn filter_output(text: &str, config: &PostflightConfig) -> PostflightResult 
         };
     }
 
-    let mut findings = Vec::new();
-    let mut sanitized = text.to_string();
+    // Collect all matches as (start, end, redaction_label, severity, category, description).
+    let mut matches: Vec<(usize, usize, &str, FindingSeverity, FindingCategory, String)> =
+        Vec::new();
 
     if config.block_pii {
-        // Email addresses
         for mat in RE_EMAIL.find_iter(text) {
-            findings.push(PostflightFinding {
-                severity: FindingSeverity::Warning,
-                category: FindingCategory::Pii,
-                description: "Email address detected in output".to_string(),
-                matched: "[EMAIL]".to_string(),
-            });
-            sanitized = sanitized.replace(mat.as_str(), "[EMAIL_REDACTED]");
+            matches.push((
+                mat.start(),
+                mat.end(),
+                "[EMAIL_REDACTED]",
+                FindingSeverity::Warning,
+                FindingCategory::Pii,
+                "Email address detected in output".to_string(),
+            ));
         }
-
-        // Phone numbers
         for mat in RE_PHONE.find_iter(text) {
-            findings.push(PostflightFinding {
-                severity: FindingSeverity::Warning,
-                category: FindingCategory::Pii,
-                description: "Phone number detected in output".to_string(),
-                matched: "[PHONE]".to_string(),
-            });
-            sanitized = sanitized.replace(mat.as_str(), "[PHONE_REDACTED]");
+            matches.push((
+                mat.start(),
+                mat.end(),
+                "[PHONE_REDACTED]",
+                FindingSeverity::Warning,
+                FindingCategory::Pii,
+                "Phone number detected in output".to_string(),
+            ));
         }
-
-        // SSNs
         for mat in RE_SSN.find_iter(text) {
-            findings.push(PostflightFinding {
-                severity: FindingSeverity::Critical,
-                category: FindingCategory::Pii,
-                description: "Social Security Number detected in output".to_string(),
-                matched: "[SSN]".to_string(),
-            });
-            sanitized = sanitized.replace(mat.as_str(), "[SSN_REDACTED]");
+            matches.push((
+                mat.start(),
+                mat.end(),
+                "[SSN_REDACTED]",
+                FindingSeverity::Critical,
+                FindingCategory::Pii,
+                "Social Security Number detected in output".to_string(),
+            ));
         }
-
-        // Credit cards (Luhn-validated)
         for mat in RE_CREDIT_CARD.find_iter(text) {
             if luhn_check(mat.as_str()) {
-                findings.push(PostflightFinding {
-                    severity: FindingSeverity::Critical,
-                    category: FindingCategory::Pii,
-                    description: "Credit card number detected in output (Luhn-valid)".to_string(),
-                    matched: "[CREDIT_CARD]".to_string(),
-                });
-                sanitized = sanitized.replace(mat.as_str(), "[CC_REDACTED]");
+                matches.push((
+                    mat.start(),
+                    mat.end(),
+                    "[CC_REDACTED]",
+                    FindingSeverity::Critical,
+                    FindingCategory::Pii,
+                    "Credit card number detected in output (Luhn-valid)".to_string(),
+                ));
             }
         }
     }
 
     if config.block_credentials {
-        // API keys
         for mat in RE_API_KEY.find_iter(text) {
-            findings.push(PostflightFinding {
-                severity: FindingSeverity::Critical,
-                category: FindingCategory::Credential,
-                description: "API key pattern detected in output".to_string(),
-                matched: "[API_KEY]".to_string(),
-            });
-            sanitized = sanitized.replace(mat.as_str(), "[KEY_REDACTED]");
+            matches.push((
+                mat.start(),
+                mat.end(),
+                "[KEY_REDACTED]",
+                FindingSeverity::Critical,
+                FindingCategory::Credential,
+                "API key pattern detected in output".to_string(),
+            ));
         }
-
-        // Bearer tokens
         for mat in RE_BEARER.find_iter(text) {
-            findings.push(PostflightFinding {
-                severity: FindingSeverity::Critical,
-                category: FindingCategory::Credential,
-                description: "Bearer token detected in output".to_string(),
-                matched: "[BEARER]".to_string(),
-            });
-            sanitized = sanitized.replace(mat.as_str(), "[TOKEN_REDACTED]");
+            matches.push((
+                mat.start(),
+                mat.end(),
+                "[TOKEN_REDACTED]",
+                FindingSeverity::Critical,
+                FindingCategory::Credential,
+                "Bearer token detected in output".to_string(),
+            ));
         }
-
-        // Basic auth
         for mat in RE_BASIC_AUTH.find_iter(text) {
-            findings.push(PostflightFinding {
-                severity: FindingSeverity::Critical,
-                category: FindingCategory::Credential,
-                description: "Basic auth credential detected in output".to_string(),
-                matched: "[BASIC_AUTH]".to_string(),
-            });
-            sanitized = sanitized.replace(mat.as_str(), "[AUTH_REDACTED]");
+            matches.push((
+                mat.start(),
+                mat.end(),
+                "[AUTH_REDACTED]",
+                FindingSeverity::Critical,
+                FindingCategory::Credential,
+                "Basic auth credential detected in output".to_string(),
+            ));
         }
-
-        // Password parameters
         for mat in RE_PASSWORD_PARAM.find_iter(text) {
-            findings.push(PostflightFinding {
-                severity: FindingSeverity::Critical,
-                category: FindingCategory::Credential,
-                description: "Password parameter detected in output".to_string(),
-                matched: "[PASSWORD]".to_string(),
-            });
-            sanitized = sanitized.replace(mat.as_str(), "[PASSWORD_REDACTED]");
+            matches.push((
+                mat.start(),
+                mat.end(),
+                "[PASSWORD_REDACTED]",
+                FindingSeverity::Critical,
+                FindingCategory::Credential,
+                "Password parameter detected in output".to_string(),
+            ));
         }
-
-        // AWS keys
         for mat in RE_AWS_KEY.find_iter(text) {
-            findings.push(PostflightFinding {
-                severity: FindingSeverity::Critical,
-                category: FindingCategory::Credential,
-                description: "AWS access key detected in output".to_string(),
-                matched: "[AWS_KEY]".to_string(),
-            });
-            sanitized = sanitized.replace(mat.as_str(), "[AWS_KEY_REDACTED]");
+            matches.push((
+                mat.start(),
+                mat.end(),
+                "[AWS_KEY_REDACTED]",
+                FindingSeverity::Critical,
+                FindingCategory::Credential,
+                "AWS access key detected in output".to_string(),
+            ));
         }
-
-        // GitHub tokens
         for mat in RE_GITHUB_TOKEN.find_iter(text) {
-            findings.push(PostflightFinding {
-                severity: FindingSeverity::Critical,
-                category: FindingCategory::Credential,
-                description: "GitHub token detected in output".to_string(),
-                matched: "[GITHUB_TOKEN]".to_string(),
-            });
-            sanitized = sanitized.replace(mat.as_str(), "[GITHUB_TOKEN_REDACTED]");
+            matches.push((
+                mat.start(),
+                mat.end(),
+                "[GITHUB_TOKEN_REDACTED]",
+                FindingSeverity::Critical,
+                FindingCategory::Credential,
+                "GitHub token detected in output".to_string(),
+            ));
         }
     }
 
-    // Custom patterns
-    for pattern in &config.custom_patterns {
-        if let Ok(re) = Regex::new(pattern) {
-            for mat in re.find_iter(text) {
-                findings.push(PostflightFinding {
-                    severity: FindingSeverity::Warning,
-                    category: FindingCategory::Credential,
-                    description: format!("Custom pattern matched: {pattern}"),
-                    matched: "[CUSTOM]".to_string(),
-                });
-                sanitized = sanitized.replace(mat.as_str(), "[CUSTOM_REDACTED]");
+    // Pre-compile custom patterns once per call (not per-match).
+    let compiled_custom: Vec<Regex> = config
+        .custom_patterns
+        .iter()
+        .filter_map(|p| Regex::new(p).ok())
+        .collect();
+
+    for re in &compiled_custom {
+        for mat in re.find_iter(text) {
+            matches.push((
+                mat.start(),
+                mat.end(),
+                "[CUSTOM_REDACTED]",
+                FindingSeverity::Warning,
+                FindingCategory::Credential,
+                format!("Custom pattern matched: {}", re.as_str()),
+            ));
+        }
+    }
+
+    // Build findings from collected matches.
+    let mut findings: Vec<PostflightFinding> = Vec::new();
+    for &(_, _, redaction, severity, category, ref desc) in &matches {
+        findings.push(PostflightFinding {
+            severity,
+            category,
+            description: desc.clone(),
+            matched: match redaction {
+                "[EMAIL_REDACTED]" => "[EMAIL]",
+                "[PHONE_REDACTED]" => "[PHONE]",
+                "[SSN_REDACTED]" => "[SSN]",
+                "[CC_REDACTED]" => "[CREDIT_CARD]",
+                "[KEY_REDACTED]" => "[API_KEY]",
+                "[TOKEN_REDACTED]" => "[BEARER]",
+                "[AUTH_REDACTED]" => "[BASIC_AUTH]",
+                "[PASSWORD_REDACTED]" => "[PASSWORD]",
+                "[AWS_KEY_REDACTED]" => "[AWS_KEY]",
+                "[GITHUB_TOKEN_REDACTED]" => "[GITHUB_TOKEN]",
+                "[CUSTOM_REDACTED]" => "[CUSTOM]",
+                _ => "[REDACTED]",
+            }
+            .to_string(),
+        });
+    }
+
+    // Sort matches by start position, then by end (descending) for overlapping.
+    matches.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+
+    // Build sanitized string in a single pass, merging overlapping ranges.
+    let sanitized = if matches.is_empty() {
+        text.to_string()
+    } else {
+        let mut result = String::with_capacity(text.len());
+        let mut last_end = 0;
+
+        // Merge overlapping ranges.
+        let mut merged: Vec<(usize, usize, &str)> = Vec::new();
+        for &(start, end, redaction, _, _, _) in &matches {
+            if let Some(last) = merged.last_mut() {
+                if start < last.1 {
+                    // Overlapping — extend if needed, keep the first redaction label.
+                    if end > last.1 {
+                        last.1 = end;
+                    }
+                    continue;
+                }
+            }
+            merged.push((start, end, redaction));
+        }
+
+        for (start, end, redaction) in merged {
+            if start >= last_end {
+                result.push_str(&text[last_end..start]);
+                result.push_str(redaction);
+                last_end = end;
             }
         }
-    }
+        result.push_str(&text[last_end..]);
+        result
+    };
 
     let blocked = findings
         .iter()
