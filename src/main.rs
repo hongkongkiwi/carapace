@@ -33,7 +33,7 @@ use clap::Parser;
 use serde_json::Value;
 use tracing::{error, info, warn};
 
-use cli::{Cli, Command, ConfigCommand};
+use cli::{Cli, Command, ConfigCommand, TlsCommand};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -83,6 +83,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Some(Command::Update { check, version }) => {
             cli::handle_update(check, version.as_deref()).await
+        }
+
+        Some(Command::Tls(sub)) => {
+            match sub {
+                TlsCommand::InitCa { output } => {
+                    cli::handle_tls_init_ca(output.as_deref())?;
+                }
+                TlsCommand::IssueCert {
+                    node_id,
+                    ca_dir,
+                    output,
+                } => {
+                    cli::handle_tls_issue_cert(&node_id, ca_dir.as_deref(), output.as_deref())?;
+                }
+                TlsCommand::RevokeCert {
+                    fingerprint,
+                    node_id,
+                    ca_dir,
+                    reason,
+                } => {
+                    cli::handle_tls_revoke_cert(
+                        &fingerprint,
+                        &node_id,
+                        ca_dir.as_deref(),
+                        reason.as_deref(),
+                    )?;
+                }
+                TlsCommand::ShowCa { ca_dir } => {
+                    cli::handle_tls_show_ca(ca_dir.as_deref())?;
+                }
+            }
+            Ok(())
         }
     }
 }

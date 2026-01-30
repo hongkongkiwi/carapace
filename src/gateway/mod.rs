@@ -67,6 +67,8 @@ pub enum GatewayError {
     MaxGatewaysExceeded,
     /// The requested gateway was not found.
     NotFound,
+    /// mTLS certificate verification failed.
+    MtlsCertError(String),
 }
 
 impl std::fmt::Display for GatewayError {
@@ -84,6 +86,7 @@ impl std::fmt::Display for GatewayError {
             Self::ConfigError(msg) => write!(f, "config error: {}", msg),
             Self::MaxGatewaysExceeded => write!(f, "maximum number of gateways exceeded"),
             Self::NotFound => write!(f, "gateway not found"),
+            Self::MtlsCertError(msg) => write!(f, "mTLS certificate error: {}", msg),
         }
     }
 }
@@ -667,6 +670,78 @@ pub async fn connect_to_gateway(
     Ok(conn)
 }
 
+/// Connect to a remote gateway using mTLS.
+///
+/// Similar to [`connect_to_gateway`] but uses the provided
+/// `rustls::ClientConfig` to present a client certificate and verify the
+/// server certificate against the cluster CA.
+pub async fn connect_to_gateway_mtls(
+    entry: &GatewayEntry,
+    auth_token: &str,
+    client_id: &str,
+    client_config: std::sync::Arc<rustls::ClientConfig>,
+) -> Result<(GatewayConnection, Option<String>), GatewayError> {
+    validate_gateway_params(entry, auth_token, client_id)?;
+
+    info!(
+        gateway_id = %entry.id,
+        gateway_name = %entry.name,
+        url = %entry.url,
+        "connecting to remote gateway with mTLS"
+    );
+
+    // Build the TLS connector with our mTLS client config
+    let connector = tokio_tungstenite::Connector::Rustls(client_config);
+
+    let (ws_stream, _response) =
+        tokio_tungstenite::connect_async_tls_with_config(&entry.url, None, false, Some(connector))
+            .await
+            .map_err(|e| {
+                GatewayError::ConnectionFailed(format!("mTLS WebSocket connect failed: {}", e))
+            })?;
+
+    // Extract peer node identity from the TLS connection
+    let peer_node_id = extract_peer_node_identity(&ws_stream);
+    if let Some(ref id) = peer_node_id {
+        info!(
+            gateway_id = %entry.id,
+            peer_node_id = %id,
+            "mTLS peer identified"
+        );
+    }
+
+    // Build the connection handle
+    let conn = GatewayConnection::new_with_stream(entry.id.clone(), ws_stream);
+
+    // Send JSON-RPC handshake and wait for response
+    send_gateway_handshake(&conn, auth_token, client_id).await?;
+    receive_handshake_response(&conn).await?;
+
+    info!(
+        gateway_id = %entry.id,
+        "mTLS gateway WebSocket connected and handshake completed"
+    );
+
+    Ok((conn, peer_node_id))
+}
+
+/// Extract the peer's node identity from an mTLS WebSocket stream.
+///
+/// Reads the peer's TLS certificate and extracts the Common Name (CN),
+/// which contains the node ID set during certificate issuance.
+fn extract_peer_node_identity(stream: &WsStream) -> Option<String> {
+    let tls_stream = match stream.get_ref() {
+        MaybeTlsStream::Rustls(s) => s,
+        _ => return None,
+    };
+
+    let (_, conn) = tls_stream.get_ref();
+    let certs = conn.peer_certificates()?;
+    let cert_der = certs.first()?;
+
+    crate::tls::ca::extract_node_identity(cert_der)
+}
+
 /// Extract the SHA-256 fingerprint from a TLS-wrapped WebSocket stream.
 ///
 /// Returns `None` for plaintext (non-TLS) streams or if certificate
@@ -830,6 +905,8 @@ pub struct GatewayConfig {
     pub max_reconnect_attempts: u32,
     /// Auth token passed in the `gateway.connect` handshake.
     pub auth_token: String,
+    /// mTLS configuration for gateway-to-gateway communication.
+    pub mtls: crate::tls::MtlsConfig,
 }
 
 impl Default for GatewayConfig {
@@ -841,6 +918,7 @@ impl Default for GatewayConfig {
             reconnect_interval_ms: DEFAULT_RECONNECT_INTERVAL_MS,
             max_reconnect_attempts: DEFAULT_MAX_RECONNECT_ATTEMPTS,
             auth_token: String::new(),
+            mtls: crate::tls::MtlsConfig::default(),
         }
     }
 }
@@ -957,6 +1035,9 @@ pub fn build_gateway_config(cfg: &Value) -> GatewayConfig {
         })
         .unwrap_or_default();
 
+    // Parse mTLS config from the same top-level config value
+    let mtls = crate::tls::parse_mtls_config(cfg);
+
     GatewayConfig {
         enabled,
         gateways,
@@ -964,6 +1045,7 @@ pub fn build_gateway_config(cfg: &Value) -> GatewayConfig {
         reconnect_interval_ms,
         max_reconnect_attempts,
         auth_token,
+        mtls,
     }
 }
 
@@ -1654,6 +1736,9 @@ mod tests {
 
         let err = GatewayError::NotFound;
         assert_eq!(err.to_string(), "gateway not found");
+
+        let err = GatewayError::MtlsCertError("invalid cert".to_string());
+        assert_eq!(err.to_string(), "mTLS certificate error: invalid cert");
     }
 
     // ====================================================================
@@ -1688,6 +1773,58 @@ mod tests {
         });
         let config = build_gateway_config(&cfg);
         assert!(!config.enabled);
+    }
+
+    // ====================================================================
+    // build_gateway_config: mTLS settings
+    // ====================================================================
+
+    #[test]
+    fn test_build_gateway_config_mtls() {
+        let cfg = json!({
+            "gateway": {
+                "remote": {
+                    "enabled": true
+                },
+                "mtls": {
+                    "enabled": true,
+                    "caCert": "/path/to/ca.pem",
+                    "nodeCert": "/path/to/node-cert.pem",
+                    "nodeKey": "/path/to/node-key.pem",
+                    "requireClientCert": false
+                }
+            }
+        });
+        let config = build_gateway_config(&cfg);
+        assert!(config.mtls.enabled);
+        assert_eq!(
+            config.mtls.ca_cert,
+            Some(std::path::PathBuf::from("/path/to/ca.pem"))
+        );
+        assert_eq!(
+            config.mtls.node_cert,
+            Some(std::path::PathBuf::from("/path/to/node-cert.pem"))
+        );
+        assert_eq!(
+            config.mtls.node_key,
+            Some(std::path::PathBuf::from("/path/to/node-key.pem"))
+        );
+        assert!(!config.mtls.require_client_cert);
+    }
+
+    #[test]
+    fn test_build_gateway_config_mtls_defaults() {
+        let cfg = json!({
+            "gateway": {
+                "remote": {
+                    "enabled": true
+                }
+            }
+        });
+        let config = build_gateway_config(&cfg);
+        assert!(!config.mtls.enabled);
+        assert!(config.mtls.ca_cert.is_none());
+        assert!(config.mtls.require_client_cert); // default true
     }
 
     // ====================================================================

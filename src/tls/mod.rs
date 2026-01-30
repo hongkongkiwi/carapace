@@ -5,6 +5,10 @@
 //! - Certificate and key loading from PEM files
 //! - SHA-256 fingerprint computation for trust-on-first-use pairing
 //! - TLS configuration types for the gateway config schema
+//! - Cluster CA management for mTLS gateway-to-gateway authentication
+//! - mTLS configuration and rustls server/client config builders
+
+pub mod ca;
 
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -399,6 +403,181 @@ pub fn compute_cert_fingerprint(cert_der: &CertificateDer<'_>) -> String {
         .join(":")
 }
 
+// ============================================================================
+// mTLS configuration
+// ============================================================================
+
+/// mTLS configuration for gateway-to-gateway communication.
+#[derive(Debug, Clone)]
+pub struct MtlsConfig {
+    /// Whether mTLS is enabled for gateway connections.
+    pub enabled: bool,
+    /// Path to the cluster CA certificate PEM file.
+    pub ca_cert: Option<PathBuf>,
+    /// Path to this node's certificate PEM file.
+    pub node_cert: Option<PathBuf>,
+    /// Path to this node's private key PEM file.
+    pub node_key: Option<PathBuf>,
+    /// Whether to require client certificates from connecting gateways.
+    pub require_client_cert: bool,
+}
+
+impl Default for MtlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ca_cert: None,
+            node_cert: None,
+            node_key: None,
+            require_client_cert: true,
+        }
+    }
+}
+
+/// Parse mTLS configuration from the loaded JSON config value.
+///
+/// Looks for `gateway.mtls` object with keys:
+/// - `enabled` (bool, default false)
+/// - `caCert` (string, path to CA certificate PEM)
+/// - `nodeCert` (string, path to node certificate PEM)
+/// - `nodeKey` (string, path to node private key PEM)
+/// - `requireClientCert` (bool, default true)
+pub fn parse_mtls_config(cfg: &serde_json::Value) -> MtlsConfig {
+    let mtls_obj = cfg
+        .get("gateway")
+        .and_then(|g| g.get("mtls"))
+        .and_then(|t| t.as_object());
+
+    let mtls_obj = match mtls_obj {
+        Some(obj) => obj,
+        None => return MtlsConfig::default(),
+    };
+
+    let enabled = mtls_obj
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let ca_cert = mtls_obj
+        .get("caCert")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from);
+
+    let node_cert = mtls_obj
+        .get("nodeCert")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from);
+
+    let node_key = mtls_obj
+        .get("nodeKey")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from);
+
+    let require_client_cert = mtls_obj
+        .get("requireClientCert")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    MtlsConfig {
+        enabled,
+        ca_cert,
+        node_cert,
+        node_key,
+        require_client_cert,
+    }
+}
+
+/// Result of mTLS setup, containing server and client TLS configurations.
+pub struct MtlsSetupResult {
+    /// Server-side TLS config with client certificate verification.
+    pub server_config: Arc<rustls::ServerConfig>,
+    /// Client-side TLS config that presents this node's certificate.
+    pub client_config: Arc<rustls::ClientConfig>,
+    /// SHA-256 fingerprint of this node's certificate.
+    pub node_fingerprint: String,
+    /// SHA-256 fingerprint of the CA certificate.
+    pub ca_fingerprint: String,
+}
+
+/// Set up mTLS for gateway-to-gateway communication.
+///
+/// Builds both a `rustls::ServerConfig` (for accepting connections from other
+/// gateways, verifying their client certificates against the cluster CA) and
+/// a `rustls::ClientConfig` (for connecting to other gateways, presenting
+/// this node's certificate).
+pub fn setup_mtls(config: &MtlsConfig) -> Result<MtlsSetupResult, TlsError> {
+    let ca_cert_path = config.ca_cert.as_deref().ok_or_else(|| {
+        TlsError::ConfigBuildError("mTLS enabled but gateway.mtls.caCert is not set".to_string())
+    })?;
+    let node_cert_path = config.node_cert.as_deref().ok_or_else(|| {
+        TlsError::ConfigBuildError("mTLS enabled but gateway.mtls.nodeCert is not set".to_string())
+    })?;
+    let node_key_path = config.node_key.as_deref().ok_or_else(|| {
+        TlsError::ConfigBuildError("mTLS enabled but gateway.mtls.nodeKey is not set".to_string())
+    })?;
+
+    // Load CA certificate
+    let ca_certs = load_certs(ca_cert_path)?;
+    let ca_fingerprint = compute_cert_fingerprint(&ca_certs[0]);
+
+    // Load node certificate and key
+    let node_certs = load_certs(node_cert_path)?;
+    let node_key = load_private_key(node_key_path)?;
+    let node_fingerprint = compute_cert_fingerprint(&node_certs[0]);
+
+    // Ensure crypto provider is installed
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    // Build the root cert store with the cluster CA
+    let mut root_store = rustls::RootCertStore::empty();
+    for ca_cert in &ca_certs {
+        root_store
+            .add(ca_cert.clone())
+            .map_err(|e| TlsError::ConfigBuildError(format!("failed to add CA cert: {}", e)))?;
+    }
+
+    // -- Server config: verify client certs against the cluster CA --
+    let client_verifier = if config.require_client_cert {
+        rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store.clone()))
+            .build()
+            .map_err(|e| {
+                TlsError::ConfigBuildError(format!("failed to build client verifier: {}", e))
+            })?
+    } else {
+        rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store.clone()))
+            .allow_unauthenticated()
+            .build()
+            .map_err(|e| {
+                TlsError::ConfigBuildError(format!("failed to build client verifier: {}", e))
+            })?
+    };
+
+    let server_config = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(client_verifier)
+        .with_single_cert(node_certs.clone(), node_key.clone_key())
+        .map_err(|e| TlsError::ConfigBuildError(format!("server config: {}", e)))?;
+
+    // -- Client config: present node cert, verify server against CA --
+    let client_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_client_auth_cert(node_certs, node_key)
+        .map_err(|e| TlsError::ConfigBuildError(format!("client config: {}", e)))?;
+
+    info!(
+        node_fingerprint = %node_fingerprint,
+        ca_fingerprint = %ca_fingerprint,
+        require_client_cert = config.require_client_cert,
+        "mTLS configured for gateway-to-gateway communication"
+    );
+
+    Ok(MtlsSetupResult {
+        server_config: Arc::new(server_config),
+        client_config: Arc::new(client_config),
+        node_fingerprint,
+        ca_fingerprint,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,5 +823,153 @@ mod tests {
         let metadata = std::fs::metadata(&key_path).unwrap();
         let mode = metadata.permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "Key file should have 600 permissions");
+    }
+
+    // ====================================================================
+    // mTLS config parsing tests
+    // ====================================================================
+
+    #[test]
+    fn test_mtls_config_default() {
+        let config = MtlsConfig::default();
+        assert!(!config.enabled);
+        assert!(config.ca_cert.is_none());
+        assert!(config.node_cert.is_none());
+        assert!(config.node_key.is_none());
+        assert!(config.require_client_cert);
+    }
+
+    #[test]
+    fn test_parse_mtls_config_empty() {
+        let cfg = serde_json::json!({});
+        let mtls = parse_mtls_config(&cfg);
+        assert!(!mtls.enabled);
+        assert!(mtls.ca_cert.is_none());
+        assert!(mtls.node_cert.is_none());
+        assert!(mtls.node_key.is_none());
+        assert!(mtls.require_client_cert);
+    }
+
+    #[test]
+    fn test_parse_mtls_config_enabled() {
+        let cfg = serde_json::json!({
+            "gateway": {
+                "mtls": {
+                    "enabled": true,
+                    "caCert": "/path/to/ca.pem",
+                    "nodeCert": "/path/to/node-cert.pem",
+                    "nodeKey": "/path/to/node-key.pem",
+                    "requireClientCert": false
+                }
+            }
+        });
+        let mtls = parse_mtls_config(&cfg);
+        assert!(mtls.enabled);
+        assert_eq!(mtls.ca_cert, Some(PathBuf::from("/path/to/ca.pem")));
+        assert_eq!(
+            mtls.node_cert,
+            Some(PathBuf::from("/path/to/node-cert.pem"))
+        );
+        assert_eq!(mtls.node_key, Some(PathBuf::from("/path/to/node-key.pem")));
+        assert!(!mtls.require_client_cert);
+    }
+
+    #[test]
+    fn test_parse_mtls_config_defaults() {
+        let cfg = serde_json::json!({
+            "gateway": {
+                "mtls": {
+                    "enabled": true
+                }
+            }
+        });
+        let mtls = parse_mtls_config(&cfg);
+        assert!(mtls.enabled);
+        assert!(mtls.ca_cert.is_none());
+        assert!(mtls.node_cert.is_none());
+        assert!(mtls.node_key.is_none());
+        assert!(mtls.require_client_cert); // default true
+    }
+
+    #[test]
+    fn test_setup_mtls_missing_ca_cert() {
+        let config = MtlsConfig {
+            enabled: true,
+            ca_cert: None,
+            node_cert: Some(PathBuf::from("/some/cert.pem")),
+            node_key: Some(PathBuf::from("/some/key.pem")),
+            require_client_cert: true,
+        };
+        let result = setup_mtls(&config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_setup_mtls_missing_node_cert() {
+        let config = MtlsConfig {
+            enabled: true,
+            ca_cert: Some(PathBuf::from("/some/ca.pem")),
+            node_cert: None,
+            node_key: Some(PathBuf::from("/some/key.pem")),
+            require_client_cert: true,
+        };
+        let result = setup_mtls(&config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_setup_mtls_missing_node_key() {
+        let config = MtlsConfig {
+            enabled: true,
+            ca_cert: Some(PathBuf::from("/some/ca.pem")),
+            node_cert: Some(PathBuf::from("/some/cert.pem")),
+            node_key: None,
+            require_client_cert: true,
+        };
+        let result = setup_mtls(&config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_setup_mtls_with_valid_certs() {
+        let dir = TempDir::new().unwrap();
+
+        // Generate a cluster CA and node cert
+        let ca = ca::ClusterCA::generate(dir.path()).unwrap();
+        let node_dir = dir.path().join("nodes");
+        let node_cert = ca.issue_node_cert("test-node", &node_dir).unwrap();
+
+        let config = MtlsConfig {
+            enabled: true,
+            ca_cert: Some(ca.ca_cert_path()),
+            node_cert: Some(node_cert.cert_path.clone()),
+            node_key: Some(node_cert.key_path.clone()),
+            require_client_cert: true,
+        };
+
+        let result = setup_mtls(&config).unwrap();
+        assert!(!result.node_fingerprint.is_empty());
+        assert!(!result.ca_fingerprint.is_empty());
+        assert_ne!(result.node_fingerprint, result.ca_fingerprint);
+    }
+
+    #[test]
+    fn test_setup_mtls_optional_client_cert() {
+        let dir = TempDir::new().unwrap();
+
+        let ca = ca::ClusterCA::generate(dir.path()).unwrap();
+        let node_dir = dir.path().join("nodes");
+        let node_cert = ca.issue_node_cert("test-node-opt", &node_dir).unwrap();
+
+        let config = MtlsConfig {
+            enabled: true,
+            ca_cert: Some(ca.ca_cert_path()),
+            node_cert: Some(node_cert.cert_path.clone()),
+            node_key: Some(node_cert.key_path.clone()),
+            require_client_cert: false,
+        };
+
+        let result = setup_mtls(&config);
+        assert!(result.is_ok());
     }
 }

@@ -142,6 +142,59 @@ pub enum Command {
         #[arg(long)]
         version: Option<String>,
     },
+
+    /// Manage mTLS certificates for gateway-to-gateway communication.
+    #[command(subcommand)]
+    Tls(TlsCommand),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TlsCommand {
+    /// Generate a new cluster CA certificate.
+    InitCa {
+        /// Output directory for CA files (default: ~/.config/carapace/cluster-ca).
+        #[arg(long)]
+        output: Option<String>,
+    },
+
+    /// Issue a node certificate signed by the cluster CA.
+    IssueCert {
+        /// Node ID to embed in the certificate CN.
+        node_id: String,
+
+        /// Directory containing the cluster CA files.
+        #[arg(long)]
+        ca_dir: Option<String>,
+
+        /// Output directory for the node certificate and key.
+        #[arg(long)]
+        output: Option<String>,
+    },
+
+    /// Revoke a node certificate by fingerprint.
+    RevokeCert {
+        /// SHA-256 fingerprint of the certificate to revoke (colon-separated hex).
+        fingerprint: String,
+
+        /// Node ID associated with the certificate.
+        #[arg(long)]
+        node_id: String,
+
+        /// Directory containing the cluster CA files.
+        #[arg(long)]
+        ca_dir: Option<String>,
+
+        /// Reason for revocation.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+
+    /// Show cluster CA information and certificate revocation list.
+    ShowCa {
+        /// Directory containing the cluster CA files.
+        #[arg(long)]
+        ca_dir: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1274,6 +1327,133 @@ fn format_timestamp(ms: u64) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// TLS / mTLS subcommand handlers
+// ---------------------------------------------------------------------------
+
+/// Run the `tls init-ca` subcommand.
+pub fn handle_tls_init_ca(output: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let ca_dir = match output {
+        Some(p) => PathBuf::from(p),
+        None => crate::tls::ca::default_ca_dir(),
+    };
+
+    let ca = crate::tls::ca::ClusterCA::generate(&ca_dir)?;
+
+    println!("Cluster CA generated successfully");
+    println!("  Directory:   {}", ca_dir.display());
+    println!("  Certificate: {}", ca.ca_cert_path().display());
+    println!("  Key:         {}", ca.ca_key_path().display());
+    println!("  Fingerprint: {}", ca.ca_fingerprint());
+    println!();
+    println!("Distribute the CA certificate to all gateway nodes.");
+    println!("Keep the CA private key secure.");
+
+    Ok(())
+}
+
+/// Run the `tls issue-cert` subcommand.
+pub fn handle_tls_issue_cert(
+    node_id: &str,
+    ca_dir_opt: Option<&str>,
+    output_opt: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ca_dir = match ca_dir_opt {
+        Some(p) => PathBuf::from(p),
+        None => crate::tls::ca::default_ca_dir(),
+    };
+
+    let output_dir = match output_opt {
+        Some(p) => PathBuf::from(p),
+        None => ca_dir.join("nodes"),
+    };
+
+    let ca = crate::tls::ca::ClusterCA::load(&ca_dir)?;
+    let cert = ca.issue_node_cert(node_id, &output_dir)?;
+
+    println!("Node certificate issued successfully");
+    println!("  Node ID:     {}", cert.node_id);
+    println!("  Certificate: {}", cert.cert_path.display());
+    println!("  Key:         {}", cert.key_path.display());
+    println!("  Fingerprint: {}", cert.fingerprint);
+    println!();
+    println!("Deploy these files to the node and configure gateway.mtls:");
+    println!("  nodeCert: \"{}\"", cert.cert_path.display());
+    println!("  nodeKey:  \"{}\"", cert.key_path.display());
+
+    Ok(())
+}
+
+/// Run the `tls revoke-cert` subcommand.
+pub fn handle_tls_revoke_cert(
+    fingerprint: &str,
+    node_id: &str,
+    ca_dir_opt: Option<&str>,
+    reason: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ca_dir = match ca_dir_opt {
+        Some(p) => PathBuf::from(p),
+        None => crate::tls::ca::default_ca_dir(),
+    };
+
+    let ca = crate::tls::ca::ClusterCA::load(&ca_dir)?;
+    let revoked = ca.revoke_cert(fingerprint, node_id, reason.map(|s| s.to_string()))?;
+
+    if revoked {
+        println!("Certificate revoked successfully");
+        println!("  Fingerprint: {}", fingerprint);
+        println!("  Node ID:     {}", node_id);
+        if let Some(r) = reason {
+            println!("  Reason:      {}", r);
+        }
+    } else {
+        println!("Certificate was already revoked: {}", fingerprint);
+    }
+
+    Ok(())
+}
+
+/// Run the `tls show-ca` subcommand.
+pub fn handle_tls_show_ca(ca_dir_opt: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let ca_dir = match ca_dir_opt {
+        Some(p) => PathBuf::from(p),
+        None => crate::tls::ca::default_ca_dir(),
+    };
+
+    let ca = crate::tls::ca::ClusterCA::load(&ca_dir)?;
+
+    println!("Cluster CA Information");
+    println!("=====================");
+    println!("  Directory:   {}", ca.ca_dir().display());
+    println!("  Certificate: {}", ca.ca_cert_path().display());
+    println!("  Key:         {}", ca.ca_key_path().display());
+    println!("  Fingerprint: {}", ca.ca_fingerprint());
+
+    let entries = ca.crl_entries();
+    if entries.is_empty() {
+        println!();
+        println!("Certificate Revocation List: (empty)");
+    } else {
+        println!();
+        println!("Certificate Revocation List ({} entries):", entries.len());
+        for entry in &entries {
+            println!(
+                "  - {} (node: {}, revoked at: {}{})",
+                entry.fingerprint,
+                entry.node_id,
+                entry.revoked_at_ms,
+                entry
+                    .reason
+                    .as_deref()
+                    .map(|r| format!(", reason: {}", r))
+                    .unwrap_or_default()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2191,5 +2371,155 @@ mod tests {
             std::cmp::Ordering::Less,
             "Current should be less than latest when update is available"
         );
+    }
+
+    // ====================================================================
+    // TLS subcommand parsing tests
+    // ====================================================================
+
+    #[test]
+    fn test_cli_tls_init_ca() {
+        let cli = Cli::try_parse_from(["carapace", "tls", "init-ca"]).unwrap();
+        match cli.command {
+            Some(Command::Tls(TlsCommand::InitCa { output })) => {
+                assert!(output.is_none());
+            }
+            other => panic!("Expected Tls(InitCa), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_tls_init_ca_with_output() {
+        let cli =
+            Cli::try_parse_from(["carapace", "tls", "init-ca", "--output", "/tmp/ca"]).unwrap();
+        match cli.command {
+            Some(Command::Tls(TlsCommand::InitCa { output })) => {
+                assert_eq!(output.as_deref(), Some("/tmp/ca"));
+            }
+            other => panic!("Expected Tls(InitCa), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_tls_issue_cert() {
+        let cli = Cli::try_parse_from(["carapace", "tls", "issue-cert", "node-east-1"]).unwrap();
+        match cli.command {
+            Some(Command::Tls(TlsCommand::IssueCert {
+                node_id,
+                ca_dir,
+                output,
+            })) => {
+                assert_eq!(node_id, "node-east-1");
+                assert!(ca_dir.is_none());
+                assert!(output.is_none());
+            }
+            other => panic!("Expected Tls(IssueCert), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_tls_issue_cert_with_options() {
+        let cli = Cli::try_parse_from([
+            "carapace",
+            "tls",
+            "issue-cert",
+            "node-west-2",
+            "--ca-dir",
+            "/etc/carapace/ca",
+            "--output",
+            "/etc/carapace/nodes",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Tls(TlsCommand::IssueCert {
+                node_id,
+                ca_dir,
+                output,
+            })) => {
+                assert_eq!(node_id, "node-west-2");
+                assert_eq!(ca_dir.as_deref(), Some("/etc/carapace/ca"));
+                assert_eq!(output.as_deref(), Some("/etc/carapace/nodes"));
+            }
+            other => panic!("Expected Tls(IssueCert), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_tls_revoke_cert() {
+        let cli = Cli::try_parse_from([
+            "carapace",
+            "tls",
+            "revoke-cert",
+            "AA:BB:CC:DD",
+            "--node-id",
+            "node-1",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Tls(TlsCommand::RevokeCert {
+                fingerprint,
+                node_id,
+                ca_dir,
+                reason,
+            })) => {
+                assert_eq!(fingerprint, "AA:BB:CC:DD");
+                assert_eq!(node_id, "node-1");
+                assert!(ca_dir.is_none());
+                assert!(reason.is_none());
+            }
+            other => panic!("Expected Tls(RevokeCert), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_tls_revoke_cert_with_reason() {
+        let cli = Cli::try_parse_from([
+            "carapace",
+            "tls",
+            "revoke-cert",
+            "AA:BB:CC:DD",
+            "--node-id",
+            "node-1",
+            "--reason",
+            "key compromised",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Tls(TlsCommand::RevokeCert {
+                fingerprint,
+                node_id,
+                ca_dir,
+                reason,
+            })) => {
+                assert_eq!(fingerprint, "AA:BB:CC:DD");
+                assert_eq!(node_id, "node-1");
+                assert!(ca_dir.is_none());
+                assert_eq!(reason.as_deref(), Some("key compromised"));
+            }
+            other => panic!("Expected Tls(RevokeCert), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_tls_show_ca() {
+        let cli = Cli::try_parse_from(["carapace", "tls", "show-ca"]).unwrap();
+        match cli.command {
+            Some(Command::Tls(TlsCommand::ShowCa { ca_dir })) => {
+                assert!(ca_dir.is_none());
+            }
+            other => panic!("Expected Tls(ShowCa), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_tls_show_ca_with_dir() {
+        let cli =
+            Cli::try_parse_from(["carapace", "tls", "show-ca", "--ca-dir", "/tmp/ca"]).unwrap();
+        match cli.command {
+            Some(Command::Tls(TlsCommand::ShowCa { ca_dir })) => {
+                assert_eq!(ca_dir.as_deref(), Some("/tmp/ca"));
+            }
+            other => panic!("Expected Tls(ShowCa), got {:?}", other),
+        }
     }
 }
