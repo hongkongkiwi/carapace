@@ -73,6 +73,7 @@ const MAX_JSON_DEPTH: usize = 32;
 const ERROR_INVALID_REQUEST: &str = "INVALID_REQUEST";
 const ERROR_NOT_PAIRED: &str = "NOT_PAIRED";
 const ERROR_UNAVAILABLE: &str = "UNAVAILABLE";
+const ERROR_RATE_LIMITED: &str = "RATE_LIMITED";
 // Note: Node doesn't use ERROR_FORBIDDEN - use ERROR_INVALID_REQUEST for auth errors
 
 const ALLOWED_CLIENT_IDS: [&str; 12] = [
@@ -278,6 +279,10 @@ pub struct WsServerConfig {
     /// Maximum JSON nesting depth for incoming WS messages.
     /// `None` means use the default (32).
     pub max_json_depth: Option<usize>,
+    /// Per-connection WS message rate (messages/sec). Default 60.
+    pub ws_message_rate: Option<f64>,
+    /// Per-connection WS message burst capacity. Default 120.
+    pub ws_message_burst: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1010,6 +1015,13 @@ pub async fn build_ws_config_from_files() -> Result<WsServerConfig, WsConfigErro
         .and_then(|v| v.as_u64())
         .map(|v| v as usize);
 
+    let ws_message_rate = ws_obj
+        .and_then(|w| w.get("messageRate"))
+        .and_then(|v| v.as_f64());
+    let ws_message_burst = ws_obj
+        .and_then(|w| w.get("messageBurst"))
+        .and_then(|v| v.as_f64());
+
     Ok(WsServerConfig {
         auth: WsAuthConfig {
             resolved: auth::ResolvedGatewayAuth {
@@ -1029,6 +1041,8 @@ pub async fn build_ws_config_from_files() -> Result<WsServerConfig, WsConfigErro
         max_ws_connections,
         max_ws_per_ip,
         max_json_depth,
+        ws_message_rate,
+        ws_message_burst,
     })
 }
 
@@ -1756,6 +1770,20 @@ async fn handle_socket(
         }
     });
 
+    // Per-connection rate limiter
+    let mut ws_rate_limiter = {
+        let rate = state
+            .config
+            .ws_message_rate
+            .unwrap_or(crate::server::ratelimit::DEFAULT_WS_MESSAGE_RATE);
+        let burst = state
+            .config
+            .ws_message_burst
+            .unwrap_or(crate::server::ratelimit::DEFAULT_WS_MESSAGE_BURST);
+        crate::server::ratelimit::WsRateLimiter::new(rate, burst)
+    };
+    let mut ws_rate_warn_count: u32 = 0;
+
     while let Some(next) = receiver.next().await {
         let msg = match next {
             Ok(msg) => msg,
@@ -1800,6 +1828,20 @@ async fn handle_socket(
                 continue;
             }
         };
+
+        // Per-connection rate limiting
+        if !ws_rate_limiter.try_consume() {
+            ws_rate_warn_count += 1;
+            if ws_rate_warn_count >= 3 {
+                let _ = send_close(&tx, 1008, "rate limit exceeded");
+                break;
+            }
+            let err = error_shape(ERROR_RATE_LIMITED, "rate limit exceeded", None);
+            let _ = send_response(&tx, &req_id, false, None, Some(err));
+            continue;
+        }
+        // Reset warning count on successful consume
+        ws_rate_warn_count = 0;
         if let Some(ref p) = params {
             if let Err(depth_err) = validate_json_depth(p, json_depth_limit) {
                 let err = error_shape(ERROR_INVALID_REQUEST, &depth_err, None);

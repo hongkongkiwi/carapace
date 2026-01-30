@@ -559,6 +559,68 @@ pub fn layer_with_config(config: RateLimitConfig) -> RateLimitLayer {
     RateLimitLayer::with_config(config)
 }
 
+// ============================================================================
+// Per-Connection WebSocket Rate Limiter
+// ============================================================================
+
+/// Per-connection WebSocket message rate limiter.
+///
+/// Uses a token bucket algorithm, but this struct is owned by a single
+/// connection — no atomics or locks needed.
+#[derive(Debug)]
+pub struct WsRateLimiter {
+    /// Current token count.
+    tokens: f64,
+    /// Last time tokens were refilled.
+    last_refill: Instant,
+    /// Messages per second refill rate.
+    rate: f64,
+    /// Maximum burst capacity (token bucket max).
+    max_burst: f64,
+}
+
+/// Default WS message rate: 60 messages/second.
+pub const DEFAULT_WS_MESSAGE_RATE: f64 = 60.0;
+
+/// Default WS message burst: 120 messages.
+pub const DEFAULT_WS_MESSAGE_BURST: f64 = 120.0;
+
+impl WsRateLimiter {
+    /// Create a new rate limiter with the given rate and burst.
+    pub fn new(rate: f64, burst: f64) -> Self {
+        Self {
+            tokens: burst,
+            last_refill: Instant::now(),
+            rate,
+            max_burst: burst,
+        }
+    }
+
+    /// Try to consume one token. Returns `true` if allowed.
+    pub fn try_consume(&mut self) -> bool {
+        self.refill();
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn refill(&mut self) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.rate).min(self.max_burst);
+        self.last_refill = now;
+    }
+}
+
+impl Default for WsRateLimiter {
+    fn default() -> Self {
+        Self::new(DEFAULT_WS_MESSAGE_RATE, DEFAULT_WS_MESSAGE_BURST)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -834,5 +896,53 @@ mod tests {
         assert_eq!(config.prefix, "/api/v1/");
         assert_eq!(config.rate, 50);
         assert_eq!(config.burst, 100);
+    }
+
+    // --- WsRateLimiter tests ---
+
+    #[test]
+    fn test_ws_rate_limiter_default() {
+        let limiter = WsRateLimiter::default();
+        assert_eq!(limiter.rate, DEFAULT_WS_MESSAGE_RATE);
+        assert_eq!(limiter.max_burst, DEFAULT_WS_MESSAGE_BURST);
+    }
+
+    #[test]
+    fn test_ws_rate_limiter_burst_then_reject() {
+        let mut limiter = WsRateLimiter::new(10.0, 5.0);
+        // Should allow 5 messages (burst capacity)
+        for _ in 0..5 {
+            assert!(limiter.try_consume(), "should allow within burst");
+        }
+        // 6th should be rejected
+        assert!(
+            !limiter.try_consume(),
+            "should reject after burst exhausted"
+        );
+    }
+
+    #[test]
+    fn test_ws_rate_limiter_refill() {
+        let mut limiter = WsRateLimiter::new(100.0, 5.0);
+        // Exhaust burst
+        for _ in 0..5 {
+            limiter.try_consume();
+        }
+        assert!(!limiter.try_consume());
+
+        // Wait for refill
+        sleep(Duration::from_millis(50));
+        // At 100/sec, 50ms = ~5 tokens refilled
+        assert!(limiter.try_consume(), "should allow after refill");
+    }
+
+    #[test]
+    fn test_ws_rate_limiter_does_not_exceed_max_burst() {
+        let mut limiter = WsRateLimiter::new(1000.0, 10.0);
+        // Wait to let tokens accumulate beyond burst
+        sleep(Duration::from_millis(50));
+        limiter.refill();
+        // Tokens should be capped at max_burst
+        assert!(limiter.tokens <= limiter.max_burst + 0.01);
     }
 }
