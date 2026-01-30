@@ -2,8 +2,12 @@
 
 use serde_json::{json, Value};
 use std::io::Write;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+use hickory_resolver::config::{ResolverConfig, ResolverOpts};
+use hickory_resolver::TokioAsyncResolver;
 
 use super::super::*;
 use super::config::{map_validation_issues, read_config_snapshot, write_config_file};
@@ -289,6 +293,75 @@ fn download_skill_wasm(
         )
     })?;
 
+    // --- DNS rebinding defense ---
+    // Extract the hostname and resolve DNS to get actual IPs. Validate each
+    // resolved IP against SSRF rules, then pin the validated IP to the HTTP
+    // client so that the connection cannot be redirected to a different IP
+    // between DNS resolution and the actual HTTP request.
+    let host = url
+        .host_str()
+        .ok_or_else(|| {
+            error_shape(
+                ERROR_INVALID_REQUEST,
+                "skill download URL has no host",
+                None,
+            )
+        })?
+        .to_string();
+    let port = url.port_or_known_default().unwrap_or(443);
+
+    let resolved_ip: Option<IpAddr> = if host.parse::<IpAddr>().is_ok() {
+        // Host is already an IP literal; URL validation above already checked it.
+        None
+    } else {
+        // Host is a hostname — resolve DNS and validate every returned IP.
+        let ip = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let resolver =
+                    TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
+
+                let lookup = resolver.lookup_ip(&host).await.map_err(|e| {
+                    error_shape(
+                        ERROR_UNAVAILABLE,
+                        &format!("DNS resolution failed for {}: {}", host, e),
+                        None,
+                    )
+                })?;
+
+                let mut first_valid: Option<IpAddr> = None;
+                for ip in lookup.iter() {
+                    SsrfProtection::validate_resolved_ip(&ip, &host).map_err(|e| {
+                        error_shape(
+                            ERROR_INVALID_REQUEST,
+                            &format!("skill download blocked by DNS rebinding protection: {}", e),
+                            None,
+                        )
+                    })?;
+                    if first_valid.is_none() {
+                        first_valid = Some(ip);
+                    }
+                }
+
+                first_valid.ok_or_else(|| {
+                    error_shape(
+                        ERROR_UNAVAILABLE,
+                        &format!("DNS resolution returned no addresses for {}", host),
+                        None,
+                    )
+                })
+            })
+        })?;
+
+        tracing::debug!(
+            url = %url,
+            host = %host,
+            resolved_ip = %ip,
+            "DNS resolved and validated for skill download"
+        );
+
+        Some(ip)
+    };
+
     std::fs::create_dir_all(skills_dir).map_err(|e| {
         error_shape(
             ERROR_UNAVAILABLE,
@@ -297,16 +370,26 @@ fn download_skill_wasm(
         )
     })?;
 
-    let client = reqwest::blocking::Client::builder()
+    let mut client_builder = reqwest::blocking::Client::builder()
         .timeout(SKILL_DOWNLOAD_TIMEOUT)
-        .build()
-        .map_err(|e| {
-            error_shape(
-                ERROR_UNAVAILABLE,
-                &format!("failed to create HTTP client: {}", e),
-                None,
-            )
-        })?;
+        // SECURITY: Disable redirects to prevent redirect-based SSRF bypass.
+        // An attacker could redirect from a public URL to a private IP.
+        .redirect(reqwest::redirect::Policy::none());
+
+    // Pin the validated IP so the HTTP client connects directly to it,
+    // preventing any second DNS lookup from returning a different address.
+    if let Some(ip) = resolved_ip {
+        let socket_addr = std::net::SocketAddr::new(ip, port);
+        client_builder = client_builder.resolve(&host, socket_addr);
+    }
+
+    let client = client_builder.build().map_err(|e| {
+        error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("failed to create HTTP client: {}", e),
+            None,
+        )
+    })?;
 
     let response = client.get(url.as_str()).send().map_err(|e| {
         error_shape(
@@ -860,13 +943,22 @@ mod tests {
 
     // ---- SSRF protection tests for skill downloads ----
 
-    #[test]
-    fn test_download_skill_ssrf_public_url_passes_validation() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_download_skill_ssrf_public_url_passes_validation() {
         // A public URL should pass SSRF validation (will fail later at the network level,
         // but the SSRF check itself should not reject it).
+        // This test requires a tokio multi_thread runtime because the function
+        // performs async DNS resolution for hostname-based URLs via block_in_place.
+        // We use spawn_blocking to avoid reqwest::blocking::Client's internal
+        // runtime conflicting with the test runtime on drop.
         let dir = TempDir::new().unwrap();
-        let url = url::Url::parse("https://example.com/skills/my-skill.wasm").unwrap();
-        let result = download_skill_wasm(&url, dir.path(), "test.wasm");
+        let dir_path = dir.path().to_path_buf();
+        let result = tokio::task::spawn_blocking(move || {
+            let url = url::Url::parse("https://example.com/skills/my-skill.wasm").unwrap();
+            download_skill_wasm(&url, &dir_path, "test.wasm")
+        })
+        .await
+        .unwrap();
         // Should fail with a network error, NOT an SSRF error
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -1337,6 +1429,79 @@ mod tests {
         assert!(
             result.is_ok(),
             "legacy entries without sha256 should pass verification"
+        );
+    }
+
+    // ---- DNS rebinding defense tests ----
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_download_skill_dns_rebinding_defense_active() {
+        // Verify that the DNS rebinding defense code path is active by testing
+        // that both IP-literal and hostname-based URLs are handled correctly.
+        // Requires a tokio multi_thread runtime because the hostname path uses
+        // async DNS resolution via block_in_place. We use spawn_blocking to
+        // isolate the reqwest::blocking::Client from the async test runtime.
+
+        // IP literal: blocked at URL validation (no DNS resolution path).
+        // This part does not need spawn_blocking since it fails before
+        // creating any blocking HTTP client.
+        let dir = TempDir::new().unwrap();
+        let ip_url = url::Url::parse("http://10.0.0.1/skill.wasm").unwrap();
+        let result = download_skill_wasm(&ip_url, dir.path(), "test.wasm");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("SSRF"),
+            "IP-literal private URL should be blocked by SSRF protection, got: {}",
+            err.message
+        );
+
+        // Hostname-based URL with a public domain: passes URL validation but
+        // enters the DNS resolution + IP validation path. Will fail at the
+        // network/DNS level (not SSRF), confirming the defense path is active.
+        let dir2 = TempDir::new().unwrap();
+        let dir2_path = dir2.path().to_path_buf();
+        let result = tokio::task::spawn_blocking(move || {
+            let hostname_url = url::Url::parse("https://example.com/skills/my-skill.wasm").unwrap();
+            download_skill_wasm(&hostname_url, &dir2_path, "test.wasm")
+        })
+        .await
+        .unwrap();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        // The error should NOT be an SSRF error -- example.com resolves to a
+        // public IP. The error will be a DNS/network error since we are running
+        // in a test environment, but critically it must not be an SSRF block.
+        assert!(
+            !err.message.contains("SSRF") && !err.message.contains("rebinding"),
+            "public hostname URL should not be blocked by SSRF/rebinding protection, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_download_skill_hostname_url_passes_ssrf_validation() {
+        // Verify that a hostname-based URL with a legitimate public domain
+        // passes through SSRF URL validation and reaches the DNS resolution
+        // stage (where it may fail due to network, but that is expected).
+        // Requires a tokio multi_thread runtime for the async DNS resolution path.
+        // We use spawn_blocking to isolate the reqwest::blocking::Client.
+        let dir = TempDir::new().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        let result = tokio::task::spawn_blocking(move || {
+            let url = url::Url::parse("https://cdn.example.org/plugins/translator.wasm").unwrap();
+            download_skill_wasm(&url, &dir_path, "translator.wasm")
+        })
+        .await
+        .unwrap();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        // Must not fail with an SSRF or rebinding error -- the hostname and
+        // its (eventual) resolved IP are both public.
+        assert!(
+            !err.message.contains("SSRF") && !err.message.contains("rebinding"),
+            "legitimate hostname URL must not be rejected by SSRF/rebinding checks, got: {}",
+            err.message
         );
     }
 }

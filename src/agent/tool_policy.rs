@@ -71,6 +71,27 @@ impl ToolPolicy {
         }
     }
 
+    /// Filter a list of tool definitions, optionally excluding
+    /// exfiltration-sensitive tools when the guard is enabled.
+    ///
+    /// This combines the standard policy filter with the exfiltration guard
+    /// so the LLM never even sees blocked tools (defence-in-depth).
+    pub fn filter_tools_with_guard(
+        &self,
+        tools: Vec<ToolDefinition>,
+        exfiltration_guard: bool,
+    ) -> Vec<ToolDefinition> {
+        let filtered = self.filter_tools(tools);
+        if exfiltration_guard {
+            filtered
+                .into_iter()
+                .filter(|t| !crate::agent::exfiltration::is_exfiltration_sensitive(&t.name))
+                .collect()
+        } else {
+            filtered
+        }
+    }
+
     /// Parse a `ToolPolicy` from a JSON config value.
     ///
     /// Expects an object shaped like:
@@ -295,6 +316,99 @@ mod tests {
         let policy = ToolPolicy::from_config(Some(&val));
         let expected: HashSet<String> = ["time", "search"].iter().map(|s| s.to_string()).collect();
         assert_eq!(policy, ToolPolicy::AllowList(expected));
+    }
+
+    // ===== filter_tools_with_guard =====
+
+    #[test]
+    fn test_filter_tools_with_guard_disabled_passes_all() {
+        let policy = ToolPolicy::AllowAll;
+        let tools = vec![
+            make_tool("time"),
+            make_tool("web_fetch"),
+            make_tool("message_send"),
+        ];
+        let filtered = policy.filter_tools_with_guard(tools, false);
+        assert_eq!(filtered.len(), 3);
+    }
+
+    #[test]
+    fn test_filter_tools_with_guard_enabled_removes_sensitive() {
+        let policy = ToolPolicy::AllowAll;
+        let tools = vec![
+            make_tool("time"),
+            make_tool("web_fetch"),
+            make_tool("message_send"),
+            make_tool("telegram_edit_message"),
+            make_tool("search"),
+        ];
+        let filtered = policy.filter_tools_with_guard(tools, true);
+        let names: Vec<&str> = filtered.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["time", "search"]);
+    }
+
+    #[test]
+    fn test_filter_tools_with_guard_combines_with_policy() {
+        // Allow-list only permits "time" and "web_fetch".
+        // Exfiltration guard removes "web_fetch".
+        // Result: only "time" survives.
+        let policy = ToolPolicy::AllowList(
+            ["time", "web_fetch"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        let tools = vec![
+            make_tool("time"),
+            make_tool("web_fetch"),
+            make_tool("search"),
+        ];
+        let filtered = policy.filter_tools_with_guard(tools, true);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "time");
+    }
+
+    #[test]
+    fn test_filter_tools_with_guard_enabled_no_sensitive_tools() {
+        let policy = ToolPolicy::AllowAll;
+        let tools = vec![make_tool("time"), make_tool("search")];
+        let filtered = policy.filter_tools_with_guard(tools, true);
+        assert_eq!(filtered.len(), 2);
+    }
+
+    #[test]
+    fn test_filter_tools_with_guard_enabled_empty_input() {
+        let policy = ToolPolicy::AllowAll;
+        let filtered = policy.filter_tools_with_guard(vec![], true);
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_filter_tools_with_guard_all_channel_tools_removed() {
+        let policy = ToolPolicy::AllowAll;
+        let tools = vec![
+            make_tool("time"),
+            make_tool("telegram_edit_message"),
+            make_tool("telegram_delete_message"),
+            make_tool("telegram_pin_message"),
+            make_tool("telegram_reply_markup"),
+            make_tool("telegram_send_photo"),
+            make_tool("discord_add_reaction"),
+            make_tool("discord_send_embed"),
+            make_tool("discord_create_thread"),
+            make_tool("discord_edit_message"),
+            make_tool("discord_delete_message"),
+            make_tool("slack_send_blocks"),
+            make_tool("slack_send_ephemeral"),
+            make_tool("slack_add_reaction"),
+            make_tool("slack_update_message"),
+            make_tool("slack_delete_message"),
+            make_tool("web_fetch"),
+            make_tool("message_send"),
+        ];
+        let filtered = policy.filter_tools_with_guard(tools, true);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "time");
     }
 
     // ===== Default =====

@@ -9,6 +9,7 @@ pub mod builtin_tools;
 pub mod channel_tools;
 pub mod context;
 pub mod executor;
+pub mod exfiltration;
 pub mod gemini;
 pub mod ollama;
 pub mod openai;
@@ -77,6 +78,11 @@ pub struct AgentConfig {
     pub deliver: bool,
     /// Tool policy controlling which tools this agent may invoke.
     pub tool_policy: ToolPolicy,
+    /// When `true`, exfiltration-sensitive tools (those that send data to
+    /// external services) are blocked at both the definition and dispatch
+    /// levels.  This prevents prompt-injection attacks from silently
+    /// exfiltrating user data.  Default: `false` (backward-compatible).
+    pub exfiltration_guard: bool,
 }
 
 impl Default for AgentConfig {
@@ -89,6 +95,7 @@ impl Default for AgentConfig {
             temperature: None,
             deliver: false,
             tool_policy: ToolPolicy::default(),
+            exfiltration_guard: false,
         }
     }
 }

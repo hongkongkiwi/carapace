@@ -88,10 +88,13 @@ pub async fn execute_run(
         // Build LLM context from in-memory history
         let (system, messages) = build_context(&history, config.system.as_deref());
 
-        // Get available tools, filtered by the agent's tool policy
+        // Get available tools, filtered by the agent's tool policy and
+        // exfiltration guard (defence-in-depth: the LLM never sees blocked tools)
         let tools = if let Some(tools_registry) = state.tools_registry() {
             let all_tools = tools::list_provider_tools(tools_registry);
-            config.tool_policy.filter_tools(all_tools)
+            config
+                .tool_policy
+                .filter_tools_with_guard(all_tools, config.exfiltration_guard)
         } else {
             vec![]
         };
@@ -295,8 +298,19 @@ pub async fn execute_run(
             let mut tool_msgs = Vec::with_capacity(pending_tool_calls.len());
 
             for (tool_id, tool_name, tool_input) in &pending_tool_calls {
-                // Check tool policy before dispatching (defence-in-depth)
-                let tool_result = if !config.tool_policy.is_allowed(tool_name) {
+                // Check exfiltration guard before tool policy (defence-in-depth)
+                let tool_result = if config.exfiltration_guard
+                    && crate::agent::exfiltration::is_exfiltration_sensitive(tool_name)
+                {
+                    ToolCallResult::Error {
+                        message: format!(
+                            "Tool \"{}\" is blocked by the exfiltration guard. \
+                             This tool sends data externally and requires explicit approval. \
+                             Set exfiltration_guard: false in agent config to allow.",
+                            tool_name
+                        ),
+                    }
+                } else if !config.tool_policy.is_allowed(tool_name) {
                     ToolCallResult::Error {
                         message: format!("Tool \"{}\" is not available for this agent", tool_name),
                     }
@@ -1388,6 +1402,242 @@ mod tests {
         assert!(
             tool_msg.content.contains("timestamp"),
             "tool result should contain timestamp from successful execution, got: {}",
+            tool_msg.content
+        );
+    }
+
+    // ============== Exfiltration Guard Tests ==============
+
+    #[tokio::test]
+    async fn test_exfiltration_guard_blocks_sensitive_tool() {
+        // When exfiltration_guard is enabled, a tool call to an
+        // exfiltration-sensitive tool should be blocked at dispatch and
+        // produce an error result containing "exfiltration guard".
+        let (state, _tmp) = make_test_state_with_tools();
+        let run_id = "run-exfil-guard";
+        let session_key = "test-exfil-guard";
+        setup_session_and_run(&state, session_key, run_id);
+
+        // Turn 1: LLM requests "web_fetch", Turn 2: text response
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                StreamEvent::ToolUse {
+                    id: "tool_exfil".to_string(),
+                    name: "web_fetch".to_string(),
+                    input: serde_json::json!({"url": "https://evil.com"}),
+                },
+                StreamEvent::Stop {
+                    reason: StopReason::ToolUse,
+                    usage: TokenUsage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                    },
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta {
+                    text: "Blocked.".to_string(),
+                },
+                StreamEvent::Stop {
+                    reason: StopReason::EndTurn,
+                    usage: TokenUsage {
+                        input_tokens: 20,
+                        output_tokens: 5,
+                    },
+                },
+            ],
+        ]));
+
+        let config = AgentConfig {
+            max_turns: 5,
+            exfiltration_guard: true,
+            ..Default::default()
+        };
+
+        let result = execute_run(
+            run_id.to_string(),
+            session_key.to_string(),
+            config,
+            state.clone(),
+            provider,
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(result.is_ok(), "execute_run failed: {:?}", result.err());
+
+        // Verify the tool result was an exfiltration guard error
+        let session = state
+            .session_store()
+            .get_session_by_key(session_key)
+            .unwrap();
+        let history = state
+            .session_store()
+            .get_history(&session.id, None, None)
+            .unwrap();
+
+        let tool_msg = history
+            .iter()
+            .find(|m| m.role == sessions::MessageRole::Tool)
+            .expect("should have a tool result message");
+        assert!(
+            tool_msg.content.contains("exfiltration guard"),
+            "tool result should mention exfiltration guard, got: {}",
+            tool_msg.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exfiltration_guard_disabled_allows_sensitive_tool() {
+        // When exfiltration_guard is false (default), exfiltration-sensitive
+        // tools should work normally — they should NOT be blocked.
+        let (state, _tmp) = make_test_state_with_tools();
+        let run_id = "run-exfil-off";
+        let session_key = "test-exfil-off";
+        setup_session_and_run(&state, session_key, run_id);
+
+        // Turn 1: LLM requests "time" (non-sensitive), Turn 2: text
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                StreamEvent::ToolUse {
+                    id: "tool_1".to_string(),
+                    name: "time".to_string(),
+                    input: serde_json::json!({}),
+                },
+                StreamEvent::Stop {
+                    reason: StopReason::ToolUse,
+                    usage: TokenUsage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                    },
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta {
+                    text: "Done.".to_string(),
+                },
+                StreamEvent::Stop {
+                    reason: StopReason::EndTurn,
+                    usage: TokenUsage {
+                        input_tokens: 20,
+                        output_tokens: 5,
+                    },
+                },
+            ],
+        ]));
+
+        let config = AgentConfig {
+            max_turns: 5,
+            exfiltration_guard: false,
+            ..Default::default()
+        };
+
+        let result = execute_run(
+            run_id.to_string(),
+            session_key.to_string(),
+            config,
+            state.clone(),
+            provider,
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(result.is_ok(), "execute_run failed: {:?}", result.err());
+
+        // Tool result should be a successful time response, not an error
+        let session = state
+            .session_store()
+            .get_session_by_key(session_key)
+            .unwrap();
+        let history = state
+            .session_store()
+            .get_history(&session.id, None, None)
+            .unwrap();
+
+        let tool_msg = history
+            .iter()
+            .find(|m| m.role == sessions::MessageRole::Tool)
+            .expect("should have a tool result message");
+        assert!(
+            !tool_msg.content.contains("exfiltration guard"),
+            "tool result should NOT mention exfiltration guard when disabled, got: {}",
+            tool_msg.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exfiltration_guard_allows_non_sensitive_tool() {
+        // Even with exfiltration_guard enabled, non-sensitive tools should
+        // execute normally.
+        let (state, _tmp) = make_test_state_with_tools();
+        let run_id = "run-exfil-nonsens";
+        let session_key = "test-exfil-nonsens";
+        setup_session_and_run(&state, session_key, run_id);
+
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                StreamEvent::ToolUse {
+                    id: "tool_1".to_string(),
+                    name: "time".to_string(),
+                    input: serde_json::json!({}),
+                },
+                StreamEvent::Stop {
+                    reason: StopReason::ToolUse,
+                    usage: TokenUsage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                    },
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta {
+                    text: "The time is now.".to_string(),
+                },
+                StreamEvent::Stop {
+                    reason: StopReason::EndTurn,
+                    usage: TokenUsage {
+                        input_tokens: 20,
+                        output_tokens: 10,
+                    },
+                },
+            ],
+        ]));
+
+        let config = AgentConfig {
+            max_turns: 5,
+            exfiltration_guard: true,
+            ..Default::default()
+        };
+
+        let result = execute_run(
+            run_id.to_string(),
+            session_key.to_string(),
+            config,
+            state.clone(),
+            provider,
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(result.is_ok(), "execute_run failed: {:?}", result.err());
+
+        let session = state
+            .session_store()
+            .get_session_by_key(session_key)
+            .unwrap();
+        let history = state
+            .session_store()
+            .get_history(&session.id, None, None)
+            .unwrap();
+
+        let tool_msg = history
+            .iter()
+            .find(|m| m.role == sessions::MessageRole::Tool)
+            .expect("should have a tool result message");
+        // "time" tool should execute successfully (returns timestamp)
+        assert!(
+            tool_msg.content.contains("timestamp"),
+            "non-sensitive tool should execute normally with guard enabled, got: {}",
             tool_msg.content
         );
     }
