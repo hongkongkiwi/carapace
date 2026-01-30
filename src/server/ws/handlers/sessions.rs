@@ -475,10 +475,21 @@ impl AgentStreamEvent {
     }
 }
 
-pub(super) fn handle_sessions_list(
-    state: &WsServerState,
-    params: Option<&Value>,
-) -> Result<Value, ErrorShape> {
+/// Parsed filter/sort/pagination parameters for session listing.
+struct SessionListFilters {
+    filter: sessions::SessionFilter,
+    active_minutes: Option<i64>,
+    label_filter: Option<String>,
+    search_filter: Option<String>,
+    include_global: bool,
+    include_unknown: bool,
+    agent_filter: Option<String>,
+    include_last_message: bool,
+    include_derived_titles: bool,
+}
+
+/// Parse filter, sort, and pagination parameters from a sessions.list request.
+fn parse_session_list_filters(params: Option<&Value>) -> SessionListFilters {
     let mut filter = sessions::SessionFilter::new();
     if let Some(limit) = params.and_then(|v| v.get("limit")).and_then(|v| v.as_i64()) {
         if limit > 0 {
@@ -538,15 +549,6 @@ pub(super) fn handle_sessions_list(
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-
-    let sessions = state.session_store.list_sessions(filter).map_err(|err| {
-        error_shape(
-            ERROR_UNAVAILABLE,
-            &format!("session list failed: {}", err),
-            None,
-        )
-    })?;
-
     let include_global = params
         .and_then(|v| v.get("includeGlobal"))
         .and_then(|v| v.as_bool())
@@ -569,17 +571,37 @@ pub(super) fn handle_sessions_list(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    SessionListFilters {
+        filter,
+        active_minutes,
+        label_filter,
+        search_filter,
+        include_global,
+        include_unknown,
+        agent_filter,
+        include_last_message,
+        include_derived_titles,
+    }
+}
+
+/// Add metadata (last message preview, derived title, etc.) to session list entries.
+/// Also applies client-side filters (global/unknown exclusion, agent, active minutes, label, search).
+fn enrich_session_list(
+    state: &WsServerState,
+    sessions: &[sessions::Session],
+    filters: &SessionListFilters,
+) -> Vec<Value> {
     let now = now_ms() as i64;
-    let rows = sessions
+    sessions
         .iter()
         .filter(|session| {
-            if !include_global && session.session_key == "global" {
+            if !filters.include_global && session.session_key == "global" {
                 return false;
             }
-            if !include_unknown && session.session_key == "unknown" {
+            if !filters.include_unknown && session.session_key == "unknown" {
                 return false;
             }
-            if let Some(ref agent_id) = agent_filter {
+            if let Some(ref agent_id) = filters.agent_filter {
                 if let Some(meta_id) = session.metadata.agent_id.as_deref() {
                     if meta_id != agent_id.as_str() {
                         return false;
@@ -592,18 +614,18 @@ pub(super) fn handle_sessions_list(
                     return false;
                 }
             }
-            if let Some(minutes) = active_minutes {
+            if let Some(minutes) = filters.active_minutes {
                 let cutoff = now - minutes * 60_000;
                 if session.updated_at < cutoff {
                     return false;
                 }
             }
-            if let Some(ref label) = label_filter {
+            if let Some(ref label) = filters.label_filter {
                 if session.metadata.name.as_deref() != Some(label.as_str()) {
                     return false;
                 }
             }
-            if let Some(ref search) = search_filter {
+            if let Some(ref search) = filters.search_filter {
                 let mut haystack = session.session_key.clone();
                 if let Some(name) = session.metadata.name.as_ref() {
                     haystack.push(' ');
@@ -617,7 +639,7 @@ pub(super) fn handle_sessions_list(
         })
         .map(|session| {
             let mut row = session_row(session);
-            if include_last_message {
+            if filters.include_last_message {
                 if let Ok(messages) = state.session_store.get_history(&session.id, Some(1), None) {
                     if let Some(last) = messages.last() {
                         if let Some(obj) = row.as_object_mut() {
@@ -629,7 +651,7 @@ pub(super) fn handle_sessions_list(
                     }
                 }
             }
-            if include_derived_titles {
+            if filters.include_derived_titles {
                 if let Ok(messages) = state.session_store.get_history(&session.id, None, None) {
                     let title = messages
                         .iter()
@@ -644,7 +666,27 @@ pub(super) fn handle_sessions_list(
             }
             row
         })
-        .collect::<Vec<_>>();
+        .collect::<Vec<_>>()
+}
+
+pub(super) fn handle_sessions_list(
+    state: &WsServerState,
+    params: Option<&Value>,
+) -> Result<Value, ErrorShape> {
+    let filters = parse_session_list_filters(params);
+
+    let sessions = state
+        .session_store
+        .list_sessions(filters.filter.clone())
+        .map_err(|err| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("session list failed: {}", err),
+                None,
+            )
+        })?;
+
+    let rows = enrich_session_list(state, &sessions, &filters);
     Ok(json!({
         "ts": now_ms(),
         "path": state.session_store.base_path().display().to_string(),
@@ -1483,11 +1525,18 @@ pub(super) fn handle_sessions_archive_delete(
 ///   "streaming": true
 /// }
 /// ```
-pub(super) fn handle_agent(
-    params: Option<&Value>,
-    state: Arc<WsServerState>,
-    _conn: &ConnectionContext,
-) -> Result<Value, ErrorShape> {
+/// Parsed agent request parameters.
+struct AgentRequestParams<'a> {
+    message: &'a str,
+    idempotency_key: &'a str,
+    session_key: &'a str,
+    stream: bool,
+}
+
+/// Extract and validate agent request parameters (message, idempotencyKey, sessionKey, stream).
+fn parse_agent_request_params<'a>(
+    params: Option<&'a Value>,
+) -> Result<AgentRequestParams<'a>, ErrorShape> {
     let message = params
         .and_then(|v| v.get("message"))
         .and_then(|v| v.as_str())
@@ -1514,29 +1563,25 @@ pub(super) fn handle_agent(
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
-    // Check for duplicate idempotencyKey — return existing run status
-    {
-        let registry = state.agent_run_registry.lock();
-        if let Some(existing) = registry.get(idempotency_key) {
-            if matches!(
-                existing.status,
-                AgentRunStatus::Queued | AgentRunStatus::Running
-            ) {
-                return Ok(json!({
-                    "runId": existing.run_id,
-                    "status": existing.status.to_string(),
-                    "sessionKey": existing.session_key,
-                    "duplicate": true,
-                    "streaming": stream
-                }));
-            }
-        }
-    }
+    Ok(AgentRequestParams {
+        message,
+        idempotency_key,
+        session_key,
+        stream,
+    })
+}
 
+/// Create/validate the session and register the agent run.
+/// Returns (run_id, session_key, cancel_token).
+fn setup_agent_session(
+    state: &Arc<WsServerState>,
+    params: Option<&Value>,
+    agent_params: &AgentRequestParams<'_>,
+) -> Result<(String, String, CancellationToken), ErrorShape> {
     let metadata = build_session_metadata(params);
     let session = state
         .session_store
-        .get_or_create_session(session_key, metadata)
+        .get_or_create_session(agent_params.session_key, metadata)
         .map_err(|err| {
             error_shape(
                 ERROR_UNAVAILABLE,
@@ -1546,7 +1591,10 @@ pub(super) fn handle_agent(
         })?;
     state
         .session_store
-        .append_message(sessions::ChatMessage::user(session.id.clone(), message))
+        .append_message(sessions::ChatMessage::user(
+            session.id.clone(),
+            agent_params.message,
+        ))
         .map_err(|err| {
             error_shape(
                 ERROR_UNAVAILABLE,
@@ -1558,10 +1606,10 @@ pub(super) fn handle_agent(
     // Create the agent run
     let cancel_token = CancellationToken::new();
     let run = AgentRun {
-        run_id: idempotency_key.to_string(),
+        run_id: agent_params.idempotency_key.to_string(),
         session_key: session.session_key.clone(),
         status: AgentRunStatus::Queued,
-        message: message.to_string(),
+        message: agent_params.message.to_string(),
         response: String::new(),
         error: None,
         created_at: now_ms(),
@@ -1579,6 +1627,38 @@ pub(super) fn handle_agent(
         let mut registry = state.agent_run_registry.lock();
         registry.register(run);
     }
+
+    Ok((run_id, session_key_out, cancel_token))
+}
+
+pub(super) fn handle_agent(
+    params: Option<&Value>,
+    state: Arc<WsServerState>,
+    _conn: &ConnectionContext,
+) -> Result<Value, ErrorShape> {
+    let agent_params = parse_agent_request_params(params)?;
+
+    // Check for duplicate idempotencyKey — return existing run status
+    {
+        let registry = state.agent_run_registry.lock();
+        if let Some(existing) = registry.get(agent_params.idempotency_key) {
+            if matches!(
+                existing.status,
+                AgentRunStatus::Queued | AgentRunStatus::Running
+            ) {
+                return Ok(json!({
+                    "runId": existing.run_id,
+                    "status": existing.status.to_string(),
+                    "sessionKey": existing.session_key,
+                    "duplicate": true,
+                    "streaming": agent_params.stream
+                }));
+            }
+        }
+    }
+
+    let (run_id, session_key_out, cancel_token) =
+        setup_agent_session(&state, params, &agent_params)?;
 
     // Spawn the agent executor if an LLM provider is configured
     let status = if let Some(provider) = state.llm_provider() {
@@ -1615,9 +1695,9 @@ pub(super) fn handle_agent(
     Ok(json!({
         "runId": run_id,
         "status": status,
-        "message": message,
+        "message": agent_params.message,
         "sessionKey": session_key_out,
-        "streaming": stream
+        "streaming": agent_params.stream
     }))
 }
 
@@ -1893,11 +1973,18 @@ pub(super) fn handle_chat_history(
 ///   "agentTriggered": true | false
 /// }
 /// ```
-pub(super) fn handle_chat_send(
-    state: Arc<WsServerState>,
-    params: Option<&Value>,
-    _conn: &ConnectionContext,
-) -> Result<Value, ErrorShape> {
+/// Parsed chat send parameters.
+struct ChatSendParams<'a> {
+    session_id: Option<&'a str>,
+    session_key: Option<String>,
+    message: &'a str,
+    idempotency_key: &'a str,
+    stream: bool,
+    trigger_agent: bool,
+}
+
+/// Extract and validate chat send parameters (session key, message, idempotencyKey, etc.).
+fn parse_chat_send_params<'a>(params: Option<&'a Value>) -> Result<ChatSendParams<'a>, ErrorShape> {
     let session_id = params
         .and_then(|v| v.get("sessionId"))
         .and_then(|v| v.as_str())
@@ -1928,10 +2015,88 @@ pub(super) fn handle_chat_send(
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
+    Ok(ChatSendParams {
+        session_id,
+        session_key,
+        message,
+        idempotency_key,
+        stream,
+        trigger_agent,
+    })
+}
+
+/// Check if agent auto-reply is enabled and spawn agent run if so.
+/// Returns (run_id, status_str).
+fn trigger_agent_if_enabled(
+    state: &Arc<WsServerState>,
+    trigger_agent: bool,
+    idempotency_key: &str,
+    message: &str,
+    session_key: &str,
+) -> (Option<String>, &'static str) {
+    if !trigger_agent {
+        return (None, "sent");
+    }
+
+    // Create the agent run
+    let cancel_token = CancellationToken::new();
+    let run = AgentRun {
+        run_id: idempotency_key.to_string(),
+        session_key: session_key.to_string(),
+        status: AgentRunStatus::Queued,
+        message: message.to_string(),
+        response: String::new(),
+        error: None,
+        created_at: now_ms(),
+        started_at: None,
+        completed_at: None,
+        cancel_token: cancel_token.clone(),
+        waiters: Vec::new(),
+    };
+
+    let run_id = run.run_id.clone();
+
+    // Register the run in the agent_run_registry
+    {
+        let mut registry = state.agent_run_registry.lock();
+        registry.register(run);
+    }
+
+    // Spawn the agent executor if an LLM provider is configured
+    let status = if let Some(provider) = state.llm_provider() {
+        let config = crate::agent::AgentConfig {
+            model: crate::agent::DEFAULT_MODEL.to_string(),
+            deliver: true,
+            ..Default::default()
+        };
+        crate::agent::spawn_run(
+            run_id.clone(),
+            session_key.to_string(),
+            config,
+            state.clone(),
+            provider,
+            cancel_token,
+        );
+        "accepted"
+    } else {
+        // No provider configured — run stays queued
+        "queued"
+    };
+
+    (Some(run_id), status)
+}
+
+pub(super) fn handle_chat_send(
+    state: Arc<WsServerState>,
+    params: Option<&Value>,
+    _conn: &ConnectionContext,
+) -> Result<Value, ErrorShape> {
+    let chat_params = parse_chat_send_params(params)?;
+
     // Check for duplicate idempotencyKey — return existing run status
     {
         let registry = state.agent_run_registry.lock();
-        if let Some(existing) = registry.get(idempotency_key) {
+        if let Some(existing) = registry.get(chat_params.idempotency_key) {
             if matches!(
                 existing.status,
                 AgentRunStatus::Queued | AgentRunStatus::Running
@@ -1941,23 +2106,25 @@ pub(super) fn handle_chat_send(
                     "status": existing.status.to_string(),
                     "sessionKey": existing.session_key,
                     "duplicate": true,
-                    "streaming": stream
+                    "streaming": chat_params.stream
                 }));
             }
         }
     }
 
-    let session = if let Some(session_id) = session_id {
+    let session = if let Some(session_id) = chat_params.session_id {
         state
             .session_store
             .get_session(session_id)
             .map_err(|err| error_shape(ERROR_INVALID_REQUEST, &err.to_string(), None))?
     } else {
-        let key = session_key
+        let key = chat_params
+            .session_key
+            .as_deref()
             .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "sessionKey is required", None))?;
         state
             .session_store
-            .get_or_create_session(&key, sessions::SessionMetadata::default())
+            .get_or_create_session(key, sessions::SessionMetadata::default())
             .map_err(|err| {
                 error_shape(
                     ERROR_UNAVAILABLE,
@@ -1968,7 +2135,7 @@ pub(super) fn handle_chat_send(
     };
 
     // Create and append the user message
-    let chat_message = sessions::ChatMessage::user(session.id.clone(), message);
+    let chat_message = sessions::ChatMessage::user(session.id.clone(), chat_params.message);
     let message_id = chat_message.id.clone();
     state
         .session_store
@@ -1984,13 +2151,13 @@ pub(super) fn handle_chat_send(
     // Emit chat event for the user message
     broadcast_chat_event(
         &state,
-        idempotency_key,
+        chat_params.idempotency_key,
         &session.session_key,
         0, // First event in this run
         "delta",
         Some(json!({
             "role": "user",
-            "content": message
+            "content": chat_params.message
         })),
         None,
         None,
@@ -1998,64 +2165,21 @@ pub(super) fn handle_chat_send(
     );
 
     // If agent triggering is enabled, queue the agent run
-    let (run_id, status) = if trigger_agent {
-        // Create the agent run
-        let cancel_token = CancellationToken::new();
-        let run = AgentRun {
-            run_id: idempotency_key.to_string(),
-            session_key: session.session_key.clone(),
-            status: AgentRunStatus::Queued,
-            message: message.to_string(),
-            response: String::new(),
-            error: None,
-            created_at: now_ms(),
-            started_at: None,
-            completed_at: None,
-            cancel_token: cancel_token.clone(),
-            waiters: Vec::new(),
-        };
-
-        let run_id = run.run_id.clone();
-
-        // Register the run in the agent_run_registry
-        {
-            let mut registry = state.agent_run_registry.lock();
-            registry.register(run);
-        }
-
-        // Spawn the agent executor if an LLM provider is configured
-        let status = if let Some(provider) = state.llm_provider() {
-            let config = crate::agent::AgentConfig {
-                model: crate::agent::DEFAULT_MODEL.to_string(),
-                deliver: true,
-                ..Default::default()
-            };
-            crate::agent::spawn_run(
-                run_id.clone(),
-                session.session_key.clone(),
-                config,
-                state.clone(),
-                provider,
-                cancel_token,
-            );
-            "accepted"
-        } else {
-            // No provider configured — run stays queued
-            "queued"
-        };
-
-        (Some(run_id), status)
-    } else {
-        (None, "sent")
-    };
+    let (run_id, status) = trigger_agent_if_enabled(
+        &state,
+        chat_params.trigger_agent,
+        chat_params.idempotency_key,
+        chat_params.message,
+        &session.session_key,
+    );
 
     Ok(json!({
         "runId": run_id,
         "messageId": message_id,
         "status": status,
         "sessionKey": session.session_key,
-        "agentTriggered": trigger_agent,
-        "streaming": stream
+        "agentTriggered": chat_params.trigger_agent,
+        "streaming": chat_params.stream
     }))
 }
 

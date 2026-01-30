@@ -597,12 +597,17 @@ pub(crate) fn handle_node_describe(
     }))
 }
 
-pub(crate) async fn handle_node_invoke(
-    params: Option<&Value>,
-    state: &WsServerState,
-) -> Result<Value, ErrorShape> {
-    let params =
-        params.ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "params required", None))?;
+/// Parsed and validated parameters for a node invoke request.
+struct NodeInvokeParams<'a> {
+    node_id: &'a str,
+    command: &'a str,
+    idempotency_key: &'a str,
+    timeout_ms: Option<u64>,
+    params_json: Option<String>,
+}
+
+/// Extract and validate the required fields from the invoke request params.
+fn validate_node_invoke_params(params: &Value) -> Result<NodeInvokeParams<'_>, ErrorShape> {
     let node_id = params
         .get("nodeId")
         .and_then(|v| v.as_str())
@@ -634,6 +639,22 @@ pub(crate) async fn handle_node_invoke(
         None => None,
     };
 
+    Ok(NodeInvokeParams {
+        node_id,
+        command,
+        idempotency_key,
+        timeout_ms,
+        params_json,
+    })
+}
+
+/// Verify the target node is connected and the command is in the node's allowlist.
+/// Returns the connection ID on success.
+fn validate_node_command(
+    node_id: &str,
+    command: &str,
+    state: &WsServerState,
+) -> Result<String, ErrorShape> {
     let (conn_id, commands) = {
         let registry = state.node_registry.lock();
         let node = registry.get(node_id).ok_or_else(|| {
@@ -663,52 +684,18 @@ pub(crate) async fn handle_node_invoke(
         ));
     }
 
-    let invoke_id = Uuid::new_v4().to_string();
-    let (responder, receiver) = oneshot::channel();
-    {
-        let mut registry = state.node_registry.lock();
-        registry.insert_pending_invoke(
-            invoke_id.clone(),
-            PendingInvoke {
-                node_id: node_id.to_string(),
-                command: command.to_string(),
-                responder,
-            },
-        );
-    }
+    Ok(conn_id)
+}
 
-    let mut payload = serde_json::Map::new();
-    payload.insert("id".to_string(), json!(invoke_id));
-    payload.insert("nodeId".to_string(), json!(node_id));
-    payload.insert("command".to_string(), json!(command));
-    payload.insert("idempotencyKey".to_string(), json!(idempotency_key));
-    if let Some(params_json) = params_json {
-        payload.insert("paramsJSON".to_string(), json!(params_json));
-    }
-    if let Some(timeout_ms) = timeout_ms {
-        payload.insert("timeoutMs".to_string(), json!(timeout_ms));
-    }
-
-    if !send_event_to_connection(
-        state,
-        &conn_id,
-        "node.invoke.request",
-        Value::Object(payload),
-    ) {
-        state.node_registry.lock().remove_pending_invoke(&invoke_id);
-        return Err(error_shape(
-            ERROR_UNAVAILABLE,
-            "failed to send invoke to node",
-            Some(json!({
-                "details": {
-                    "nodeId": node_id,
-                    "command": command,
-                    "nodeError": { "code": "UNAVAILABLE" }
-                }
-            })),
-        ));
-    }
-
+/// Wait for the node invoke result with a timeout, handling cancellation and error cases.
+async fn await_node_invoke_result(
+    invoke_id: &str,
+    node_id: &str,
+    command: &str,
+    timeout_ms: Option<u64>,
+    receiver: oneshot::Receiver<NodeInvokeResult>,
+    state: &WsServerState,
+) -> Result<Value, ErrorShape> {
     let timeout_ms = timeout_ms.unwrap_or(30_000);
     let result = match tokio::time::timeout(Duration::from_millis(timeout_ms), receiver).await {
         Ok(Ok(result)) => result,
@@ -722,7 +709,7 @@ pub(crate) async fn handle_node_invoke(
             }),
         },
         Err(_) => {
-            state.node_registry.lock().remove_pending_invoke(&invoke_id);
+            state.node_registry.lock().remove_pending_invoke(invoke_id);
             return Err(error_shape(
                 ERROR_UNAVAILABLE,
                 "node invoke timed out",
@@ -767,6 +754,75 @@ pub(crate) async fn handle_node_invoke(
         "payload": payload,
         "payloadJSON": result.payload_json
     }))
+}
+
+pub(crate) async fn handle_node_invoke(
+    params: Option<&Value>,
+    state: &WsServerState,
+) -> Result<Value, ErrorShape> {
+    let params =
+        params.ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "params required", None))?;
+    let invoke_params = validate_node_invoke_params(params)?;
+    let conn_id = validate_node_command(invoke_params.node_id, invoke_params.command, state)?;
+
+    let invoke_id = Uuid::new_v4().to_string();
+    let (responder, receiver) = oneshot::channel();
+    {
+        let mut registry = state.node_registry.lock();
+        registry.insert_pending_invoke(
+            invoke_id.clone(),
+            PendingInvoke {
+                node_id: invoke_params.node_id.to_string(),
+                command: invoke_params.command.to_string(),
+                responder,
+            },
+        );
+    }
+
+    let mut payload = serde_json::Map::new();
+    payload.insert("id".to_string(), json!(invoke_id));
+    payload.insert("nodeId".to_string(), json!(invoke_params.node_id));
+    payload.insert("command".to_string(), json!(invoke_params.command));
+    payload.insert(
+        "idempotencyKey".to_string(),
+        json!(invoke_params.idempotency_key),
+    );
+    if let Some(params_json) = invoke_params.params_json {
+        payload.insert("paramsJSON".to_string(), json!(params_json));
+    }
+    if let Some(timeout_ms) = invoke_params.timeout_ms {
+        payload.insert("timeoutMs".to_string(), json!(timeout_ms));
+    }
+
+    if !send_event_to_connection(
+        state,
+        &conn_id,
+        "node.invoke.request",
+        Value::Object(payload),
+    ) {
+        state.node_registry.lock().remove_pending_invoke(&invoke_id);
+        return Err(error_shape(
+            ERROR_UNAVAILABLE,
+            "failed to send invoke to node",
+            Some(json!({
+                "details": {
+                    "nodeId": invoke_params.node_id,
+                    "command": invoke_params.command,
+                    "nodeError": { "code": "UNAVAILABLE" }
+                }
+            })),
+        ));
+    }
+
+    await_node_invoke_result(
+        &invoke_id,
+        invoke_params.node_id,
+        invoke_params.command,
+        invoke_params.timeout_ms,
+        receiver,
+        state,
+    )
+    .await
 }
 
 pub(crate) fn handle_node_invoke_result(

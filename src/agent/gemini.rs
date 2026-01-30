@@ -329,17 +329,7 @@ fn parse_gemini_sse_data(
     }
 
     // Extract usage metadata if present
-    if let Some(usage_meta) = parsed.get("usageMetadata") {
-        if let Some(prompt_tokens) = usage_meta.get("promptTokenCount").and_then(|v| v.as_u64()) {
-            accumulated_usage.input_tokens = prompt_tokens;
-        }
-        if let Some(candidates_tokens) = usage_meta
-            .get("candidatesTokenCount")
-            .and_then(|v| v.as_u64())
-        {
-            accumulated_usage.output_tokens = candidates_tokens;
-        }
-    }
+    extract_gemini_usage(&parsed, accumulated_usage);
 
     // Process candidates
     let candidates = parsed.get("candidates")?.as_array()?;
@@ -352,68 +342,11 @@ fn parse_gemini_sse_data(
     // Check for finish reason
     if let Some(finish_reason) = candidate.get("finishReason").and_then(|v| v.as_str()) {
         *last_finish_reason = Some(finish_reason.to_string());
-
-        let reason = match finish_reason {
-            "STOP" => StopReason::EndTurn,
-            "MAX_TOKENS" => StopReason::MaxTokens,
-            "SAFETY" => StopReason::EndTurn,
-            _ => StopReason::EndTurn,
-        };
-
-        // Check if this chunk also has parts (content + finish in same chunk)
-        let parts = candidate
-            .get("content")
-            .and_then(|c| c.get("parts"))
-            .and_then(|p| p.as_array());
-
-        let mut events = Vec::new();
-
-        if let Some(parts) = parts {
-            let has_function_call = parts.iter().any(|p| p.get("functionCall").is_some());
-
-            for part in parts {
-                if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                    if !text.is_empty() {
-                        events.push(StreamEvent::TextDelta {
-                            text: text.to_string(),
-                        });
-                    }
-                }
-                if let Some(fc) = part.get("functionCall") {
-                    let name = fc
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let args = fc.get("args").cloned().unwrap_or(json!({}));
-                    let id = uuid::Uuid::new_v4().to_string();
-                    events.push(StreamEvent::ToolUse {
-                        id,
-                        name,
-                        input: args,
-                    });
-                }
-            }
-
-            // Determine stop reason: if there were function calls, use ToolUse
-            let stop_reason = if has_function_call {
-                StopReason::ToolUse
-            } else {
-                reason
-            };
-
-            events.push(StreamEvent::Stop {
-                reason: stop_reason,
-                usage: *accumulated_usage,
-            });
-        } else {
-            events.push(StreamEvent::Stop {
-                reason,
-                usage: *accumulated_usage,
-            });
-        }
-
-        return Some(events);
+        return Some(parse_gemini_finish_chunk(
+            candidate,
+            finish_reason,
+            accumulated_usage,
+        ));
     }
 
     // No finish reason — process content parts
@@ -422,8 +355,75 @@ fn parse_gemini_sse_data(
         .and_then(|c| c.get("parts"))
         .and_then(|p| p.as_array())?;
 
+    let events = collect_gemini_part_events(parts);
+    if events.is_empty() {
+        None
+    } else {
+        Some(events)
+    }
+}
+
+/// Extract usage metadata from a Gemini SSE chunk.
+fn extract_gemini_usage(parsed: &Value, accumulated_usage: &mut TokenUsage) {
+    if let Some(usage_meta) = parsed.get("usageMetadata") {
+        if let Some(prompt_tokens) = usage_meta.get("promptTokenCount").and_then(|v| v.as_u64()) {
+            accumulated_usage.input_tokens = prompt_tokens;
+        }
+        if let Some(candidates_tokens) = usage_meta
+            .get("candidatesTokenCount")
+            .and_then(|v| v.as_u64())
+        {
+            accumulated_usage.output_tokens = candidates_tokens;
+        }
+    }
+}
+
+/// Parse a Gemini chunk that includes a finish reason.
+fn parse_gemini_finish_chunk(
+    candidate: &Value,
+    finish_reason: &str,
+    accumulated_usage: &TokenUsage,
+) -> Vec<StreamEvent> {
+    let reason = match finish_reason {
+        "STOP" => StopReason::EndTurn,
+        "MAX_TOKENS" => StopReason::MaxTokens,
+        "SAFETY" => StopReason::EndTurn,
+        _ => StopReason::EndTurn,
+    };
+
+    let parts = candidate
+        .get("content")
+        .and_then(|c| c.get("parts"))
+        .and_then(|p| p.as_array());
+
     let mut events = Vec::new();
 
+    if let Some(parts) = parts {
+        let has_function_call = parts.iter().any(|p| p.get("functionCall").is_some());
+        events.extend(collect_gemini_part_events(parts));
+
+        let stop_reason = if has_function_call {
+            StopReason::ToolUse
+        } else {
+            reason
+        };
+        events.push(StreamEvent::Stop {
+            reason: stop_reason,
+            usage: *accumulated_usage,
+        });
+    } else {
+        events.push(StreamEvent::Stop {
+            reason,
+            usage: *accumulated_usage,
+        });
+    }
+
+    events
+}
+
+/// Collect stream events from Gemini content parts (text deltas and function calls).
+fn collect_gemini_part_events(parts: &[Value]) -> Vec<StreamEvent> {
+    let mut events = Vec::new();
     for part in parts {
         if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
             if !text.is_empty() {
@@ -447,12 +447,7 @@ fn parse_gemini_sse_data(
             });
         }
     }
-
-    if events.is_empty() {
-        None
-    } else {
-        Some(events)
-    }
+    events
 }
 
 /// Determine whether a model identifier should route to the Gemini provider.

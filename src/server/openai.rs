@@ -335,7 +335,6 @@ async fn stream_llm_provider(
     response_id: String,
     created: i64,
 ) -> Response {
-    // Start the LLM call. If it fails, return an error SSE stream.
     let request = CompletionRequest {
         model: model.clone(),
         messages,
@@ -348,131 +347,83 @@ async fn stream_llm_provider(
     let rx = match provider.complete(request).await {
         Ok(rx) => rx,
         Err(e) => {
-            // Return an error as a single SSE event
-            let error_stream = async_stream::stream! {
-                let error_data = serde_json::to_string(&OpenAiError::api_error(e.to_string())).unwrap_or_default();
-                yield Ok::<_, Infallible>(format!("data: {}\n\ndata: [DONE]\n\n", error_data));
-            };
-            let body = Body::from_stream(error_stream);
-            return Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
-                .header(header::CACHE_CONTROL, "no-cache")
-                .header("connection", "keep-alive")
-                .body(body)
-                .unwrap();
+            return build_error_sse_response(e.to_string());
         }
     };
 
     let stream = async_stream::stream! {
         let mut rx = rx;
 
-        // First chunk: role
-        let first_chunk = ChatCompletionChunk {
-            id: response_id.clone(),
-            object: "chat.completion.chunk".to_string(),
-            created,
-            model: model.clone(),
-            choices: vec![ChunkChoice {
-                index: 0,
-                delta: ChunkDelta {
-                    role: Some("assistant".to_string()),
-                    content: None,
-                },
-                finish_reason: None,
-            }],
-        };
-        yield Ok::<_, Infallible>(format!(
-            "data: {}\n\n",
-            serde_json::to_string(&first_chunk).unwrap()
-        ));
+        yield Ok::<_, Infallible>(format_sse_chunk(&build_chunk(
+            &response_id, created, &model,
+            Some("assistant".to_string()), None, None,
+        )));
 
-        // Stream content from the LLM provider
         while let Some(event) = rx.recv().await {
             match event {
                 StreamEvent::TextDelta { text } => {
-                    let chunk = ChatCompletionChunk {
-                        id: response_id.clone(),
-                        object: "chat.completion.chunk".to_string(),
-                        created,
-                        model: model.clone(),
-                        choices: vec![ChunkChoice {
-                            index: 0,
-                            delta: ChunkDelta {
-                                role: None,
-                                content: Some(text),
-                            },
-                            finish_reason: None,
-                        }],
-                    };
-                    yield Ok::<_, Infallible>(format!(
-                        "data: {}\n\n",
-                        serde_json::to_string(&chunk).unwrap()
-                    ));
+                    yield Ok::<_, Infallible>(format_sse_chunk(&build_chunk(
+                        &response_id, created, &model, None, Some(text), None,
+                    )));
                 }
                 StreamEvent::Stop { reason, .. } => {
-                    let finish_reason = match reason {
+                    let finish = match reason {
                         StopReason::EndTurn => "stop",
                         StopReason::MaxTokens => "length",
                         StopReason::ToolUse => "stop",
                     };
-                    let final_chunk = ChatCompletionChunk {
-                        id: response_id.clone(),
-                        object: "chat.completion.chunk".to_string(),
-                        created,
-                        model: model.clone(),
-                        choices: vec![ChunkChoice {
-                            index: 0,
-                            delta: ChunkDelta {
-                                role: None,
-                                content: None,
-                            },
-                            finish_reason: Some(finish_reason.to_string()),
-                        }],
-                    };
-                    yield Ok::<_, Infallible>(format!(
-                        "data: {}\n\n",
-                        serde_json::to_string(&final_chunk).unwrap()
-                    ));
+                    yield Ok::<_, Infallible>(format_sse_chunk(&build_chunk(
+                        &response_id, created, &model, None, None, Some(finish.to_string()),
+                    )));
                     break;
                 }
                 StreamEvent::Error { message } => {
-                    // Log the error server-side; do not embed it in assistant text.
                     tracing::error!(error = %message, "streaming LLM error");
-
-                    // Send a final chunk with empty content and finish_reason "stop"
-                    let error_chunk = ChatCompletionChunk {
-                        id: response_id.clone(),
-                        object: "chat.completion.chunk".to_string(),
-                        created,
-                        model: model.clone(),
-                        choices: vec![ChunkChoice {
-                            index: 0,
-                            delta: ChunkDelta {
-                                role: None,
-                                content: None,
-                            },
-                            finish_reason: Some("stop".to_string()),
-                        }],
-                    };
-                    yield Ok::<_, Infallible>(format!(
-                        "data: {}\n\n",
-                        serde_json::to_string(&error_chunk).unwrap()
-                    ));
+                    yield Ok::<_, Infallible>(format_sse_chunk(&build_chunk(
+                        &response_id, created, &model, None, None, Some("stop".to_string()),
+                    )));
                     break;
                 }
-                StreamEvent::ToolUse { .. } => {
-                    // Skip tool calls in OpenAI chat mode
-                }
+                StreamEvent::ToolUse { .. } => {}
             }
         }
 
-        // Done marker
         yield Ok::<_, Infallible>("data: [DONE]\n\n".to_string());
     };
 
     let body = Body::from_stream(stream);
+    sse_response(body)
+}
 
+/// Build a `ChatCompletionChunk` with the given delta fields.
+fn build_chunk(
+    id: &str,
+    created: i64,
+    model: &str,
+    role: Option<String>,
+    content: Option<String>,
+    finish_reason: Option<String>,
+) -> ChatCompletionChunk {
+    ChatCompletionChunk {
+        id: id.to_string(),
+        object: "chat.completion.chunk".to_string(),
+        created,
+        model: model.to_string(),
+        choices: vec![ChunkChoice {
+            index: 0,
+            delta: ChunkDelta { role, content },
+            finish_reason,
+        }],
+    }
+}
+
+/// Serialize a chunk into an SSE `data:` line.
+fn format_sse_chunk(chunk: &ChatCompletionChunk) -> String {
+    format!("data: {}\n\n", serde_json::to_string(chunk).unwrap())
+}
+
+/// Build an SSE response with standard headers.
+fn sse_response(body: Body) -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
@@ -480,6 +431,16 @@ async fn stream_llm_provider(
         .header("connection", "keep-alive")
         .body(body)
         .unwrap()
+}
+
+/// Build an SSE error response for a provider failure.
+fn build_error_sse_response(error_msg: String) -> Response {
+    let error_stream = async_stream::stream! {
+        let error_data = serde_json::to_string(&OpenAiError::api_error(error_msg)).unwrap_or_default();
+        yield Ok::<_, Infallible>(format!("data: {}\n\ndata: [DONE]\n\n", error_data));
+    };
+    let body = Body::from_stream(error_stream);
+    sse_response(body)
 }
 
 /// POST /v1/chat/completions handler
@@ -878,45 +839,8 @@ pub async fn responses_handler(
     }
 
     // Validate tool_choice
-    if let Some(ref tool_choice) = req.tool_choice {
-        if let Some(s) = tool_choice.as_str() {
-            if s == "required" && req.tools.as_ref().map(|t| t.is_empty()).unwrap_or(true) {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(OpenAiError::invalid_request(
-                        "tool_choice=required but no tools were provided",
-                    )),
-                )
-                    .into_response();
-            }
-        }
-        if let Some(obj) = tool_choice.as_object() {
-            if obj.get("type").and_then(|v| v.as_str()) == Some("function") {
-                if let Some(func) = obj.get("function") {
-                    if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
-                        let has_tool = req
-                            .tools
-                            .as_ref()
-                            .map(|tools| {
-                                tools.iter().any(|t| {
-                                    t.function.as_ref().map(|f| f.name == name).unwrap_or(false)
-                                })
-                            })
-                            .unwrap_or(false);
-                        if !has_tool {
-                            return (
-                                StatusCode::BAD_REQUEST,
-                                Json(OpenAiError::invalid_request(format!(
-                                    "tool_choice requested unknown tool: {}",
-                                    name
-                                ))),
-                            )
-                                .into_response();
-                        }
-                    }
-                }
-            }
-        }
+    if let Some(err) = validate_tool_choice(&req) {
+        return err;
     }
 
     // Generate response IDs and timestamp
@@ -995,6 +919,58 @@ pub async fn responses_handler(
         )
             .into_response(),
     }
+}
+
+/// Validate tool_choice against the provided tools.
+/// Returns `Some(Response)` on validation failure, `None` if valid.
+fn validate_tool_choice(req: &ResponsesRequest) -> Option<Response> {
+    let tool_choice = req.tool_choice.as_ref()?;
+
+    if let Some(s) = tool_choice.as_str() {
+        if s == "required" && req.tools.as_ref().map(|t| t.is_empty()).unwrap_or(true) {
+            return Some(
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(OpenAiError::invalid_request(
+                        "tool_choice=required but no tools were provided",
+                    )),
+                )
+                    .into_response(),
+            );
+        }
+    }
+
+    if let Some(obj) = tool_choice.as_object() {
+        if obj.get("type").and_then(|v| v.as_str()) == Some("function") {
+            if let Some(func) = obj.get("function") {
+                if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                    let has_tool = req
+                        .tools
+                        .as_ref()
+                        .map(|tools| {
+                            tools.iter().any(|t| {
+                                t.function.as_ref().map(|f| f.name == name).unwrap_or(false)
+                            })
+                        })
+                        .unwrap_or(false);
+                    if !has_tool {
+                        return Some(
+                            (
+                                StatusCode::BAD_REQUEST,
+                                Json(OpenAiError::invalid_request(format!(
+                                    "tool_choice requested unknown tool: {}",
+                                    name
+                                ))),
+                            )
+                                .into_response(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]

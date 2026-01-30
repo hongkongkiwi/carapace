@@ -390,58 +390,12 @@ pub fn create_router_with_state(
 
     // Control endpoints
     if config.control_endpoints_enabled {
-        let control_state = ControlState {
-            gateway_token: config.gateway_token.clone(),
-            gateway_password: config.gateway_password.clone(),
-            channel_registry: channel_registry.clone(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            start_time,
-        };
-
-        let control_state_status = control_state.clone();
-        let control_state_channels = control_state.clone();
-        let control_state_config = control_state.clone();
-
-        router = router
-            .route(
-                "/control/status",
-                get(move |headers| {
-                    let state = control_state_status.clone();
-                    async move { control::status_handler(State(state), headers).await }
-                }),
-            )
-            .route(
-                "/control/channels",
-                get(move |headers| {
-                    let state = control_state_channels.clone();
-                    async move { control::channels_handler(State(state), headers).await }
-                }),
-            )
-            .route(
-                "/control/config",
-                post(move |headers, body| {
-                    let state = control_state_config.clone();
-                    async move { control::config_handler(State(state), headers, body).await }
-                }),
-            );
+        router = register_session_routes(router, &config, &channel_registry, start_time);
     }
 
     // Control UI routes (when enabled)
     if config.control_ui_enabled {
-        let base = if config.control_ui_base_path.is_empty() {
-            "/ui".to_string()
-        } else {
-            config.control_ui_base_path.clone()
-        };
-
-        router = router
-            .route(&base, get(control_ui_redirect))
-            .route(&format!("{}/", base), get(control_ui_index))
-            .route(
-                &format!("{}/__moltbot_avatar__/:agent_id", base),
-                get(avatar_handler),
-            )
-            .route(&format!("{}/*path", base), get(control_ui_static));
+        router = register_admin_routes(router, &config);
     }
 
     // Convert to stateless Router and apply middleware layers
@@ -475,6 +429,67 @@ pub fn create_router_with_state(
     }
 
     stateless_router
+}
+
+/// Register control session endpoints (status, channels, config).
+fn register_session_routes(
+    router: Router<AppState>,
+    config: &HttpConfig,
+    channel_registry: &Arc<ChannelRegistry>,
+    start_time: i64,
+) -> Router<AppState> {
+    let control_state = ControlState {
+        gateway_token: config.gateway_token.clone(),
+        gateway_password: config.gateway_password.clone(),
+        channel_registry: channel_registry.clone(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        start_time,
+    };
+
+    let control_state_status = control_state.clone();
+    let control_state_channels = control_state.clone();
+    let control_state_config = control_state.clone();
+
+    router
+        .route(
+            "/control/status",
+            get(move |headers| {
+                let state = control_state_status.clone();
+                async move { control::status_handler(State(state), headers).await }
+            }),
+        )
+        .route(
+            "/control/channels",
+            get(move |headers| {
+                let state = control_state_channels.clone();
+                async move { control::channels_handler(State(state), headers).await }
+            }),
+        )
+        .route(
+            "/control/config",
+            post(move |headers, body| {
+                let state = control_state_config.clone();
+                async move { control::config_handler(State(state), headers, body).await }
+            }),
+        )
+}
+
+/// Register control UI routes (static files, SPA fallback, avatar endpoint).
+fn register_admin_routes(router: Router<AppState>, config: &HttpConfig) -> Router<AppState> {
+    let base = if config.control_ui_base_path.is_empty() {
+        "/ui".to_string()
+    } else {
+        config.control_ui_base_path.clone()
+    };
+
+    router
+        .route(&base, get(control_ui_redirect))
+        .route(&format!("{}/", base), get(control_ui_index))
+        .route(
+            &format!("{}/__moltbot_avatar__/:agent_id", base),
+            get(avatar_handler),
+        )
+        .route(&format!("{}/*path", base), get(control_ui_static))
 }
 
 /// Normalize hooks path (ensure leading slash, no trailing slash)
@@ -604,28 +619,13 @@ async fn hooks_wake_handler(
     }
 }
 
-/// POST /hooks/agent - Dispatch message to agent
-async fn hooks_agent_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    uri: Uri,
-    body: axum::body::Bytes,
-) -> Response {
-    // Check auth
-    if let Some(err) = check_hooks_auth(&state.config, &headers, &uri) {
-        return err;
-    }
-
-    // Check body size
-    if body.len() > state.config.hooks_max_body_bytes {
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            Json(HooksErrorResponse::new("payload too large")),
-        )
-            .into_response();
-    }
-
-    // Parse JSON body
+/// Parse and validate an agent request body, returning the validated request
+/// or an HTTP error response.
+#[allow(clippy::result_large_err)]
+fn parse_agent_request(
+    body: &axum::body::Bytes,
+    valid_channels: &[String],
+) -> Result<crate::hooks::handler::ValidatedAgentRequest, Response> {
     let req: AgentRequest = if body.is_empty() {
         AgentRequest {
             message: None,
@@ -641,73 +641,59 @@ async fn hooks_agent_handler(
             allow_unsafe_external_content: None,
         }
     } else {
-        match serde_json::from_slice(&body) {
+        match serde_json::from_slice(body) {
             Ok(r) => r,
             Err(e) => {
-                return (
+                return Err((
                     StatusCode::BAD_REQUEST,
                     Json(HooksErrorResponse::new(&format!("SyntaxError: {}", e))),
                 )
-                    .into_response();
+                    .into_response());
             }
         }
     };
 
-    // Validate request
-    let validated = match validate_agent_request(&req, &state.config.valid_channels) {
-        Ok(v) => v,
-        Err(e) => {
-            return (StatusCode::BAD_REQUEST, Json(AgentResponse::error(&e))).into_response();
-        }
-    };
+    validate_agent_request(&req, valid_channels)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(AgentResponse::error(&e))).into_response())
+}
 
-    let run_id = Uuid::new_v4().to_string();
-
-    // Dispatch agent run if WsServerState is available
-    let ws = match &state.ws_state {
-        Some(ws) => ws.clone(),
-        None => {
-            debug!(
-                "Agent job accepted (no runtime): message='{}', channel='{}', runId='{}'",
-                validated.message, validated.channel, run_id
-            );
-            return (StatusCode::ACCEPTED, Json(AgentResponse::success(run_id))).into_response();
-        }
-    };
-
+/// Dispatch a validated agent request through the WebSocket runtime, creating
+/// a session, registering the run, and optionally spawning the LLM executor.
+#[allow(clippy::result_large_err)]
+fn dispatch_agent_run(
+    ws: &Arc<WsServerState>,
+    validated: &crate::hooks::handler::ValidatedAgentRequest,
+    run_id: &str,
+) -> Result<(), Response> {
     // Append user message to session
     let session_key = &validated.session_key;
     let metadata = crate::sessions::SessionMetadata {
         channel: Some(validated.channel.clone()),
         ..Default::default()
     };
-    let session = match ws
+    let session = ws
         .session_store()
         .get_or_create_session(session_key, metadata)
-    {
-        Ok(s) => s,
-        Err(e) => {
-            return (
+        .map_err(|e| {
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(AgentResponse::error(&format!("session error: {}", e))),
             )
-                .into_response();
-        }
-    };
+                .into_response()
+        })?;
 
-    if let Err(e) = ws
-        .session_store()
+    ws.session_store()
         .append_message(crate::sessions::ChatMessage::user(
             session.id.clone(),
             &validated.message,
         ))
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(AgentResponse::error(&format!("session write error: {}", e))),
-        )
-            .into_response();
-    }
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(AgentResponse::error(&format!("session write error: {}", e))),
+            )
+                .into_response()
+        })?;
 
     // Register the agent run
     let now = std::time::SystemTime::now()
@@ -717,7 +703,7 @@ async fn hooks_agent_handler(
 
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let run = crate::server::ws::AgentRun {
-        run_id: run_id.clone(),
+        run_id: run_id.to_string(),
         session_key: session.session_key.clone(),
         status: crate::server::ws::AgentRunStatus::Queued,
         message: validated.message.clone(),
@@ -746,10 +732,10 @@ async fn hooks_agent_handler(
             ..Default::default()
         };
         crate::agent::spawn_run(
-            run_id.clone(),
+            run_id.to_string(),
             session.session_key.clone(),
             config,
-            ws,
+            ws.clone(),
             provider,
             cancel_token,
         );
@@ -761,7 +747,134 @@ async fn hooks_agent_handler(
         debug!("Agent job queued (no LLM provider): runId='{}'", run_id);
     }
 
+    Ok(())
+}
+
+/// POST /hooks/agent - Dispatch message to agent
+async fn hooks_agent_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    body: axum::body::Bytes,
+) -> Response {
+    // Check auth
+    if let Some(err) = check_hooks_auth(&state.config, &headers, &uri) {
+        return err;
+    }
+
+    // Check body size
+    if body.len() > state.config.hooks_max_body_bytes {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(HooksErrorResponse::new("payload too large")),
+        )
+            .into_response();
+    }
+
+    let validated = match parse_agent_request(&body, &state.config.valid_channels) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    let run_id = Uuid::new_v4().to_string();
+
+    // Dispatch agent run if WsServerState is available
+    let ws = match &state.ws_state {
+        Some(ws) => ws.clone(),
+        None => {
+            debug!(
+                "Agent job accepted (no runtime): message='{}', channel='{}', runId='{}'",
+                validated.message, validated.channel, run_id
+            );
+            return (StatusCode::ACCEPTED, Json(AgentResponse::success(run_id))).into_response();
+        }
+    };
+
+    if let Err(resp) = dispatch_agent_run(&ws, &validated, &run_id) {
+        return resp;
+    }
+
     (StatusCode::ACCEPTED, Json(AgentResponse::success(run_id))).into_response()
+}
+
+/// Build the hook execution context from request headers, URI, path, and payload.
+fn build_hook_context(
+    headers: &HeaderMap,
+    uri: &Uri,
+    path: &str,
+    payload: Value,
+) -> HookMappingContext {
+    let mut header_map: HashMap<String, String> = HashMap::new();
+    for (key, value) in headers.iter() {
+        if let Ok(v) = value.to_str() {
+            header_map.insert(key.as_str().to_lowercase(), v.to_string());
+        }
+    }
+
+    HookMappingContext {
+        path: path.to_string(),
+        headers: header_map,
+        payload,
+        query: uri.query().map(|s| s.to_string()),
+        now: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+    }
+}
+
+/// Convert a hook mapping evaluation result into an HTTP response.
+fn hook_result_to_response(
+    result: Result<HookMappingResult, crate::hooks::HookMappingError>,
+) -> Response {
+    match result {
+        Ok(HookMappingResult::Skip) => {
+            // Transform returned null - skip this webhook
+            (StatusCode::NO_CONTENT, "").into_response()
+        }
+        Ok(HookMappingResult::Wake { text, mode }) => {
+            debug!("Hook triggered wake: text='{}', mode='{}'", text, mode);
+            (StatusCode::OK, Json(json!({ "ok": true, "mode": mode }))).into_response()
+        }
+        Ok(HookMappingResult::Agent {
+            message,
+            session_key,
+            ..
+        }) => {
+            let run_id = Uuid::new_v4().to_string();
+            debug!(
+                "Hook triggered agent: message='{}', session_key='{}', runId='{}'",
+                message, session_key, run_id
+            );
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({ "ok": true, "runId": run_id })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            let status = match &e {
+                crate::hooks::HookMappingError::TransformError(_) => {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+                _ => StatusCode::BAD_REQUEST,
+            };
+            (status, Json(json!({ "ok": false, "error": e.to_string() }))).into_response()
+        }
+    }
+}
+
+/// Look up a matching hook mapping and evaluate it, returning an HTTP response.
+fn execute_hook_mapping(state: &AppState, path: &str, ctx: &HookMappingContext) -> Response {
+    let mapping = match state.hook_registry.find_match(ctx) {
+        Some(m) => m,
+        None => {
+            debug!("No hook mapping found for path: {}", path);
+            return (StatusCode::NOT_FOUND, "Not Found").into_response();
+        }
+    };
+
+    debug!("Hook mapping found for path '{}': {:?}", path, mapping.id);
+
+    let result = state.hook_registry.evaluate(&mapping, ctx);
+    hook_result_to_response(result)
 }
 
 /// POST /hooks/<mapping> - Custom hook mappings
@@ -802,69 +915,8 @@ async fn hooks_mapping_handler(
         }
     };
 
-    // Build hook context
-    let mut header_map: HashMap<String, String> = HashMap::new();
-    for (key, value) in headers.iter() {
-        if let Ok(v) = value.to_str() {
-            header_map.insert(key.as_str().to_lowercase(), v.to_string());
-        }
-    }
-
-    let ctx = HookMappingContext {
-        path: path.clone(),
-        headers: header_map,
-        payload,
-        query: uri.query().map(|s| s.to_string()),
-        now: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-    };
-
-    // Look up matching mapping
-    let mapping = match state.hook_registry.find_match(&ctx) {
-        Some(m) => m,
-        None => {
-            debug!("No hook mapping found for path: {}", path);
-            return (StatusCode::NOT_FOUND, "Not Found").into_response();
-        }
-    };
-
-    debug!("Hook mapping found for path '{}': {:?}", path, mapping.id);
-
-    // Evaluate the mapping
-    match state.hook_registry.evaluate(&mapping, &ctx) {
-        Ok(HookMappingResult::Skip) => {
-            // Transform returned null - skip this webhook
-            (StatusCode::NO_CONTENT, "").into_response()
-        }
-        Ok(HookMappingResult::Wake { text, mode }) => {
-            debug!("Hook triggered wake: text='{}', mode='{}'", text, mode);
-            (StatusCode::OK, Json(json!({ "ok": true, "mode": mode }))).into_response()
-        }
-        Ok(HookMappingResult::Agent {
-            message,
-            session_key,
-            ..
-        }) => {
-            let run_id = Uuid::new_v4().to_string();
-            debug!(
-                "Hook triggered agent: message='{}', session_key='{}', runId='{}'",
-                message, session_key, run_id
-            );
-            (
-                StatusCode::ACCEPTED,
-                Json(json!({ "ok": true, "runId": run_id })),
-            )
-                .into_response()
-        }
-        Err(e) => {
-            let status = match &e {
-                crate::hooks::HookMappingError::TransformError(_) => {
-                    StatusCode::INTERNAL_SERVER_ERROR
-                }
-                _ => StatusCode::BAD_REQUEST,
-            };
-            (status, Json(json!({ "ok": false, "error": e.to_string() }))).into_response()
-        }
-    }
+    let ctx = build_hook_context(&headers, &uri, &path, payload);
+    execute_hook_mapping(&state, &path, &ctx)
 }
 
 /// Check hooks authentication

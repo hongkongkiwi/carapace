@@ -360,28 +360,36 @@ impl MediaStore {
         }
 
         let ttl = self.config.ttl;
-        let mut to_remove = Vec::new();
+        let to_remove = self.collect_expired_entries(ttl);
 
-        // Find expired entries
-        {
-            let entries = self.entries.read();
-            for (id, entry) in entries.iter() {
-                if entry.metadata.is_expired(ttl) {
-                    to_remove.push((id.clone(), entry.metadata.path.clone()));
-                }
-            }
+        let count = to_remove.len();
+        self.remove_expired_entries(to_remove).await;
+
+        if count > 0 {
+            tracing::info!(count = count, "Cleaned up expired media files");
         }
 
-        // Remove expired entries
-        let count = to_remove.len();
+        Ok(count)
+    }
+
+    /// Collect IDs and paths of entries whose TTL has elapsed.
+    fn collect_expired_entries(&self, ttl: std::time::Duration) -> Vec<(String, PathBuf)> {
+        let entries = self.entries.read();
+        entries
+            .iter()
+            .filter(|(_, entry)| entry.metadata.is_expired(ttl))
+            .map(|(id, entry)| (id.clone(), entry.metadata.path.clone()))
+            .collect()
+    }
+
+    /// Remove the given entries from tracking and delete their files from disk.
+    async fn remove_expired_entries(&self, to_remove: Vec<(String, PathBuf)>) {
         for (id, path) in to_remove {
-            // Remove from tracking
             {
                 let mut entries = self.entries.write();
                 entries.remove(&id);
             }
 
-            // Delete file if it exists
             if path.exists() {
                 if let Err(e) = fs::remove_file(&path).await {
                     tracing::warn!(
@@ -397,12 +405,6 @@ impl MediaStore {
                 }
             }
         }
-
-        if count > 0 {
-            tracing::info!(count = count, "Cleaned up expired media files");
-        }
-
-        Ok(count)
     }
 
     /// Get the number of tracked files

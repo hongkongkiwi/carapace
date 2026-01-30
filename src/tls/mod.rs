@@ -129,54 +129,60 @@ pub struct TlsSetupResult {
     pub key_path: PathBuf,
 }
 
-/// Set up TLS based on the provided configuration.
+/// Ensure a self-signed certificate exists in the default TLS directory,
+/// generating one if necessary.  Returns the cert and key paths.
+fn auto_generate_certificate() -> Result<(PathBuf, PathBuf), TlsError> {
+    info!("Auto-generating self-signed TLS certificate");
+    let tls_dir = default_tls_dir();
+    ensure_tls_dir(&tls_dir)?;
+
+    let cert_path = tls_dir.join("cert.pem");
+    let key_path = tls_dir.join("key.pem");
+
+    if !cert_path.exists() || !key_path.exists() {
+        generate_self_signed_cert(&cert_path, &key_path)?;
+        info!(
+            "Generated self-signed certificate at {}",
+            cert_path.display()
+        );
+    } else {
+        info!(
+            "Using existing self-signed certificate at {}",
+            cert_path.display()
+        );
+    }
+
+    Ok((cert_path, key_path))
+}
+
+/// Resolve the certificate and key file paths.
 ///
-/// If `cert_path` and `key_path` are provided, loads them from disk.
-/// If they are not provided and `auto_generate` is true, generates a self-signed
-/// certificate and stores it in the default TLS directory.
-///
-/// Returns a `TlsSetupResult` containing the rustls ServerConfig and fingerprint.
-pub fn setup_tls(config: &TlsConfig) -> Result<TlsSetupResult, TlsError> {
-    let (cert_path, key_path) = match (&config.cert_path, &config.key_path) {
+/// When both paths are provided in the config they are returned as-is.
+/// When neither is provided and `auto_generate` is enabled, the default TLS
+/// directory is created and a self-signed certificate is generated (if not
+/// already present).  Returns an error for any other combination.
+fn resolve_certificate_paths(config: &TlsConfig) -> Result<(PathBuf, PathBuf), TlsError> {
+    match (&config.cert_path, &config.key_path) {
         (Some(cert), Some(key)) => {
             info!("Loading TLS certificate from provided paths");
-            (cert.clone(), key.clone())
+            Ok((cert.clone(), key.clone()))
         }
-        (None, None) if config.auto_generate => {
-            info!("Auto-generating self-signed TLS certificate");
-            let tls_dir = default_tls_dir();
-            ensure_tls_dir(&tls_dir)?;
+        (None, None) if config.auto_generate => auto_generate_certificate(),
+        _ => Err(TlsError::ConfigBuildError(
+            "TLS enabled but cert/key paths are incomplete and auto-generate is disabled"
+                .to_string(),
+        )),
+    }
+}
 
-            let cert_path = tls_dir.join("cert.pem");
-            let key_path = tls_dir.join("key.pem");
-
-            // Only generate if files don't already exist
-            if !cert_path.exists() || !key_path.exists() {
-                generate_self_signed_cert(&cert_path, &key_path)?;
-                info!(
-                    "Generated self-signed certificate at {}",
-                    cert_path.display()
-                );
-            } else {
-                info!(
-                    "Using existing self-signed certificate at {}",
-                    cert_path.display()
-                );
-            }
-
-            (cert_path, key_path)
-        }
-        _ => {
-            return Err(TlsError::ConfigBuildError(
-                "TLS enabled but cert/key paths are incomplete and auto-generate is disabled"
-                    .to_string(),
-            ));
-        }
-    };
-
-    // Load certificate and key from PEM files
-    let certs = load_certs(&cert_path)?;
-    let key = load_private_key(&key_path)?;
+/// Load certificates and key, compute the fingerprint, and assemble a
+/// `rustls::ServerConfig`.
+fn build_server_config(
+    cert_path: &Path,
+    key_path: &Path,
+) -> Result<(Arc<rustls::ServerConfig>, String), TlsError> {
+    let certs = load_certs(cert_path)?;
+    let key = load_private_key(key_path)?;
 
     // Compute fingerprint from the first (leaf) certificate
     let fingerprint = compute_cert_fingerprint(&certs[0]);
@@ -185,14 +191,27 @@ pub fn setup_tls(config: &TlsConfig) -> Result<TlsSetupResult, TlsError> {
     // This is idempotent; if already installed, the Err is ignored.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    // Build rustls ServerConfig
     let server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| TlsError::ConfigBuildError(e.to_string()))?;
 
+    Ok((Arc::new(server_config), fingerprint))
+}
+
+/// Set up TLS based on the provided configuration.
+///
+/// If `cert_path` and `key_path` are provided, loads them from disk.
+/// If they are not provided and `auto_generate` is true, generates a self-signed
+/// certificate and stores it in the default TLS directory.
+///
+/// Returns a `TlsSetupResult` containing the rustls ServerConfig and fingerprint.
+pub fn setup_tls(config: &TlsConfig) -> Result<TlsSetupResult, TlsError> {
+    let (cert_path, key_path) = resolve_certificate_paths(config)?;
+    let (server_config, fingerprint) = build_server_config(&cert_path, &key_path)?;
+
     Ok(TlsSetupResult {
-        server_config: Arc::new(server_config),
+        server_config,
         fingerprint,
         cert_path,
         key_path,

@@ -500,19 +500,13 @@ pub fn verify_fingerprint(expected: Option<&str>, actual: &str) -> Result<String
 // Gateway client connection (stub)
 // ============================================================================
 
-/// Connect to a remote gateway via direct WebSocket.
-///
-/// 1. Validate parameters.
-/// 2. Establish a TLS + WebSocket connection to `entry.url` via
-///    `tokio-tungstenite`.
-/// 3. Extract the TLS certificate fingerprint and verify it via TOFU.
-/// 4. Send a JSON-RPC `gateway.connect` handshake.
-/// 5. Return a [`GatewayConnection`] with live read/write stream halves.
-pub async fn connect_to_gateway(
+/// Validate gateway connection parameters (URL, auth token, client ID) and
+/// URL scheme before attempting a connection.
+fn validate_gateway_params(
     entry: &GatewayEntry,
     auth_token: &str,
     client_id: &str,
-) -> Result<GatewayConnection, GatewayError> {
+) -> Result<(), GatewayError> {
     if entry.url.is_empty() {
         return Err(GatewayError::ConnectionFailed(
             "gateway URL is empty".to_string(),
@@ -540,35 +534,15 @@ pub async fn connect_to_gateway(
         }
     }
 
-    info!(
-        gateway_id = %entry.id,
-        gateway_name = %entry.name,
-        url = %entry.url,
-        "connecting to remote gateway"
-    );
+    Ok(())
+}
 
-    // Establish the WebSocket connection (TLS handled by tokio-tungstenite
-    // when the URL scheme is wss://).
-    let (ws_stream, _response) = tokio_tungstenite::connect_async(&entry.url)
-        .await
-        .map_err(|e| GatewayError::ConnectionFailed(format!("WebSocket connect failed: {}", e)))?;
-
-    // Extract TLS fingerprint if the stream is TLS-wrapped
-    let actual_fp = extract_tls_fingerprint(&ws_stream);
-    if let Some(ref fp) = actual_fp {
-        let verified = verify_fingerprint(entry.fingerprint.as_deref(), fp)?;
-        info!(fingerprint = %verified, "TLS fingerprint verified");
-    } else if entry.fingerprint.is_some() {
-        // Expected a fingerprint but got a non-TLS connection
-        return Err(GatewayError::ConnectionFailed(
-            "expected TLS connection for fingerprint verification but got plaintext".into(),
-        ));
-    }
-
-    // Build the connection handle (splits the stream)
-    let conn = GatewayConnection::new_with_stream(entry.id.clone(), ws_stream);
-
-    // Send JSON-RPC handshake
+/// Send the JSON-RPC `gateway.connect` handshake over the WebSocket connection.
+async fn send_gateway_handshake(
+    conn: &GatewayConnection,
+    auth_token: &str,
+    client_id: &str,
+) -> Result<(), GatewayError> {
     let handshake_id = Uuid::new_v4().to_string();
     let handshake = serde_json::json!({
         "jsonrpc": "2.0",
@@ -583,19 +557,19 @@ pub async fn connect_to_gateway(
     let handshake_text = serde_json::to_string(&handshake)
         .map_err(|e| GatewayError::ConnectionFailed(e.to_string()))?;
 
-    {
-        let writer = conn.ws_writer.as_ref().unwrap();
-        writer
-            .lock()
-            .await
-            .send(tokio_tungstenite::tungstenite::Message::Text(
-                handshake_text,
-            ))
-            .await
-            .map_err(|e| GatewayError::ConnectionFailed(format!("handshake send failed: {}", e)))?;
-    }
+    let writer = conn.ws_writer.as_ref().unwrap();
+    writer
+        .lock()
+        .await
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            handshake_text,
+        ))
+        .await
+        .map_err(|e| GatewayError::ConnectionFailed(format!("handshake send failed: {}", e)))
+}
 
-    // Wait for handshake response
+/// Receive and validate the handshake response from the remote gateway.
+async fn receive_handshake_response(conn: &GatewayConnection) -> Result<(), GatewayError> {
     match conn.recv_message().await {
         Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
             let resp: Value = serde_json::from_str(&text).map_err(|e| {
@@ -614,24 +588,76 @@ pub async fn connect_to_gateway(
                     .unwrap_or("handshake rejected");
                 return Err(GatewayError::AuthFailed(err_msg.to_string()));
             }
+            Ok(())
         }
-        Some(Ok(_)) => {
-            return Err(GatewayError::ConnectionFailed(
-                "unexpected non-text handshake response".into(),
-            ));
-        }
-        Some(Err(e)) => {
-            return Err(GatewayError::ConnectionFailed(format!(
-                "handshake receive failed: {}",
-                e
-            )));
-        }
-        None => {
-            return Err(GatewayError::ConnectionFailed(
-                "connection closed during handshake".into(),
-            ));
-        }
+        Some(Ok(_)) => Err(GatewayError::ConnectionFailed(
+            "unexpected non-text handshake response".into(),
+        )),
+        Some(Err(e)) => Err(GatewayError::ConnectionFailed(format!(
+            "handshake receive failed: {}",
+            e
+        ))),
+        None => Err(GatewayError::ConnectionFailed(
+            "connection closed during handshake".into(),
+        )),
     }
+}
+
+/// Verify the TLS fingerprint extracted from the WebSocket stream against
+/// the expected fingerprint stored in the gateway entry.
+fn verify_stream_fingerprint(
+    entry: &GatewayEntry,
+    ws_stream: &WsStream,
+) -> Result<(), GatewayError> {
+    let actual_fp = extract_tls_fingerprint(ws_stream);
+    if let Some(ref fp) = actual_fp {
+        let verified = verify_fingerprint(entry.fingerprint.as_deref(), fp)?;
+        info!(fingerprint = %verified, "TLS fingerprint verified");
+    } else if entry.fingerprint.is_some() {
+        return Err(GatewayError::ConnectionFailed(
+            "expected TLS connection for fingerprint verification but got plaintext".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Connect to a remote gateway via direct WebSocket.
+///
+/// 1. Validate parameters.
+/// 2. Establish a TLS + WebSocket connection to `entry.url` via
+///    `tokio-tungstenite`.
+/// 3. Extract the TLS certificate fingerprint and verify it via TOFU.
+/// 4. Send a JSON-RPC `gateway.connect` handshake.
+/// 5. Return a [`GatewayConnection`] with live read/write stream halves.
+pub async fn connect_to_gateway(
+    entry: &GatewayEntry,
+    auth_token: &str,
+    client_id: &str,
+) -> Result<GatewayConnection, GatewayError> {
+    validate_gateway_params(entry, auth_token, client_id)?;
+
+    info!(
+        gateway_id = %entry.id,
+        gateway_name = %entry.name,
+        url = %entry.url,
+        "connecting to remote gateway"
+    );
+
+    // Establish the WebSocket connection (TLS handled by tokio-tungstenite
+    // when the URL scheme is wss://).
+    let (ws_stream, _response) = tokio_tungstenite::connect_async(&entry.url)
+        .await
+        .map_err(|e| GatewayError::ConnectionFailed(format!("WebSocket connect failed: {}", e)))?;
+
+    // Verify TLS fingerprint via TOFU
+    verify_stream_fingerprint(entry, &ws_stream)?;
+
+    // Build the connection handle (splits the stream)
+    let conn = GatewayConnection::new_with_stream(entry.id.clone(), ws_stream);
+
+    // Send JSON-RPC handshake and wait for response
+    send_gateway_handshake(&conn, auth_token, client_id).await?;
+    receive_handshake_response(&conn).await?;
 
     info!(
         gateway_id = %entry.id,
@@ -945,6 +971,195 @@ pub fn build_gateway_config(cfg: &Value) -> GatewayConfig {
 // Lifecycle
 // ============================================================================
 
+/// Run the message-read loop for an established gateway connection.
+///
+/// Returns `true` if shutdown was requested, `false` if the connection
+/// was lost and a reconnect should be attempted.
+async fn run_gateway_read_loop(
+    conn: &GatewayConnection,
+    gateway_id: &str,
+    rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    loop {
+        tokio::select! {
+            msg = conn.recv_message() => {
+                match msg {
+                    Some(Ok(_)) => {
+                        // Message received -- could dispatch here
+                    }
+                    Some(Err(e)) => {
+                        warn!(
+                            gateway_id = %gateway_id,
+                            error = %e,
+                            "gateway read error, will reconnect"
+                        );
+                        break;
+                    }
+                    None => {
+                        info!(
+                            gateway_id = %gateway_id,
+                            "gateway connection closed by remote"
+                        );
+                        break;
+                    }
+                }
+            }
+            _ = rx.changed() => {
+                if *rx.borrow() {
+                    return true;
+                }
+            }
+        }
+    }
+    *rx.borrow()
+}
+
+/// Handle a failed gateway connection attempt: update registry state, log,
+/// and sleep with exponential backoff.
+///
+/// Returns `true` if the caller should stop retrying (shutdown requested or
+/// max attempts reached), `false` if a retry should be attempted.
+async fn handle_connection_failure(
+    e: &GatewayError,
+    gateway_id: &str,
+    attempts: u32,
+    reg: &GatewayRegistry,
+    cfg: &GatewayConfig,
+    rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    let backoff_ms = cfg.reconnect_interval_ms * 2u64.saturating_pow(attempts.min(6));
+    let retry_at = now_ms() + backoff_ms;
+
+    reg.update_connection_state(
+        gateway_id,
+        GatewayConnectionState::Failed {
+            error: e.to_string(),
+            retry_at_ms: Some(retry_at),
+        },
+    );
+
+    if !cfg.auto_reconnect || attempts >= cfg.max_reconnect_attempts {
+        error!(
+            gateway_id = %gateway_id,
+            attempts = attempts,
+            "giving up on gateway connection"
+        );
+        return true;
+    }
+
+    warn!(
+        gateway_id = %gateway_id,
+        error = %e,
+        attempt = attempts,
+        backoff_ms = backoff_ms,
+        "gateway connection failed, will retry"
+    );
+
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+        _ = rx.changed() => {
+            if *rx.borrow() {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Per-gateway reconnection loop with exponential backoff.
+///
+/// Connects to the given gateway entry, monitors the connection, and
+/// reconnects on failure until shutdown or max attempts are reached.
+async fn run_single_gateway_connection(
+    entry: GatewayEntry,
+    reg: Arc<GatewayRegistry>,
+    cfg: GatewayConfig,
+    mut rx: tokio::sync::watch::Receiver<bool>,
+) {
+    let gateway_id = entry.id.clone();
+    let mut attempts: u32 = 0;
+
+    loop {
+        if *rx.borrow() {
+            break;
+        }
+
+        reg.update_connection_state(&gateway_id, GatewayConnectionState::Connecting);
+
+        match connect_to_gateway(&entry, &cfg.auth_token, &gateway_id).await {
+            Ok(conn) => {
+                reg.update_connection_state(
+                    &gateway_id,
+                    GatewayConnectionState::Connected { since_ms: now_ms() },
+                );
+                attempts = 0;
+
+                let shutdown = run_gateway_read_loop(&conn, &gateway_id, &mut rx).await;
+                if shutdown {
+                    break;
+                }
+            }
+            Err(e) => {
+                attempts += 1;
+                let give_up =
+                    handle_connection_failure(&e, &gateway_id, attempts, &reg, &cfg, &mut rx).await;
+                if give_up {
+                    break;
+                }
+            }
+        }
+    }
+
+    reg.update_connection_state(&gateway_id, GatewayConnectionState::Disconnected);
+}
+
+/// Seed the registry with gateway entries from the configuration file,
+/// skipping entries that already exist.
+fn seed_registry_from_config(registry: &GatewayRegistry, config: &GatewayConfig) {
+    for entry in &config.gateways {
+        if registry.get(&entry.id).is_none() {
+            if let Err(e) = registry.add(entry.clone()) {
+                warn!(
+                    gateway_id = %entry.id,
+                    error = %e,
+                    "failed to add config-defined gateway to registry"
+                );
+            }
+        }
+    }
+}
+
+/// Spawn a connection task for each auto-connect gateway and return the
+/// join handles.
+fn spawn_auto_connect_tasks(
+    registry: &Arc<GatewayRegistry>,
+    config: &GatewayConfig,
+    shutdown_rx: &tokio::sync::watch::Receiver<bool>,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let auto_connect: Vec<GatewayEntry> = registry
+        .list()
+        .into_iter()
+        .filter(|g| g.auto_connect)
+        .collect();
+
+    if auto_connect.is_empty() {
+        info!("no auto-connect gateways configured, lifecycle idle");
+    } else {
+        info!(count = auto_connect.len(), "auto-connect gateways found");
+    }
+
+    let mut handles = Vec::new();
+    for entry in auto_connect {
+        let reg = Arc::clone(registry);
+        let cfg = config.clone();
+        let rx = shutdown_rx.clone();
+        let handle = tokio::spawn(run_single_gateway_connection(entry, reg, cfg, rx));
+        handles.push(handle);
+    }
+    handles
+}
+
 /// Run the remote gateway connection lifecycle.
 ///
 /// For each gateway entry with `auto_connect = true`, spawns a connection task
@@ -966,144 +1181,8 @@ pub async fn run_gateway_lifecycle(
 
     info!("remote gateway lifecycle starting");
 
-    // Seed the registry with any gateways from the config file
-    for entry in &config.gateways {
-        if registry.get(&entry.id).is_none() {
-            if let Err(e) = registry.add(entry.clone()) {
-                warn!(
-                    gateway_id = %entry.id,
-                    error = %e,
-                    "failed to add config-defined gateway to registry"
-                );
-            }
-        }
-    }
-
-    // Gather auto-connect gateways
-    let auto_connect: Vec<GatewayEntry> = registry
-        .list()
-        .into_iter()
-        .filter(|g| g.auto_connect)
-        .collect();
-
-    if auto_connect.is_empty() {
-        info!("no auto-connect gateways configured, lifecycle idle");
-    } else {
-        info!(count = auto_connect.len(), "auto-connect gateways found");
-    }
-
-    // Spawn connection tasks
-    let mut handles = Vec::new();
-    for entry in auto_connect {
-        let reg = Arc::clone(&registry);
-        let cfg = config.clone();
-        let mut rx = shutdown_rx.clone();
-
-        let handle = tokio::spawn(async move {
-            let gateway_id = entry.id.clone();
-            let mut attempts: u32 = 0;
-
-            loop {
-                // Check for shutdown before connecting
-                if *rx.borrow() {
-                    break;
-                }
-
-                reg.update_connection_state(&gateway_id, GatewayConnectionState::Connecting);
-
-                match connect_to_gateway(&entry, &cfg.auth_token, &gateway_id).await {
-                    Ok(conn) => {
-                        reg.update_connection_state(
-                            &gateway_id,
-                            GatewayConnectionState::Connected { since_ms: now_ms() },
-                        );
-                        attempts = 0;
-
-                        // Read loop: process incoming messages until
-                        // disconnection or shutdown.
-                        loop {
-                            tokio::select! {
-                                msg = conn.recv_message() => {
-                                    match msg {
-                                        Some(Ok(_)) => {
-                                            // Message received — could dispatch here
-                                        }
-                                        Some(Err(e)) => {
-                                            warn!(
-                                                gateway_id = %gateway_id,
-                                                error = %e,
-                                                "gateway read error, will reconnect"
-                                            );
-                                            break;
-                                        }
-                                        None => {
-                                            info!(
-                                                gateway_id = %gateway_id,
-                                                "gateway connection closed by remote"
-                                            );
-                                            break;
-                                        }
-                                    }
-                                }
-                                _ = rx.changed() => {
-                                    if *rx.borrow() {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        if *rx.borrow() {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        attempts += 1;
-                        let backoff_ms =
-                            cfg.reconnect_interval_ms * 2u64.saturating_pow(attempts.min(6));
-                        let retry_at = now_ms() + backoff_ms;
-
-                        reg.update_connection_state(
-                            &gateway_id,
-                            GatewayConnectionState::Failed {
-                                error: e.to_string(),
-                                retry_at_ms: Some(retry_at),
-                            },
-                        );
-
-                        if !cfg.auto_reconnect || attempts >= cfg.max_reconnect_attempts {
-                            error!(
-                                gateway_id = %gateway_id,
-                                attempts = attempts,
-                                "giving up on gateway connection"
-                            );
-                            break;
-                        }
-
-                        warn!(
-                            gateway_id = %gateway_id,
-                            error = %e,
-                            attempt = attempts,
-                            backoff_ms = backoff_ms,
-                            "gateway connection failed, will retry"
-                        );
-
-                        tokio::select! {
-                            _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
-                            _ = rx.changed() => {
-                                if *rx.borrow() {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            reg.update_connection_state(&gateway_id, GatewayConnectionState::Disconnected);
-        });
-
-        handles.push(handle);
-    }
+    seed_registry_from_config(&registry, &config);
+    let handles = spawn_auto_connect_tasks(&registry, &config, &shutdown_rx);
 
     // Wait for shutdown
     loop {

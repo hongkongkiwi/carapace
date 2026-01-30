@@ -92,39 +92,59 @@ impl ResourceMonitor {
     /// Check thresholds and emit warnings for any that are exceeded.
     pub fn check_thresholds(&self, thresholds: &ResourceThresholds) {
         let diag = self.health_checker.gather_diagnostics(false);
+        check_disk_threshold(&diag, thresholds);
+        check_memory_threshold(&diag, thresholds);
+        check_fd_threshold(&diag, thresholds);
+    }
+}
 
-        if let Some(free) = diag.disk_free_bytes {
-            if free < thresholds.disk_min_bytes {
-                warn!(
-                    free_bytes = free,
-                    threshold = thresholds.disk_min_bytes,
-                    "disk space low"
-                );
-            }
+/// Warn if disk free space is below the configured threshold.
+fn check_disk_threshold(
+    diag: &crate::server::health::SystemDiagnostics,
+    thresholds: &ResourceThresholds,
+) {
+    if let Some(free) = diag.disk_free_bytes {
+        if free < thresholds.disk_min_bytes {
+            warn!(
+                free_bytes = free,
+                threshold = thresholds.disk_min_bytes,
+                "disk space low"
+            );
         }
+    }
+}
 
-        if let Some(rss) = diag.memory_rss_bytes {
-            if rss > thresholds.rss_warn_bytes {
-                warn!(
-                    rss_bytes = rss,
-                    threshold = thresholds.rss_warn_bytes,
-                    "memory RSS exceeds threshold"
-                );
-            }
+/// Warn if memory RSS exceeds the configured threshold.
+fn check_memory_threshold(
+    diag: &crate::server::health::SystemDiagnostics,
+    thresholds: &ResourceThresholds,
+) {
+    if let Some(rss) = diag.memory_rss_bytes {
+        if rss > thresholds.rss_warn_bytes {
+            warn!(
+                rss_bytes = rss,
+                threshold = thresholds.rss_warn_bytes,
+                "memory RSS exceeds threshold"
+            );
         }
+    }
+}
 
-        if let Some(fds) = diag.open_fds {
-            let fd_limit = fd_soft_limit();
-            if let Some(limit) = fd_limit {
-                let fraction = fds as f64 / limit as f64;
-                if fraction >= thresholds.fd_warn_fraction {
-                    warn!(
-                        open_fds = fds,
-                        limit = limit,
-                        fraction = format!("{:.1}%", fraction * 100.0),
-                        "file descriptor usage high"
-                    );
-                }
+/// Warn if file descriptor usage exceeds the configured fraction.
+fn check_fd_threshold(
+    diag: &crate::server::health::SystemDiagnostics,
+    thresholds: &ResourceThresholds,
+) {
+    if let Some(fds) = diag.open_fds {
+        if let Some(limit) = fd_soft_limit() {
+            let fraction = fds as f64 / limit as f64;
+            if fraction >= thresholds.fd_warn_fraction {
+                warn!(
+                    open_fds = fds,
+                    limit = limit,
+                    fraction = format!("{:.1}%", fraction * 100.0),
+                    "file descriptor usage high"
+                );
             }
         }
     }

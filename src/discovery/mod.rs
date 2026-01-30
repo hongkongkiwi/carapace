@@ -174,6 +174,84 @@ impl MdnsHandle {
     }
 }
 
+/// Build the TXT record key-value pairs as a `Vec` of `(&str, &str)` slices
+/// ready for `ServiceInfo::new`.
+fn prepare_txt_records(txt_records: &HashMap<String, String>) -> Vec<(&str, &str)> {
+    let mut properties: Vec<(&str, &str)> = Vec::new();
+    for (k, v) in txt_records {
+        properties.push((k.as_str(), v.as_str()));
+    }
+    properties
+}
+
+/// Resolve the system hostname and format it with a `.local.` suffix as
+/// required by `mdns-sd`.
+fn resolve_hostname() -> String {
+    let hostname = hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .unwrap_or_else(|| "localhost".to_string());
+
+    if hostname.ends_with(".local.") {
+        hostname
+    } else if hostname.ends_with(".local") {
+        format!("{}.", hostname)
+    } else {
+        format!("{}.local.", hostname)
+    }
+}
+
+/// Create the mDNS daemon, build the `ServiceInfo`, and register it.
+///
+/// Returns the daemon and the registered service fullname.
+fn register_mdns_service(
+    instance_name: &str,
+    port: u16,
+    txt_records: &HashMap<String, String>,
+) -> Result<(mdns_sd::ServiceDaemon, String), mdns_sd::Error> {
+    let daemon = mdns_sd::ServiceDaemon::new()?;
+
+    let properties = prepare_txt_records(txt_records);
+    let host_label = resolve_hostname();
+
+    let service_info = mdns_sd::ServiceInfo::new(
+        SERVICE_TYPE,
+        instance_name,
+        &host_label,
+        "", // empty IP -- let mdns-sd use the host's addresses
+        port,
+        properties.as_slice(),
+    )?;
+
+    let fullname = service_info.get_fullname().to_string();
+    daemon.register(service_info)?;
+
+    Ok((daemon, fullname))
+}
+
+/// Log the successful mDNS service registration along with TXT record details.
+fn log_mdns_registration(
+    fullname: &str,
+    port: u16,
+    mode: &DiscoveryMode,
+    txt_records: &HashMap<String, String>,
+) {
+    info!(
+        "mDNS service registered: {} on port {} ({})",
+        fullname,
+        port,
+        match mode {
+            DiscoveryMode::Minimal => "minimal TXT records",
+            DiscoveryMode::Full => "full TXT records",
+            DiscoveryMode::Off => unreachable!(),
+        }
+    );
+
+    for (k, v) in txt_records {
+        debug!("  TXT: {}={}", k, v);
+    }
+}
+
 /// Start the mDNS service daemon and register the gateway service.
 ///
 /// Returns an `MdnsHandle` on success that must be shut down on exit,
@@ -201,57 +279,9 @@ pub fn start_mdns(
         instance_name, config.mode, port
     );
 
-    // Create the mDNS daemon
-    let daemon = mdns_sd::ServiceDaemon::new()?;
+    let (daemon, fullname) = register_mdns_service(&instance_name, port, &txt_records)?;
 
-    // Build service info with TXT properties
-    let mut properties: Vec<(&str, &str)> = Vec::new();
-    for (k, v) in &txt_records {
-        properties.push((k.as_str(), v.as_str()));
-    }
-
-    let hostname = hostname::get()
-        .ok()
-        .and_then(|h| h.into_string().ok())
-        .unwrap_or_else(|| "localhost".to_string());
-
-    // mdns-sd requires the hostname to end with ".local."
-    let host_label = if hostname.ends_with(".local.") {
-        hostname.clone()
-    } else if hostname.ends_with(".local") {
-        format!("{}.", hostname)
-    } else {
-        format!("{}.local.", hostname)
-    };
-
-    let service_info = mdns_sd::ServiceInfo::new(
-        SERVICE_TYPE,
-        &instance_name,
-        &host_label,
-        "", // empty IP -- let mdns-sd use the host's addresses
-        port,
-        properties.as_slice(),
-    )?;
-
-    let fullname = service_info.get_fullname().to_string();
-
-    // Register the service
-    daemon.register(service_info)?;
-
-    info!(
-        "mDNS service registered: {} on port {} ({})",
-        fullname,
-        port,
-        match config.mode {
-            DiscoveryMode::Minimal => "minimal TXT records",
-            DiscoveryMode::Full => "full TXT records",
-            DiscoveryMode::Off => unreachable!(),
-        }
-    );
-
-    for (k, v) in &txt_records {
-        debug!("  TXT: {}={}", k, v);
-    }
+    log_mdns_registration(&fullname, port, &config.mode, &txt_records);
 
     Ok(Some(MdnsHandle { daemon, fullname }))
 }

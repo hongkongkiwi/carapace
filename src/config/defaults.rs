@@ -572,6 +572,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    #[allow(clippy::cognitive_complexity)]
     fn test_empty_config_gets_all_defaults() {
         let mut config = json!({});
         apply_defaults(&mut config);

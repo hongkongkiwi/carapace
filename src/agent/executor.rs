@@ -25,7 +25,464 @@ const TURN_TIMEOUT: Duration = Duration::from_secs(600);
 /// we treat it as a timeout and abort the turn.
 const STREAM_CHUNK_TIMEOUT: Duration = Duration::from_secs(90);
 use crate::sessions::{ChatMessage, MessageRole};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+/// Result of processing an LLM stream for a single turn.
+struct StreamResult {
+    turn_text: String,
+    pending_tool_calls: Vec<(String, String, Value)>,
+    stop_reason: StopReason,
+    turn_usage: TokenUsage,
+}
+
+/// Dispatch a single stream event, updating turn accumulators.
+///
+/// Returns `Ok(true)` if the event was a `Stop` (caller should break),
+/// `Ok(false)` to continue reading, or `Err` on a provider error event.
+fn handle_stream_event(
+    event: StreamEvent,
+    result: &mut StreamResult,
+    state: &Arc<WsServerState>,
+    run_id: &str,
+    session_key: &str,
+    seq: &AtomicU64,
+) -> Result<bool, AgentError> {
+    match event {
+        StreamEvent::TextDelta { text } => {
+            result.turn_text.push_str(&text);
+
+            broadcast_agent_event(
+                state,
+                run_id,
+                seq.fetch_add(1, Ordering::Relaxed),
+                "text",
+                json!({ "delta": &text }),
+            );
+
+            broadcast_chat_event(
+                state,
+                run_id,
+                session_key,
+                seq.fetch_add(1, Ordering::Relaxed),
+                "delta",
+                Some(json!({ "content": &text })),
+                None,
+                None,
+                None,
+            );
+            Ok(false)
+        }
+
+        StreamEvent::ToolUse { id, name, input } => {
+            broadcast_agent_event(
+                state,
+                run_id,
+                seq.fetch_add(1, Ordering::Relaxed),
+                "tool_use",
+                json!({
+                    "toolUseId": &id,
+                    "name": &name,
+                    "input": &input,
+                }),
+            );
+            result.pending_tool_calls.push((id, name, input));
+            Ok(false)
+        }
+
+        StreamEvent::Stop { reason, usage } => {
+            result.stop_reason = reason;
+            result.turn_usage = usage;
+            Ok(true)
+        }
+
+        StreamEvent::Error { message } => {
+            let safe_message = sanitize_provider_error(&message);
+            broadcast_agent_event(
+                state,
+                run_id,
+                seq.fetch_add(1, Ordering::Relaxed),
+                "error",
+                json!({ "message": &safe_message }),
+            );
+            broadcast_chat_event(
+                state,
+                run_id,
+                session_key,
+                seq.fetch_add(1, Ordering::Relaxed),
+                "error",
+                None,
+                Some(&safe_message),
+                None,
+                None,
+            );
+            tracing::error!(run_id = %run_id, error = %safe_message, "LLM provider error");
+            Err(AgentError::Provider(safe_message))
+        }
+    }
+}
+
+/// Process the LLM event stream for a single turn.
+///
+/// Reads events from `rx`, accumulates text deltas and tool-use blocks,
+/// broadcasts events to clients, and checks for cancellation. Returns the
+/// accumulated turn data or an error on cancellation / stream failure.
+async fn process_llm_stream(
+    rx: &mut mpsc::Receiver<StreamEvent>,
+    state: &Arc<WsServerState>,
+    run_id: &str,
+    session_key: &str,
+    seq: &AtomicU64,
+    cancel_token: &CancellationToken,
+) -> Result<StreamResult, AgentError> {
+    let mut result = StreamResult {
+        turn_text: String::new(),
+        pending_tool_calls: Vec::new(),
+        stop_reason: StopReason::EndTurn,
+        turn_usage: TokenUsage::default(),
+    };
+    let mut got_stop = false;
+
+    loop {
+        let event = tokio::select! {
+            _ = cancel_token.cancelled() => {
+                broadcast_agent_event(state, run_id, seq.fetch_add(1, Ordering::Relaxed), "cancelled", json!({}));
+                return Err(AgentError::Cancelled);
+            }
+            result = tokio::time::timeout(STREAM_CHUNK_TIMEOUT, rx.recv()) => {
+                match result {
+                    Ok(Some(e)) => e,
+                    Ok(None) => break, // stream ended
+                    Err(_) => {
+                        tracing::error!(
+                            run_id = %run_id,
+                            timeout_secs = STREAM_CHUNK_TIMEOUT.as_secs(),
+                            "LLM stream stalled — no data received within chunk timeout"
+                        );
+                        return Err(AgentError::Provider(format!(
+                            "LLM stream stalled — no data received for {}s",
+                            STREAM_CHUNK_TIMEOUT.as_secs()
+                        )));
+                    }
+                }
+            }
+        };
+
+        got_stop = handle_stream_event(event, &mut result, state, run_id, session_key, seq)?;
+        if got_stop {
+            break;
+        }
+    }
+
+    // Detect premature stream end (network interruption, upstream error)
+    if !got_stop {
+        return Err(AgentError::Stream(
+            "stream ended without stop event".to_string(),
+        ));
+    }
+
+    Ok(result)
+}
+
+/// Build an assistant history message from accumulated turn text and tool-use blocks.
+///
+/// Returns the `ChatMessage` ready for persistence, or `None` if there is
+/// nothing to record (empty text and no tool calls).
+fn build_assistant_message(
+    session_id: &str,
+    turn_text: &str,
+    pending_tool_calls: &[(String, String, Value)],
+    output_tokens: u64,
+) -> Option<ChatMessage> {
+    if turn_text.is_empty() && pending_tool_calls.is_empty() {
+        return None;
+    }
+
+    let content = if pending_tool_calls.is_empty() {
+        turn_text.to_string()
+    } else {
+        // Store tool_use blocks as JSON for context reconstruction
+        let mut blocks: Vec<Value> = Vec::new();
+        if !turn_text.is_empty() {
+            blocks.push(json!({"type": "text", "text": turn_text}));
+        }
+        for (id, name, input) in pending_tool_calls {
+            blocks.push(json!({
+                "type": "tool_use",
+                "id": id,
+                "name": name,
+                "input": input,
+            }));
+        }
+        serde_json::to_string(&blocks).unwrap_or_else(|_| turn_text.to_string())
+    };
+
+    Some(ChatMessage::assistant(session_id, &content).with_tokens(output_tokens))
+}
+
+/// Execute pending tool calls with exfiltration guard and tool-policy checks,
+/// broadcast results, and return the corresponding history messages.
+fn execute_tools_with_guards(
+    pending_tool_calls: &[(String, String, Value)],
+    config: &AgentConfig,
+    state: &Arc<WsServerState>,
+    session_id: &str,
+    session_key: &str,
+    run_id: &str,
+    seq: &AtomicU64,
+) -> Vec<ChatMessage> {
+    let mut tool_msgs = Vec::with_capacity(pending_tool_calls.len());
+
+    for (tool_id, tool_name, tool_input) in pending_tool_calls {
+        // Check exfiltration guard before tool policy (defence-in-depth)
+        let tool_result = if config.exfiltration_guard
+            && crate::agent::exfiltration::is_exfiltration_sensitive(tool_name)
+        {
+            ToolCallResult::Error {
+                message: format!(
+                    "Tool \"{}\" is blocked by the exfiltration guard. \
+                     This tool sends data externally and requires explicit approval. \
+                     Set exfiltration_guard: false in agent config to allow.",
+                    tool_name
+                ),
+            }
+        } else if !config.tool_policy.is_allowed(tool_name) {
+            ToolCallResult::Error {
+                message: format!("Tool \"{}\" is not available for this agent", tool_name),
+            }
+        } else if let Some(tools_registry) = state.tools_registry() {
+            tools::execute_tool_call(
+                tool_name,
+                tool_input.clone(),
+                tools_registry,
+                session_key,
+                None,
+            )
+        } else {
+            ToolCallResult::Error {
+                message: "no tools registry available".to_string(),
+            }
+        };
+
+        let (result_content, is_error) = match &tool_result {
+            ToolCallResult::Ok { output } => (output.clone(), false),
+            ToolCallResult::Error { message } => (message.clone(), true),
+        };
+
+        // Broadcast tool_result event
+        broadcast_agent_event(
+            state,
+            run_id,
+            seq.fetch_add(1, Ordering::Relaxed),
+            "tool_result",
+            json!({
+                "toolUseId": tool_id,
+                "name": tool_name,
+                "result": &result_content,
+                "isError": is_error,
+            }),
+        );
+
+        let mut tool_msg = ChatMessage::tool(session_id, tool_name, tool_id, &result_content);
+        if is_error {
+            tool_msg.metadata = Some(json!({"is_error": true}));
+        }
+        tool_msgs.push(tool_msg);
+    }
+
+    tool_msgs
+}
+
+/// Record token usage for a single turn via the usage tracker.
+fn record_turn_usage(session_key: &str, model: &str, usage: &TokenUsage) {
+    let provider_name = if crate::agent::openai::is_openai_model(model) {
+        "openai"
+    } else {
+        "anthropic"
+    };
+    crate::server::ws::record_usage(
+        session_key,
+        provider_name,
+        usage.input_tokens,
+        usage.output_tokens,
+        estimate_cost(model, usage.input_tokens, usage.output_tokens),
+    );
+}
+
+/// Build the `CompletionRequest` for a single turn from in-memory history.
+fn build_turn_request(
+    history: &[ChatMessage],
+    config: &AgentConfig,
+    state: &Arc<WsServerState>,
+) -> CompletionRequest {
+    let (system, messages) = build_context(history, config.system.as_deref());
+
+    let tools = if let Some(tools_registry) = state.tools_registry() {
+        let all_tools = tools::list_provider_tools(tools_registry);
+        config
+            .tool_policy
+            .filter_tools_with_guard(all_tools, config.exfiltration_guard)
+    } else {
+        vec![]
+    };
+
+    CompletionRequest {
+        model: config.model.clone(),
+        messages,
+        system,
+        tools,
+        max_tokens: config.max_tokens,
+        temperature: config.temperature,
+    }
+}
+
+/// Broadcast run-completion events and mark the run as completed in the registry.
+#[allow(clippy::too_many_arguments)]
+fn finalize_run(
+    state: &Arc<WsServerState>,
+    run_id: &str,
+    session_key: &str,
+    seq: &AtomicU64,
+    final_stop_reason: StopReason,
+    total_input_tokens: u64,
+    total_output_tokens: u64,
+    accumulated_text: String,
+) {
+    let stop_reason_str = match final_stop_reason {
+        StopReason::EndTurn => "end_turn",
+        StopReason::MaxTokens => "max_tokens",
+        StopReason::ToolUse => "tool_use",
+    };
+
+    broadcast_agent_event(
+        state,
+        run_id,
+        seq.fetch_add(1, Ordering::Relaxed),
+        "complete",
+        json!({
+            "stopReason": stop_reason_str,
+            "usage": {
+                "inputTokens": total_input_tokens,
+                "outputTokens": total_output_tokens,
+            }
+        }),
+    );
+
+    broadcast_chat_event(
+        state,
+        run_id,
+        session_key,
+        seq.fetch_add(1, Ordering::Relaxed),
+        "final",
+        Some(json!({ "content": &accumulated_text })),
+        None,
+        Some(json!({
+            "inputTokens": total_input_tokens,
+            "outputTokens": total_output_tokens,
+        })),
+        Some(stop_reason_str),
+    );
+
+    let mut registry = state.agent_run_registry.lock();
+    registry.mark_completed(run_id, accumulated_text);
+}
+
+/// Execute a single LLM turn: call the provider, stream the response,
+/// record usage, persist the assistant message, and optionally execute tools.
+///
+/// Returns `Ok(true)` if the loop should continue (tool calls pending),
+/// `Ok(false)` if the run is done (end-turn / max-tokens).
+#[allow(clippy::too_many_arguments)]
+async fn execute_single_turn(
+    config: &AgentConfig,
+    state: &Arc<WsServerState>,
+    provider: &Arc<dyn LlmProvider>,
+    cancel_token: &CancellationToken,
+    run_id: &str,
+    session_key: &str,
+    session_id: &str,
+    seq: &AtomicU64,
+    history: &mut Vec<ChatMessage>,
+    accumulated_text: &mut String,
+    total_input_tokens: &mut u64,
+    total_output_tokens: &mut u64,
+    final_stop_reason: &mut StopReason,
+) -> Result<bool, AgentError> {
+    // Check cancellation
+    if cancel_token.is_cancelled() {
+        broadcast_agent_event(
+            state,
+            run_id,
+            seq.fetch_add(1, Ordering::Relaxed),
+            "cancelled",
+            json!({}),
+        );
+        return Err(AgentError::Cancelled);
+    }
+
+    let request = build_turn_request(history, config, state);
+
+    // Call LLM (with per-turn timeout)
+    let mut rx = match tokio::time::timeout(TURN_TIMEOUT, provider.complete(request)).await {
+        Ok(result) => result.map_err(|e| AgentError::Provider(e.to_string()))?,
+        Err(_) => {
+            return Err(AgentError::Provider(format!(
+                "LLM turn timed out after {}s",
+                TURN_TIMEOUT.as_secs()
+            )));
+        }
+    };
+
+    let StreamResult {
+        turn_text,
+        pending_tool_calls,
+        stop_reason,
+        turn_usage,
+    } = process_llm_stream(&mut rx, state, run_id, session_key, seq, cancel_token).await?;
+
+    // Track usage
+    *total_input_tokens += turn_usage.input_tokens;
+    *total_output_tokens += turn_usage.output_tokens;
+    record_turn_usage(session_key, &config.model, &turn_usage);
+
+    // Append assistant message to history
+    if let Some(msg) = build_assistant_message(
+        session_id,
+        &turn_text,
+        &pending_tool_calls,
+        turn_usage.output_tokens,
+    ) {
+        state
+            .session_store()
+            .append_message(msg.clone())
+            .map_err(|e| AgentError::SessionStore(e.to_string()))?;
+        history.push(msg);
+    }
+
+    accumulated_text.push_str(&turn_text);
+    *final_stop_reason = stop_reason;
+
+    // If there are tool calls, execute them and signal continuation
+    if !pending_tool_calls.is_empty() && stop_reason == StopReason::ToolUse {
+        let tool_msgs = execute_tools_with_guards(
+            &pending_tool_calls,
+            config,
+            state,
+            session_id,
+            session_key,
+            run_id,
+            seq,
+        );
+        state
+            .session_store()
+            .append_messages(&tool_msgs)
+            .map_err(|e| AgentError::SessionStore(e.to_string()))?;
+        history.extend(tool_msgs);
+        return Ok(true);
+    }
+
+    Ok(false)
+}
 
 /// Execute an agent run to completion.
 ///
@@ -39,9 +496,7 @@ pub async fn execute_run(
     provider: Arc<dyn LlmProvider>,
     cancel_token: CancellationToken,
 ) -> Result<(), AgentError> {
-    // Sequence counter for broadcast events
     let seq = AtomicU64::new(0);
-    let next_seq = || seq.fetch_add(1, Ordering::Relaxed);
 
     // 1. Mark run as Running (returns false if already cancelled)
     {
@@ -51,11 +506,10 @@ pub async fn execute_run(
         }
     }
 
-    // Broadcast started event
     broadcast_agent_event(
         &state,
         &run_id,
-        next_seq(),
+        seq.fetch_add(1, Ordering::Relaxed),
         "started",
         json!({ "sessionKey": &session_key, "model": &config.model }),
     );
@@ -72,345 +526,45 @@ pub async fn execute_run(
     let mut total_output_tokens: u64 = 0;
     let mut final_stop_reason = StopReason::EndTurn;
 
-    // Load history once before the loop to avoid O(turns × history_size) disk I/O
     let mut history = state
         .session_store()
         .get_history(&session.id, None, None)
         .map_err(|e| AgentError::SessionStore(e.to_string()))?;
 
     for _turn in 0..config.max_turns {
-        // Check cancellation
-        if cancel_token.is_cancelled() {
-            broadcast_agent_event(&state, &run_id, next_seq(), "cancelled", json!({}));
-            return Err(AgentError::Cancelled);
-        }
-
-        // Build LLM context from in-memory history
-        let (system, messages) = build_context(&history, config.system.as_deref());
-
-        // Get available tools, filtered by the agent's tool policy and
-        // exfiltration guard (defence-in-depth: the LLM never sees blocked tools)
-        let tools = if let Some(tools_registry) = state.tools_registry() {
-            let all_tools = tools::list_provider_tools(tools_registry);
-            config
-                .tool_policy
-                .filter_tools_with_guard(all_tools, config.exfiltration_guard)
-        } else {
-            vec![]
-        };
-
-        // Build completion request
-        let request = CompletionRequest {
-            model: config.model.clone(),
-            messages,
-            system,
-            tools,
-            max_tokens: config.max_tokens,
-            temperature: config.temperature,
-        };
-
-        // Call LLM (with per-turn timeout)
-        let mut rx = match tokio::time::timeout(TURN_TIMEOUT, provider.complete(request)).await {
-            Ok(result) => result.map_err(|e| AgentError::Provider(e.to_string()))?,
-            Err(_) => {
-                return Err(AgentError::Provider(format!(
-                    "LLM turn timed out after {}s",
-                    TURN_TIMEOUT.as_secs()
-                )));
-            }
-        };
-
-        // Process the stream
-        let mut turn_text = String::new();
-        let mut pending_tool_calls: Vec<(String, String, Value)> = Vec::new(); // (id, name, input)
-        let mut stop_reason = StopReason::EndTurn;
-        let mut turn_usage = TokenUsage::default();
-        let mut got_stop = false;
-
-        loop {
-            let event = tokio::select! {
-                _ = cancel_token.cancelled() => {
-                    broadcast_agent_event(&state, &run_id, next_seq(), "cancelled", json!({}));
-                    return Err(AgentError::Cancelled);
-                }
-                result = tokio::time::timeout(STREAM_CHUNK_TIMEOUT, rx.recv()) => {
-                    match result {
-                        Ok(Some(e)) => e,
-                        Ok(None) => break, // stream ended
-                        Err(_) => {
-                            // No chunk received within timeout — stalled stream
-                            tracing::error!(
-                                run_id = %run_id,
-                                timeout_secs = STREAM_CHUNK_TIMEOUT.as_secs(),
-                                "LLM stream stalled — no data received within chunk timeout"
-                            );
-                            return Err(AgentError::Provider(format!(
-                                "LLM stream stalled — no data received for {}s",
-                                STREAM_CHUNK_TIMEOUT.as_secs()
-                            )));
-                        }
-                    }
-                }
-            };
-
-            match event {
-                StreamEvent::TextDelta { text } => {
-                    turn_text.push_str(&text);
-
-                    // Broadcast text delta
-                    broadcast_agent_event(
-                        &state,
-                        &run_id,
-                        next_seq(),
-                        "text",
-                        json!({ "delta": &text }),
-                    );
-
-                    // Also broadcast chat event for webchat-ui
-                    broadcast_chat_event(
-                        &state,
-                        &run_id,
-                        &session_key,
-                        next_seq(),
-                        "delta",
-                        Some(json!({ "content": &text })),
-                        None,
-                        None,
-                        None,
-                    );
-                }
-
-                StreamEvent::ToolUse { id, name, input } => {
-                    // Broadcast tool_use event
-                    broadcast_agent_event(
-                        &state,
-                        &run_id,
-                        next_seq(),
-                        "tool_use",
-                        json!({
-                            "toolUseId": &id,
-                            "name": &name,
-                            "input": &input,
-                        }),
-                    );
-                    pending_tool_calls.push((id, name, input));
-                }
-
-                StreamEvent::Stop { reason, usage } => {
-                    stop_reason = reason;
-                    turn_usage = usage;
-                    got_stop = true;
-                    break;
-                }
-
-                StreamEvent::Error { message } => {
-                    // Sanitize error before broadcasting — strip potential secrets
-                    let safe_message = sanitize_provider_error(&message);
-                    broadcast_agent_event(
-                        &state,
-                        &run_id,
-                        next_seq(),
-                        "error",
-                        json!({ "message": &safe_message }),
-                    );
-                    broadcast_chat_event(
-                        &state,
-                        &run_id,
-                        &session_key,
-                        next_seq(),
-                        "error",
-                        None,
-                        Some(&safe_message),
-                        None,
-                        None,
-                    );
-                    // Log the sanitized error — logs are accessible via logs.tail
-                    tracing::error!(run_id = %run_id, error = %safe_message, "LLM provider error");
-                    return Err(AgentError::Provider(safe_message));
-                }
-            }
-        }
-
-        // Detect premature stream end (network interruption, upstream error)
-        if !got_stop {
-            return Err(AgentError::Stream(
-                "stream ended without stop event".to_string(),
-            ));
-        }
-
-        // Track usage
-        total_input_tokens += turn_usage.input_tokens;
-        total_output_tokens += turn_usage.output_tokens;
-
-        // Record usage via the usage tracker
-        let provider_name = if crate::agent::openai::is_openai_model(&config.model) {
-            "openai"
-        } else {
-            "anthropic"
-        };
-        crate::server::ws::record_usage(
+        let should_continue = execute_single_turn(
+            &config,
+            &state,
+            &provider,
+            &cancel_token,
+            &run_id,
             &session_key,
-            provider_name,
-            turn_usage.input_tokens,
-            turn_usage.output_tokens,
-            estimate_cost(
-                &config.model,
-                turn_usage.input_tokens,
-                turn_usage.output_tokens,
-            ),
-        );
+            &session.id,
+            &seq,
+            &mut history,
+            &mut accumulated_text,
+            &mut total_input_tokens,
+            &mut total_output_tokens,
+            &mut final_stop_reason,
+        )
+        .await?;
 
-        // Append assistant message to history
-        if !turn_text.is_empty() || !pending_tool_calls.is_empty() {
-            let content = if pending_tool_calls.is_empty() {
-                turn_text.clone()
-            } else {
-                // Store tool_use blocks as JSON for context reconstruction
-                let mut blocks: Vec<Value> = Vec::new();
-                if !turn_text.is_empty() {
-                    blocks.push(json!({"type": "text", "text": &turn_text}));
-                }
-                for (id, name, input) in &pending_tool_calls {
-                    blocks.push(json!({
-                        "type": "tool_use",
-                        "id": id,
-                        "name": name,
-                        "input": input,
-                    }));
-                }
-                serde_json::to_string(&blocks).unwrap_or_else(|_| turn_text.clone())
-            };
-
-            let msg =
-                ChatMessage::assistant(&session.id, &content).with_tokens(turn_usage.output_tokens);
-            state
-                .session_store()
-                .append_message(msg.clone())
-                .map_err(|e| AgentError::SessionStore(e.to_string()))?;
-            history.push(msg);
+        if !should_continue {
+            break;
         }
-
-        accumulated_text.push_str(&turn_text);
-        final_stop_reason = stop_reason;
-
-        // If there are tool calls, execute them and continue the loop
-        if !pending_tool_calls.is_empty() && stop_reason == StopReason::ToolUse {
-            let mut tool_msgs = Vec::with_capacity(pending_tool_calls.len());
-
-            for (tool_id, tool_name, tool_input) in &pending_tool_calls {
-                // Check exfiltration guard before tool policy (defence-in-depth)
-                let tool_result = if config.exfiltration_guard
-                    && crate::agent::exfiltration::is_exfiltration_sensitive(tool_name)
-                {
-                    ToolCallResult::Error {
-                        message: format!(
-                            "Tool \"{}\" is blocked by the exfiltration guard. \
-                             This tool sends data externally and requires explicit approval. \
-                             Set exfiltration_guard: false in agent config to allow.",
-                            tool_name
-                        ),
-                    }
-                } else if !config.tool_policy.is_allowed(tool_name) {
-                    ToolCallResult::Error {
-                        message: format!("Tool \"{}\" is not available for this agent", tool_name),
-                    }
-                } else if let Some(tools_registry) = state.tools_registry() {
-                    tools::execute_tool_call(
-                        tool_name,
-                        tool_input.clone(),
-                        tools_registry,
-                        &session_key,
-                        None,
-                    )
-                } else {
-                    ToolCallResult::Error {
-                        message: "no tools registry available".to_string(),
-                    }
-                };
-
-                let (result_content, is_error) = match &tool_result {
-                    ToolCallResult::Ok { output } => (output.clone(), false),
-                    ToolCallResult::Error { message } => (message.clone(), true),
-                };
-
-                // Broadcast tool_result event
-                broadcast_agent_event(
-                    &state,
-                    &run_id,
-                    next_seq(),
-                    "tool_result",
-                    json!({
-                        "toolUseId": tool_id,
-                        "name": tool_name,
-                        "result": &result_content,
-                        "isError": is_error,
-                    }),
-                );
-
-                let mut tool_msg =
-                    ChatMessage::tool(&session.id, tool_name, tool_id, &result_content);
-                if is_error {
-                    tool_msg.metadata = Some(json!({"is_error": true}));
-                }
-                tool_msgs.push(tool_msg);
-            }
-
-            // Batch-append all tool results in a single file write
-            state
-                .session_store()
-                .append_messages(&tool_msgs)
-                .map_err(|e| AgentError::SessionStore(e.to_string()))?;
-            history.extend(tool_msgs);
-
-            // Continue loop — tool results will be sent back to LLM on next turn
-            continue;
-        }
-
-        // No tool calls or EndTurn/MaxTokens → done
-        break;
     }
 
-    // 6. Broadcast completion
-    let stop_reason_str = match final_stop_reason {
-        StopReason::EndTurn => "end_turn",
-        StopReason::MaxTokens => "max_tokens",
-        StopReason::ToolUse => "tool_use",
-    };
-
-    broadcast_agent_event(
-        &state,
-        &run_id,
-        next_seq(),
-        "complete",
-        json!({
-            "stopReason": stop_reason_str,
-            "usage": {
-                "inputTokens": total_input_tokens,
-                "outputTokens": total_output_tokens,
-            }
-        }),
-    );
-
-    broadcast_chat_event(
+    // 4. Broadcast completion and mark run done
+    finalize_run(
         &state,
         &run_id,
         &session_key,
-        next_seq(),
-        "final",
-        Some(json!({ "content": &accumulated_text })),
-        None,
-        Some(json!({
-            "inputTokens": total_input_tokens,
-            "outputTokens": total_output_tokens,
-        })),
-        Some(stop_reason_str),
+        &seq,
+        final_stop_reason,
+        total_input_tokens,
+        total_output_tokens,
+        accumulated_text,
     );
-
-    // 7. Mark run as completed
-    {
-        let mut registry = state.agent_run_registry.lock();
-        registry.mark_completed(&run_id, accumulated_text);
-    }
 
     Ok(())
 }

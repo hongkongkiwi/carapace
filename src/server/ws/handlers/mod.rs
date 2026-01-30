@@ -57,7 +57,8 @@ pub(super) fn handle_health() -> Value {
     })
 }
 
-pub(super) fn handle_status(state: &WsServerState) -> Value {
+/// Build the full status JSON response payload.
+fn build_status_response(state: &WsServerState) -> Value {
     let sessions = state
         .session_store
         .list_sessions(crate::sessions::SessionFilter::new())
@@ -94,6 +95,10 @@ pub(super) fn handle_status(state: &WsServerState) -> Value {
             "recent": recent_sessions
         }
     })
+}
+
+pub(super) fn handle_status(state: &WsServerState) -> Value {
+    build_status_response(state)
 }
 
 /// Methods exclusively for the `node` role
@@ -154,6 +159,130 @@ const OPERATOR_ADMIN_REQUIRED_METHODS: [&str; 38] = [
     "system-event",
 ];
 
+/// Read-only methods (any authenticated role).
+const READ_METHODS: &[&str] = &[
+    "health",
+    "status",
+    "last-heartbeat",
+    "config.get",
+    "config.schema",
+    "sessions.list",
+    "sessions.preview",
+    "sessions.archives",
+    "channels.status",
+    "agent.identity.get",
+    "chat.history",
+    "tts.status",
+    "tts.providers",
+    "tts.voices",
+    "voicewake.get",
+    "voicewake.keywords",
+    "wizard.status",
+    "wizard.list",
+    "talk.status",
+    "talk.devices",
+    "models.list",
+    "agents.list",
+    "skills.status",
+    "cron.status",
+    "cron.list",
+    "cron.runs",
+    "node.list",
+    "node.describe",
+    "node.pair.list",
+    "device.pair.list",
+    "exec.approvals.get",
+    "exec.approvals.node.get",
+    "usage.status",
+    "usage.cost",
+    "usage.session",
+    "usage.providers",
+    "usage.daily",
+    "update.status",
+    "update.releaseNotes",
+    "logs.tail",
+    "system-presence",
+];
+
+/// Write methods (requires write or admin role).
+const WRITE_METHODS: &[&str] = &[
+    "config.set",
+    "config.apply",
+    "config.patch",
+    "sessions.patch",
+    "sessions.reset",
+    "sessions.delete",
+    "sessions.compact",
+    "sessions.archive",
+    "sessions.restore",
+    "sessions.archive.delete",
+    "channels.logout",
+    "agent",
+    "agent.wait",
+    "chat.send",
+    "chat.abort",
+    "tts.enable",
+    "tts.disable",
+    "tts.convert",
+    "tts.setProvider",
+    "tts.setVoice",
+    "tts.configure",
+    "tts.speak",
+    "tts.stop",
+    "voicewake.set",
+    "voicewake.enable",
+    "voicewake.disable",
+    "voicewake.test",
+    "wizard.start",
+    "wizard.next",
+    "wizard.back",
+    "wizard.cancel",
+    "talk.mode",
+    "talk.start",
+    "talk.stop",
+    "talk.configure",
+    "skills.install",
+    "skills.update",
+    "update.run",
+    "update.check",
+    "update.setChannel",
+    "update.configure",
+    "update.install",
+    "update.dismiss",
+    "usage.enable",
+    "usage.disable",
+    "usage.reset",
+    "cron.add",
+    "cron.update",
+    "cron.remove",
+    "cron.run",
+    "node.invoke",
+    "set-heartbeats",
+    "wake",
+    "send",
+];
+
+/// Admin methods (requires admin role, or operator with specific scopes).
+const ADMIN_METHODS: &[&str] = &[
+    "system-event",
+    "config.reload",
+    "device.pair.approve",
+    "device.pair.reject",
+    "device.token.rotate",
+    "device.token.revoke",
+    "node.pair.request",
+    "node.pair.approve",
+    "node.pair.reject",
+    "node.pair.verify",
+    "node.rename",
+    "exec.approvals.set",
+    "exec.approvals.node.set",
+    "exec.approval.request",
+    "exec.approval.resolve",
+    "sessions.export_user",
+    "sessions.purge_user",
+];
+
 /// Method authorization levels
 ///
 /// Methods are categorized by the minimum role required to call them:
@@ -163,133 +292,15 @@ const OPERATOR_ADMIN_REQUIRED_METHODS: [&str; 38] = [
 ///
 /// Note: For operators, additional scope checks are applied separately.
 pub(super) fn get_method_required_role(method: &str) -> &'static str {
-    match method {
-        // Read-only operations (any authenticated role)
-        "health"
-        | "status"
-        | "last-heartbeat"
-        | "config.get"
-        | "config.schema"
-        | "sessions.list"
-        | "sessions.preview"
-        | "sessions.archives"
-        | "channels.status"
-        | "agent.identity.get"
-        | "chat.history"
-        | "tts.status"
-        | "tts.providers"
-        | "tts.voices"
-        | "voicewake.get"
-        | "voicewake.keywords"
-        | "wizard.status"
-        | "wizard.list"
-        | "talk.status"
-        | "talk.devices"
-        | "models.list"
-        | "agents.list"
-        | "skills.status"
-        | "cron.status"
-        | "cron.list"
-        | "cron.runs"
-        | "node.list"
-        | "node.describe"
-        | "node.pair.list"
-        | "device.pair.list"
-        | "exec.approvals.get"
-        | "exec.approvals.node.get"
-        | "usage.status"
-        | "usage.cost"
-        | "usage.session"
-        | "usage.providers"
-        | "usage.daily"
-        | "update.status"
-        | "update.releaseNotes"
-        | "logs.tail" => "read",
-
-        // Write operations (requires write or admin role)
-        "config.set"
-        | "config.apply"
-        | "config.patch"
-        | "sessions.patch"
-        | "sessions.reset"
-        | "sessions.delete"
-        | "sessions.compact"
-        | "sessions.archive"
-        | "sessions.restore"
-        | "sessions.archive.delete"
-        | "channels.logout"
-        | "agent"
-        | "agent.wait"
-        | "chat.send"
-        | "chat.abort"
-        | "tts.enable"
-        | "tts.disable"
-        | "tts.convert"
-        | "tts.setProvider"
-        | "tts.setVoice"
-        | "tts.configure"
-        | "tts.speak"
-        | "tts.stop"
-        | "voicewake.set"
-        | "voicewake.enable"
-        | "voicewake.disable"
-        | "voicewake.test"
-        | "wizard.start"
-        | "wizard.next"
-        | "wizard.back"
-        | "wizard.cancel"
-        | "talk.mode"
-        | "talk.start"
-        | "talk.stop"
-        | "talk.configure"
-        | "skills.install"
-        | "skills.update"
-        | "update.run"
-        | "update.check"
-        | "update.setChannel"
-        | "update.configure"
-        | "update.install"
-        | "update.dismiss"
-        | "usage.enable"
-        | "usage.disable"
-        | "usage.reset"
-        | "cron.add"
-        | "cron.update"
-        | "cron.remove"
-        | "cron.run"
-        | "node.invoke"
-        | "set-heartbeats"
-        | "wake"
-        | "send" => "write",
-
-        // system-presence is read-only (lists system presence)
-        "system-presence" => "read",
-
-        // system-event is admin-only (can trigger system events)
-        "system-event" => "admin",
-
-        // Config reload (admin-only, triggers config re-read and cache update)
-        "config.reload" => "admin",
-
-        // Admin operations (requires admin role, or operator with specific scopes)
-        "device.pair.approve"
-        | "device.pair.reject"
-        | "device.token.rotate"
-        | "device.token.revoke"
-        | "node.pair.request"
-        | "node.pair.approve"
-        | "node.pair.reject"
-        | "node.pair.verify"
-        | "node.rename"
-        | "exec.approvals.set"
-        | "exec.approvals.node.set"
-        | "exec.approval.request"
-        | "exec.approval.resolve"
-        | "sessions.export_user"
-        | "sessions.purge_user" => "admin",
-
+    if READ_METHODS.contains(&method) {
+        "read"
+    } else if WRITE_METHODS.contains(&method) {
+        "write"
+    } else if ADMIN_METHODS.contains(&method) {
+        "admin"
+    } else {
         // Unknown methods default to admin (fail secure)
-        _ => "admin",
+        "admin"
     }
 }
 
@@ -549,6 +560,131 @@ fn check_operator_authorization(
     Ok(())
 }
 
+/// Dispatch config methods.
+fn dispatch_config(
+    method: &str,
+    params: Option<&Value>,
+    state: &Arc<WsServerState>,
+) -> Option<Result<Value, ErrorShape>> {
+    match method {
+        "config.get" => Some(handle_config_get(params)),
+        "config.set" => Some(handle_config_set(params)),
+        "config.apply" => Some(handle_config_apply(params)),
+        "config.patch" => Some(handle_config_patch(params)),
+        "config.schema" => Some(handle_config_schema()),
+        "config.reload" => Some(handle_config_reload(state)),
+        _ => None,
+    }
+}
+
+/// Dispatch session methods.
+fn dispatch_sessions(
+    method: &str,
+    params: Option<&Value>,
+    state: &Arc<WsServerState>,
+) -> Option<Result<Value, ErrorShape>> {
+    match method {
+        "sessions.list" => Some(handle_sessions_list(state, params)),
+        "sessions.preview" => Some(handle_sessions_preview(state, params)),
+        "sessions.patch" => Some(handle_sessions_patch(state, params)),
+        "sessions.reset" => Some(handle_sessions_reset(state, params)),
+        "sessions.delete" => Some(handle_sessions_delete(state, params)),
+        "sessions.compact" => Some(handle_sessions_compact(state, params)),
+        "sessions.archive" => Some(handle_sessions_archive(state, params)),
+        "sessions.restore" => Some(handle_sessions_restore(state, params)),
+        "sessions.archives" => Some(handle_sessions_archives(state, params)),
+        "sessions.archive.delete" => Some(handle_sessions_archive_delete(state, params)),
+        "sessions.export_user" => Some(handle_sessions_export_user(state, params)),
+        "sessions.purge_user" => Some(handle_sessions_purge_user(state, params)),
+        _ => None,
+    }
+}
+
+/// Dispatch TTS and voice wake methods.
+fn dispatch_tts_voice(
+    method: &str,
+    params: Option<&Value>,
+    state: &Arc<WsServerState>,
+) -> Option<Result<Value, ErrorShape>> {
+    match method {
+        "tts.status" => Some(handle_tts_status()),
+        "tts.providers" => Some(handle_tts_providers()),
+        "tts.voices" => Some(handle_tts_voices()),
+        "tts.enable" => Some(handle_tts_enable()),
+        "tts.disable" => Some(handle_tts_disable()),
+        "tts.setProvider" => Some(handle_tts_set_provider(params)),
+        "tts.setVoice" => Some(handle_tts_set_voice(params)),
+        "tts.configure" => Some(handle_tts_configure(params)),
+        "tts.speak" => Some(handle_tts_speak(params)),
+        "tts.stop" => Some(handle_tts_stop()),
+        "voicewake.get" => Some(handle_voicewake_get()),
+        "voicewake.set" => Some(handle_voicewake_set(params, Some(state))),
+        "voicewake.enable" => Some(handle_voicewake_enable(params)),
+        "voicewake.disable" => Some(handle_voicewake_disable()),
+        "voicewake.keywords" => Some(handle_voicewake_keywords()),
+        "voicewake.test" => Some(handle_voicewake_test(params)),
+        _ => None,
+    }
+}
+
+/// Dispatch node and device pairing methods.
+fn dispatch_node_device(
+    method: &str,
+    params: Option<&Value>,
+    state: &Arc<WsServerState>,
+    conn: &ConnectionContext,
+) -> Option<Result<Value, ErrorShape>> {
+    match method {
+        "node.pair.request" => Some(handle_node_pair_request(params, state)),
+        "node.pair.list" => Some(handle_node_pair_list(state)),
+        "node.pair.approve" => Some(handle_node_pair_approve(params, state)),
+        "node.pair.reject" => Some(handle_node_pair_reject(params, state)),
+        "node.pair.verify" => Some(handle_node_pair_verify(params, state)),
+        "node.rename" => Some(handle_node_rename(params, state)),
+        "node.list" => Some(handle_node_list(state)),
+        "node.describe" => Some(handle_node_describe(params, state)),
+        "node.invoke.result" => Some(handle_node_invoke_result(params, state, conn)),
+        "node.event" => Some(handle_node_event(params, state, conn)),
+        "device.pair.list" => Some(handle_device_pair_list(state)),
+        "device.pair.approve" => Some(handle_device_pair_approve(params, state)),
+        "device.pair.reject" => Some(handle_device_pair_reject(params, state)),
+        "device.token.rotate" => Some(handle_device_token_rotate(params, state)),
+        "device.token.revoke" => Some(handle_device_token_revoke(params, state)),
+        _ => None,
+    }
+}
+
+/// Dispatch cron, usage, and update methods (sync only).
+fn dispatch_cron_usage_update(
+    method: &str,
+    params: Option<&Value>,
+    state: &Arc<WsServerState>,
+) -> Option<Result<Value, ErrorShape>> {
+    match method {
+        "cron.status" => Some(handle_cron_status(state)),
+        "cron.list" => Some(handle_cron_list(state, params)),
+        "cron.add" => Some(handle_cron_add(state, params)),
+        "cron.update" => Some(handle_cron_update(state, params)),
+        "cron.remove" => Some(handle_cron_remove(state, params)),
+        "cron.run" => Some(handle_cron_run(state.clone(), params)),
+        "cron.runs" => Some(handle_cron_runs(state, params)),
+        "usage.status" => Some(handle_usage_status()),
+        "usage.enable" => Some(handle_usage_enable()),
+        "usage.disable" => Some(handle_usage_disable()),
+        "usage.cost" => Some(handle_usage_cost(params)),
+        "usage.session" => Some(handle_usage_session(params)),
+        "usage.providers" => Some(handle_usage_providers()),
+        "usage.daily" => Some(handle_usage_daily(params)),
+        "usage.reset" => Some(handle_usage_reset(params)),
+        "update.status" => Some(handle_update_status()),
+        "update.setChannel" => Some(handle_update_set_channel(params)),
+        "update.configure" => Some(handle_update_configure(params)),
+        "update.dismiss" => Some(handle_update_dismiss()),
+        "update.releaseNotes" => Some(handle_update_release_notes()),
+        _ => None,
+    }
+}
+
 pub(super) async fn dispatch_method(
     method: &str,
     params: Option<&Value>,
@@ -558,33 +694,32 @@ pub(super) async fn dispatch_method(
     // Check authorization before dispatching
     check_method_authorization(method, conn)?;
 
+    // Health/status
     match method {
-        // Health/status
-        "health" => Ok(handle_health()),
-        "status" => Ok(handle_status(state)),
+        "health" => return Ok(handle_health()),
+        "status" => return Ok(handle_status(state)),
+        _ => {}
+    }
 
-        // Config
-        "config.get" => handle_config_get(params),
-        "config.set" => handle_config_set(params),
-        "config.apply" => handle_config_apply(params),
-        "config.patch" => handle_config_patch(params),
-        "config.schema" => handle_config_schema(),
-        "config.reload" => handle_config_reload(state),
+    // Sync sub-dispatchers
+    if let Some(result) = dispatch_config(method, params, state) {
+        return result;
+    }
+    if let Some(result) = dispatch_sessions(method, params, state) {
+        return result;
+    }
+    if let Some(result) = dispatch_tts_voice(method, params, state) {
+        return result;
+    }
+    if let Some(result) = dispatch_node_device(method, params, state, conn) {
+        return result;
+    }
+    if let Some(result) = dispatch_cron_usage_update(method, params, state) {
+        return result;
+    }
 
-        // Sessions
-        "sessions.list" => handle_sessions_list(state, params),
-        "sessions.preview" => handle_sessions_preview(state, params),
-        "sessions.patch" => handle_sessions_patch(state, params),
-        "sessions.reset" => handle_sessions_reset(state, params),
-        "sessions.delete" => handle_sessions_delete(state, params),
-        "sessions.compact" => handle_sessions_compact(state, params),
-        "sessions.archive" => handle_sessions_archive(state, params),
-        "sessions.restore" => handle_sessions_restore(state, params),
-        "sessions.archives" => handle_sessions_archives(state, params),
-        "sessions.archive.delete" => handle_sessions_archive_delete(state, params),
-        "sessions.export_user" => handle_sessions_export_user(state, params),
-        "sessions.purge_user" => handle_sessions_purge_user(state, params),
-
+    // Remaining methods (async or unique signatures)
+    match method {
         // Channels
         "channels.status" => handle_channels_status(state),
         "channels.logout" => handle_channels_logout(params, state),
@@ -599,26 +734,8 @@ pub(super) async fn dispatch_method(
         "chat.send" => handle_chat_send(state.clone(), params, conn),
         "chat.abort" => handle_chat_abort(state, params),
 
-        // TTS
-        "tts.status" => handle_tts_status(),
-        "tts.providers" => handle_tts_providers(),
-        "tts.voices" => handle_tts_voices(),
-        "tts.enable" => handle_tts_enable(),
-        "tts.disable" => handle_tts_disable(),
+        // TTS async
         "tts.convert" => handle_tts_convert(params).await,
-        "tts.setProvider" => handle_tts_set_provider(params),
-        "tts.setVoice" => handle_tts_set_voice(params),
-        "tts.configure" => handle_tts_configure(params),
-        "tts.speak" => handle_tts_speak(params),
-        "tts.stop" => handle_tts_stop(),
-
-        // Voice wake
-        "voicewake.get" => handle_voicewake_get(),
-        "voicewake.set" => handle_voicewake_set(params, Some(state)),
-        "voicewake.enable" => handle_voicewake_enable(params),
-        "voicewake.disable" => handle_voicewake_disable(),
-        "voicewake.keywords" => handle_voicewake_keywords(),
-        "voicewake.test" => handle_voicewake_test(params),
 
         // Wizard
         "wizard.start" => handle_wizard_start(params),
@@ -644,62 +761,21 @@ pub(super) async fn dispatch_method(
         "skills.install" => handle_skills_install(params),
         "skills.update" => handle_skills_update(params),
 
-        // Update
+        // Update (async)
         "update.run" => handle_update_run(params).await,
-        "update.status" => handle_update_status(),
         "update.check" => handle_update_check().await,
-        "update.setChannel" => handle_update_set_channel(params),
-        "update.configure" => handle_update_configure(params),
         "update.install" => handle_update_install().await,
-        "update.dismiss" => handle_update_dismiss(),
-        "update.releaseNotes" => handle_update_release_notes(),
 
-        // Cron
-        "cron.status" => handle_cron_status(state),
-        "cron.list" => handle_cron_list(state, params),
-        "cron.add" => handle_cron_add(state, params),
-        "cron.update" => handle_cron_update(state, params),
-        "cron.remove" => handle_cron_remove(state, params),
-        "cron.run" => handle_cron_run(state.clone(), params),
-        "cron.runs" => handle_cron_runs(state, params),
-
-        // Node pairing
-        "node.pair.request" => handle_node_pair_request(params, state),
-        "node.pair.list" => handle_node_pair_list(state),
-        "node.pair.approve" => handle_node_pair_approve(params, state),
-        "node.pair.reject" => handle_node_pair_reject(params, state),
-        "node.pair.verify" => handle_node_pair_verify(params, state),
-        "node.rename" => handle_node_rename(params, state),
-        "node.list" => handle_node_list(state),
-        "node.describe" => handle_node_describe(params, state),
+        // Node invoke (async)
         "node.invoke" => handle_node_invoke(params, state).await,
-        "node.invoke.result" => handle_node_invoke_result(params, state, conn),
-        "node.event" => handle_node_event(params, state, conn),
 
-        // Device pairing
-        "device.pair.list" => handle_device_pair_list(state),
-        "device.pair.approve" => handle_device_pair_approve(params, state),
-        "device.pair.reject" => handle_device_pair_reject(params, state),
-        "device.token.rotate" => handle_device_token_rotate(params, state),
-        "device.token.revoke" => handle_device_token_revoke(params, state),
-
-        // Exec approvals
+        // Exec approvals (mixed sync/async)
         "exec.approvals.get" => handle_exec_approvals_get(),
         "exec.approvals.set" => handle_exec_approvals_set(params),
         "exec.approvals.node.get" => handle_exec_approvals_node_get(params, state).await,
         "exec.approvals.node.set" => handle_exec_approvals_node_set(params, state).await,
         "exec.approval.request" => handle_exec_approval_request(params, state).await,
         "exec.approval.resolve" => handle_exec_approval_resolve(params, state),
-
-        // Usage
-        "usage.status" => handle_usage_status(),
-        "usage.enable" => handle_usage_enable(),
-        "usage.disable" => handle_usage_disable(),
-        "usage.cost" => handle_usage_cost(params),
-        "usage.session" => handle_usage_session(params),
-        "usage.providers" => handle_usage_providers(),
-        "usage.daily" => handle_usage_daily(params),
-        "usage.reset" => handle_usage_reset(params),
 
         // Logs
         "logs.tail" => handle_logs_tail(params),

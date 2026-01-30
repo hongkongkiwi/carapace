@@ -375,6 +375,48 @@ pub async fn teardown(config: &TailscaleConfig) -> Result<(), TailscaleError> {
 // Lifecycle management
 // ============================================================================
 
+/// Validate that the Tailscale CLI is accessible and the daemon is running.
+///
+/// Returns the daemon status on success.
+async fn validate_tailscale_environment(cli_path: &str) -> Result<TailscaleStatus, TailscaleError> {
+    let version = check_tailscale(cli_path).await?;
+    info!("Tailscale CLI version: {}", version);
+
+    let status = get_status(cli_path).await?;
+    if !status.is_up {
+        return Err(TailscaleError::NotRunning);
+    }
+    debug!(
+        "Tailscale is running: hostname={:?}, tailnet={:?}, ip={:?}",
+        status.hostname, status.tailnet, status.ip
+    );
+
+    Ok(status)
+}
+
+/// Execute the mode-specific serve or funnel setup.
+async fn execute_tailscale_setup(
+    config: &TailscaleConfig,
+) -> Result<TailscaleSetupResult, TailscaleError> {
+    match config.mode {
+        TailscaleMode::Serve => {
+            info!(
+                "Setting up Tailscale serve: localhost:{} -> https port {}",
+                config.local_port, config.external_port
+            );
+            setup_serve(config).await
+        }
+        TailscaleMode::Funnel => {
+            info!(
+                "Setting up Tailscale funnel: localhost:{} -> https port {} (public)",
+                config.local_port, config.external_port
+            );
+            setup_funnel(config).await
+        }
+        TailscaleMode::Off => unreachable!(),
+    }
+}
+
 /// Run the Tailscale serve/funnel lifecycle.
 ///
 /// - Checks the CLI is available and Tailscale is running
@@ -389,45 +431,24 @@ pub async fn run_tailscale_lifecycle(
         return Ok(());
     }
 
-    // Verify CLI is accessible
-    let version = check_tailscale(&config.cli_path).await?;
-    info!("Tailscale CLI version: {}", version);
+    validate_tailscale_environment(&config.cli_path).await?;
 
-    // Verify Tailscale is running
-    let status = get_status(&config.cli_path).await?;
-    if !status.is_up {
-        return Err(TailscaleError::NotRunning);
-    }
-    debug!(
-        "Tailscale is running: hostname={:?}, tailnet={:?}, ip={:?}",
-        status.hostname, status.tailnet, status.ip
-    );
-
-    // Set up serve or funnel
-    let result = match config.mode {
-        TailscaleMode::Serve => {
-            info!(
-                "Setting up Tailscale serve: localhost:{} -> https port {}",
-                config.local_port, config.external_port
-            );
-            setup_serve(&config).await?
-        }
-        TailscaleMode::Funnel => {
-            info!(
-                "Setting up Tailscale funnel: localhost:{} -> https port {} (public)",
-                config.local_port, config.external_port
-            );
-            setup_funnel(&config).await?
-        }
-        TailscaleMode::Off => unreachable!(),
-    };
+    let result = execute_tailscale_setup(&config).await?;
 
     info!(
         "Tailscale {:?} active: {} (local:{} -> external:{})",
         result.mode, result.url, result.local_port, result.external_port
     );
 
-    // Wait for shutdown signal
+    await_shutdown_signal(&mut shutdown_rx).await;
+
+    perform_teardown_if_configured(&config).await;
+
+    Ok(())
+}
+
+/// Block until the shutdown watch channel signals `true`.
+async fn await_shutdown_signal(shutdown_rx: &mut tokio::sync::watch::Receiver<bool>) {
     loop {
         tokio::select! {
             _ = shutdown_rx.changed() => {
@@ -437,18 +458,19 @@ pub async fn run_tailscale_lifecycle(
             }
         }
     }
+}
 
-    // Clean shutdown
+/// Tear down the Tailscale serve/funnel configuration if `reset_on_shutdown`
+/// is enabled.
+async fn perform_teardown_if_configured(config: &TailscaleConfig) {
     if config.reset_on_shutdown {
         info!("Tearing down Tailscale serve/funnel configuration");
-        if let Err(e) = teardown(&config).await {
+        if let Err(e) = teardown(config).await {
             warn!("Failed to tear down Tailscale config: {}", e);
         }
     } else {
         debug!("Tailscale reset_on_shutdown is false, leaving configuration in place");
     }
-
-    Ok(())
 }
 
 // ============================================================================

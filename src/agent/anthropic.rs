@@ -273,53 +273,9 @@ fn parse_sse_event(
             None
         }
 
-        "content_block_delta" => {
-            let index = match parsed["index"].as_u64() {
-                Some(i) => i,
-                None => {
-                    tracing::warn!("content_block_delta missing index field, defaulting to 0");
-                    0
-                }
-            };
-            let delta = &parsed["delta"];
+        "content_block_delta" => handle_content_block_delta(&parsed, tool_calls),
 
-            match delta["type"].as_str() {
-                Some("text_delta") => {
-                    let text = delta["text"].as_str().unwrap_or("").to_string();
-                    if text.is_empty() {
-                        None
-                    } else {
-                        Some(StreamEvent::TextDelta { text })
-                    }
-                }
-                Some("input_json_delta") => {
-                    // Accumulate partial JSON for tool input
-                    if let Some(entry) = tool_calls.get_mut(&index) {
-                        if let Some(partial) = delta["partial_json"].as_str() {
-                            entry.2.push_str(partial);
-                        }
-                    }
-                    None
-                }
-                _ => None,
-            }
-        }
-
-        "content_block_stop" => {
-            let index = match parsed["index"].as_u64() {
-                Some(i) => i,
-                None => {
-                    tracing::warn!("content_block_stop missing index field, defaulting to 0");
-                    0
-                }
-            };
-            if let Some((id, name, input_json)) = tool_calls.remove(&index) {
-                let input: Value = serde_json::from_str(&input_json).unwrap_or(json!({}));
-                Some(StreamEvent::ToolUse { id, name, input })
-            } else {
-                None
-            }
-        }
+        "content_block_stop" => handle_content_block_stop(&parsed, tool_calls),
 
         "message_start" => {
             // Extract input token count from the initial message
@@ -360,6 +316,61 @@ fn parse_sse_event(
         }
 
         _ => None,
+    }
+}
+
+/// Handle a `content_block_delta` SSE event from the Anthropic API.
+fn handle_content_block_delta(
+    parsed: &Value,
+    tool_calls: &mut std::collections::HashMap<u64, (String, String, String)>,
+) -> Option<StreamEvent> {
+    let index = match parsed["index"].as_u64() {
+        Some(i) => i,
+        None => {
+            tracing::warn!("content_block_delta missing index field, defaulting to 0");
+            0
+        }
+    };
+    let delta = &parsed["delta"];
+
+    match delta["type"].as_str() {
+        Some("text_delta") => {
+            let text = delta["text"].as_str().unwrap_or("").to_string();
+            if text.is_empty() {
+                None
+            } else {
+                Some(StreamEvent::TextDelta { text })
+            }
+        }
+        Some("input_json_delta") => {
+            if let Some(entry) = tool_calls.get_mut(&index) {
+                if let Some(partial) = delta["partial_json"].as_str() {
+                    entry.2.push_str(partial);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Handle a `content_block_stop` SSE event from the Anthropic API.
+fn handle_content_block_stop(
+    parsed: &Value,
+    tool_calls: &mut std::collections::HashMap<u64, (String, String, String)>,
+) -> Option<StreamEvent> {
+    let index = match parsed["index"].as_u64() {
+        Some(i) => i,
+        None => {
+            tracing::warn!("content_block_stop missing index field, defaulting to 0");
+            0
+        }
+    };
+    if let Some((id, name, input_json)) = tool_calls.remove(&index) {
+        let input: Value = serde_json::from_str(&input_json).unwrap_or(json!({}));
+        Some(StreamEvent::ToolUse { id, name, input })
+    } else {
+        None
     }
 }
 

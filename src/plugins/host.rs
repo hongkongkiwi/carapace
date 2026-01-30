@@ -40,6 +40,28 @@ fn safe_truncate(s: &str, max_bytes: usize) -> &str {
     &s[..boundary]
 }
 
+/// Dispatch a log message to tracing at the given level.
+#[allow(clippy::cognitive_complexity)]
+fn emit_log_message(level: tracing::Level, plugin_id: &str, message: &str) {
+    match level {
+        tracing::Level::DEBUG => {
+            tracing::debug!(plugin_id = %plugin_id, "{}", message);
+        }
+        tracing::Level::INFO => {
+            tracing::info!(plugin_id = %plugin_id, "{}", message);
+        }
+        tracing::Level::WARN => {
+            tracing::warn!(plugin_id = %plugin_id, "{}", message);
+        }
+        tracing::Level::ERROR => {
+            tracing::error!(plugin_id = %plugin_id, "{}", message);
+        }
+        _ => {
+            tracing::trace!(plugin_id = %plugin_id, "{}", message);
+        }
+    }
+}
+
 /// Maximum HTTP request body size (10MB)
 pub const MAX_HTTP_BODY_SIZE: usize = 10 * 1024 * 1024;
 
@@ -198,23 +220,7 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         let truncated = safe_truncate(message, MAX_LOG_MESSAGE_SIZE);
 
         // Log with plugin context
-        match level {
-            tracing::Level::DEBUG => {
-                tracing::debug!(plugin_id = %self.plugin_id, "{}", truncated);
-            }
-            tracing::Level::INFO => {
-                tracing::info!(plugin_id = %self.plugin_id, "{}", truncated);
-            }
-            tracing::Level::WARN => {
-                tracing::warn!(plugin_id = %self.plugin_id, "{}", truncated);
-            }
-            tracing::Level::ERROR => {
-                tracing::error!(plugin_id = %self.plugin_id, "{}", truncated);
-            }
-            _ => {
-                tracing::trace!(plugin_id = %self.plugin_id, "{}", truncated);
-            }
-        }
+        emit_log_message(level, &self.plugin_id, truncated);
 
         Ok(())
     }
@@ -343,67 +349,11 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
     /// 4. Disables redirects to prevent redirect-based SSRF bypass
     /// 5. Streams response with size limits to prevent memory exhaustion
     pub async fn http_fetch(&self, req: HttpRequest) -> Result<HttpResponse, HostError> {
-        // Validate URL length
-        if req.url.len() > MAX_URL_LENGTH {
-            return Err(HostError::UrlTooLong {
-                size: req.url.len(),
-                max: MAX_URL_LENGTH,
-            });
-        }
+        let method = self.validate_http_request(&req)?;
 
-        // Validate URL for SSRF (catches obvious attacks like localhost, private IPs)
-        SsrfProtection::validate_url_with_config(&req.url, &self.ssrf_config)?;
+        let (host, port) = parse_host_and_port(&req.url)?;
 
-        // Check rate limit
-        self.rate_limiters.check_http_request(&self.plugin_id)?;
-
-        // Validate body size
-        if let Some(ref body) = req.body {
-            if body.len() > MAX_HTTP_BODY_SIZE {
-                return Err(HostError::BodyTooLarge {
-                    size: body.len(),
-                    max: MAX_HTTP_BODY_SIZE,
-                });
-            }
-        }
-
-        // Validate method
-        let method = req.method.to_uppercase();
-        if !["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"].contains(&method.as_str())
-        {
-            return Err(HostError::Http(format!("Invalid HTTP method: {}", method)));
-        }
-
-        // Parse URL to get host for DNS validation
-        let parsed_url = url::Url::parse(&req.url)
-            .map_err(|e| HostError::Http(format!("Invalid URL: {}", e)))?;
-
-        let host = parsed_url
-            .host_str()
-            .ok_or_else(|| HostError::Http("URL has no host".to_string()))?
-            .to_string();
-
-        let port = parsed_url.port_or_known_default().unwrap_or(80);
-
-        // DNS resolution and validation, then pin the validated IP
-        // This prevents DNS rebinding attacks
-        let mut client_builder = Client::builder()
-            .timeout(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS as u64))
-            // SECURITY: Disable redirects to prevent redirect-based SSRF bypass
-            // Attackers could redirect from a public URL to a private IP
-            .redirect(reqwest::redirect::Policy::none());
-
-        // If host is not already an IP, resolve and pin it
-        if host.parse::<IpAddr>().is_err() {
-            let validated_ip = self.resolve_and_validate_dns(&host).await?;
-            // Pin the validated IP so reqwest uses it instead of re-resolving
-            let socket_addr = std::net::SocketAddr::new(validated_ip, port);
-            client_builder = client_builder.resolve(&host, socket_addr);
-        }
-
-        let client = client_builder
-            .build()
-            .map_err(|e| HostError::Http(format!("Failed to create HTTP client: {}", e)))?;
+        let client = self.build_secure_http_client(&host, port).await?;
 
         tracing::debug!(
             plugin_id = %self.plugin_id,
@@ -412,35 +362,7 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
             "HTTP fetch request"
         );
 
-        // Build the reqwest request
-        let reqwest_method = match method.as_str() {
-            "GET" => reqwest::Method::GET,
-            "POST" => reqwest::Method::POST,
-            "PUT" => reqwest::Method::PUT,
-            "DELETE" => reqwest::Method::DELETE,
-            "PATCH" => reqwest::Method::PATCH,
-            "HEAD" => reqwest::Method::HEAD,
-            "OPTIONS" => reqwest::Method::OPTIONS,
-            _ => unreachable!(), // Already validated above
-        };
-
-        let mut request_builder = client.request(reqwest_method, &req.url);
-
-        // Add headers
-        for (name, value) in &req.headers {
-            request_builder = request_builder.header(name, value);
-        }
-
-        // Add body if present
-        if let Some(body) = req.body {
-            request_builder = request_builder.body(body);
-        }
-
-        // Make the request
-        let response = request_builder
-            .send()
-            .await
-            .map_err(|e| HostError::Http(format!("Request failed: {}", e)))?;
+        let response = send_http_request(client, &method, req).await?;
 
         // Check content-length header if present
         let content_length = response.content_length();
@@ -461,7 +383,6 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
             .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
             .collect();
 
-        // Stream body with size limit to prevent memory exhaustion
         let body = self
             .read_response_body_limited(response, MAX_HTTP_RESPONSE_SIZE)
             .await?;
@@ -471,6 +392,54 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
             headers,
             body: if body.is_empty() { None } else { Some(body) },
         })
+    }
+
+    /// Validate an HTTP request's URL, method, body size, and rate limit.
+    /// Returns the validated uppercase method string.
+    fn validate_http_request(&self, req: &HttpRequest) -> Result<String, HostError> {
+        if req.url.len() > MAX_URL_LENGTH {
+            return Err(HostError::UrlTooLong {
+                size: req.url.len(),
+                max: MAX_URL_LENGTH,
+            });
+        }
+
+        SsrfProtection::validate_url_with_config(&req.url, &self.ssrf_config)?;
+        self.rate_limiters.check_http_request(&self.plugin_id)?;
+
+        if let Some(ref body) = req.body {
+            if body.len() > MAX_HTTP_BODY_SIZE {
+                return Err(HostError::BodyTooLarge {
+                    size: body.len(),
+                    max: MAX_HTTP_BODY_SIZE,
+                });
+            }
+        }
+
+        let method = req.method.to_uppercase();
+        if !["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"].contains(&method.as_str())
+        {
+            return Err(HostError::Http(format!("Invalid HTTP method: {}", method)));
+        }
+
+        Ok(method)
+    }
+
+    /// Build an HTTP client with SSRF protection, DNS pinning, and no redirects.
+    async fn build_secure_http_client(&self, host: &str, port: u16) -> Result<Client, HostError> {
+        let mut client_builder = Client::builder()
+            .timeout(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS as u64))
+            .redirect(reqwest::redirect::Policy::none());
+
+        if host.parse::<IpAddr>().is_err() {
+            let validated_ip = self.resolve_and_validate_dns(host).await?;
+            let socket_addr = std::net::SocketAddr::new(validated_ip, port);
+            client_builder = client_builder.resolve(host, socket_addr);
+        }
+
+        client_builder
+            .build()
+            .map_err(|e| HostError::Http(format!("Failed to create HTTP client: {}", e)))
     }
 
     /// Read response body with streaming size limit
@@ -565,47 +534,7 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         // Check rate limit (media fetch counts as HTTP request)
         self.rate_limiters.check_http_request(&self.plugin_id)?;
 
-        // Parse URL to get host for DNS validation
-        let parsed_url = url::Url::parse(url)
-            .map_err(|e| HostError::MediaFetch(format!("Invalid URL: {}", e)))?;
-
-        let host = parsed_url
-            .host_str()
-            .ok_or_else(|| HostError::MediaFetch("URL has no host".to_string()))?
-            .to_string();
-
-        let port = parsed_url.port_or_known_default().unwrap_or(80);
-
-        // Calculate timeout
-        let timeout = Duration::from_millis(
-            timeout_ms
-                .unwrap_or(DEFAULT_HTTP_TIMEOUT_MS)
-                .min(MAX_HTTP_TIMEOUT_MS) as u64,
-        );
-
-        // Build client with security settings
-        let mut client_builder = Client::builder()
-            .timeout(timeout)
-            // SECURITY: Disable redirects to prevent redirect-based SSRF bypass
-            .redirect(reqwest::redirect::Policy::none());
-
-        // DNS resolution and validation, then pin the validated IP
-        if host.parse::<IpAddr>().is_err() {
-            let validated_ip = self
-                .resolve_and_validate_dns(&host)
-                .await
-                .map_err(|e| match e {
-                    HostError::Http(msg) => HostError::MediaFetch(msg),
-                    other => other,
-                })?;
-            // Pin the validated IP
-            let socket_addr = std::net::SocketAddr::new(validated_ip, port);
-            client_builder = client_builder.resolve(&host, socket_addr);
-        }
-
-        let client = client_builder
-            .build()
-            .map_err(|e| HostError::MediaFetch(format!("Failed to create client: {}", e)))?;
+        let client = self.build_media_fetch_client(url, timeout_ms).await?;
 
         tracing::debug!(
             plugin_id = %self.plugin_id,
@@ -684,6 +613,50 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
             error: None,
         })
     }
+
+    /// Parse the media URL, resolve DNS with SSRF validation, and build a
+    /// pinned HTTP client for the media fetch request.
+    async fn build_media_fetch_client(
+        &self,
+        url: &str,
+        timeout_ms: Option<u32>,
+    ) -> Result<Client, HostError> {
+        let parsed_url = url::Url::parse(url)
+            .map_err(|e| HostError::MediaFetch(format!("Invalid URL: {}", e)))?;
+
+        let host = parsed_url
+            .host_str()
+            .ok_or_else(|| HostError::MediaFetch("URL has no host".to_string()))?
+            .to_string();
+
+        let port = parsed_url.port_or_known_default().unwrap_or(80);
+
+        let timeout = Duration::from_millis(
+            timeout_ms
+                .unwrap_or(DEFAULT_HTTP_TIMEOUT_MS)
+                .min(MAX_HTTP_TIMEOUT_MS) as u64,
+        );
+
+        let mut client_builder = Client::builder()
+            .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::none());
+
+        if host.parse::<IpAddr>().is_err() {
+            let validated_ip = self
+                .resolve_and_validate_dns(&host)
+                .await
+                .map_err(|e| match e {
+                    HostError::Http(msg) => HostError::MediaFetch(msg),
+                    other => other,
+                })?;
+            let socket_addr = std::net::SocketAddr::new(validated_ip, port);
+            client_builder = client_builder.resolve(&host, socket_addr);
+        }
+
+        client_builder
+            .build()
+            .map_err(|e| HostError::MediaFetch(format!("Failed to create client: {}", e)))
+    }
 }
 
 /// Builder for creating plugin host contexts
@@ -746,6 +719,54 @@ impl<B: CredentialBackend + 'static> PluginHostContextBuilder<B> {
             self.ssrf_config,
         ))
     }
+}
+
+/// Parse host and port from a URL string.
+fn parse_host_and_port(url: &str) -> Result<(String, u16), HostError> {
+    let parsed_url =
+        url::Url::parse(url).map_err(|e| HostError::Http(format!("Invalid URL: {}", e)))?;
+
+    let host = parsed_url
+        .host_str()
+        .ok_or_else(|| HostError::Http("URL has no host".to_string()))?
+        .to_string();
+
+    let port = parsed_url.port_or_known_default().unwrap_or(80);
+
+    Ok((host, port))
+}
+
+/// Build and send an HTTP request using the provided client.
+async fn send_http_request(
+    client: Client,
+    method: &str,
+    req: HttpRequest,
+) -> Result<reqwest::Response, HostError> {
+    let reqwest_method = match method {
+        "GET" => reqwest::Method::GET,
+        "POST" => reqwest::Method::POST,
+        "PUT" => reqwest::Method::PUT,
+        "DELETE" => reqwest::Method::DELETE,
+        "PATCH" => reqwest::Method::PATCH,
+        "HEAD" => reqwest::Method::HEAD,
+        "OPTIONS" => reqwest::Method::OPTIONS,
+        _ => unreachable!(),
+    };
+
+    let mut request_builder = client.request(reqwest_method, &req.url);
+
+    for (name, value) in &req.headers {
+        request_builder = request_builder.header(name, value);
+    }
+
+    if let Some(body) = req.body {
+        request_builder = request_builder.body(body);
+    }
+
+    request_builder
+        .send()
+        .await
+        .map_err(|e| HostError::Http(format!("Request failed: {}", e)))
 }
 
 #[cfg(test)]

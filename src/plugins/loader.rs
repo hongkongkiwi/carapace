@@ -536,16 +536,9 @@ pub fn verify_skill_hash_on_load(
     wasm_bytes: &[u8],
     skills_dir: &Path,
 ) -> Result<(), LoaderError> {
-    let manifest_path = skills_dir.join(SKILLS_MANIFEST_FILE);
-    let manifest: serde_json::Value = match fs::read_to_string(&manifest_path) {
-        Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
-        Err(_) => {
-            tracing::warn!(
-                skill = %skill_name,
-                "no skills manifest found, skipping hash verification"
-            );
-            return Ok(());
-        }
+    let manifest = match load_skills_manifest(skill_name, skills_dir) {
+        Some(m) => m,
+        None => return Ok(()),
     };
 
     let expected_hash = manifest
@@ -582,6 +575,22 @@ pub fn verify_skill_hash_on_load(
                 "no sha256 hash in manifest for skill, skipping verification (legacy entry)"
             );
             Ok(())
+        }
+    }
+}
+
+/// Load the skills manifest from the given directory.
+/// Returns `None` if the manifest file does not exist (with a warning log).
+fn load_skills_manifest(skill_name: &str, skills_dir: &Path) -> Option<serde_json::Value> {
+    let manifest_path = skills_dir.join(SKILLS_MANIFEST_FILE);
+    match fs::read_to_string(&manifest_path) {
+        Ok(contents) => Some(serde_json::from_str(&contents).unwrap_or_default()),
+        Err(_) => {
+            tracing::warn!(
+                skill = %skill_name,
+                "no skills manifest found, skipping hash verification"
+            );
+            None
         }
     }
 }

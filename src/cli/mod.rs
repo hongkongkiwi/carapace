@@ -522,48 +522,7 @@ pub fn handle_restore(archive_path: &str, force: bool) -> Result<(), Box<dyn std
         std::process::exit(1);
     }
 
-    // Open and decompress the archive.
-    let file = std::fs::File::open(&archive_path)?;
-    let dec = flate2::read::GzDecoder::new(file);
-    let mut archive = tar::Archive::new(dec);
-
-    // First pass: validate by checking for the marker file.
-    let mut found_marker = false;
-    let mut sections_found: Vec<String> = Vec::new();
-
-    for entry_result in archive.entries()? {
-        let entry = entry_result?;
-        let path = entry.path()?;
-        let path_str = path.to_string_lossy().to_string();
-
-        if path_str == BACKUP_MARKER {
-            found_marker = true;
-        } else if path_str.starts_with("sessions/") {
-            if !sections_found.contains(&"sessions".to_string()) {
-                sections_found.push("sessions".to_string());
-            }
-        } else if path_str.starts_with("config/") {
-            if !sections_found.contains(&"config".to_string()) {
-                sections_found.push("config".to_string());
-            }
-        } else if path_str.starts_with("memory/") {
-            if !sections_found.contains(&"memory".to_string()) {
-                sections_found.push("memory".to_string());
-            }
-        } else if path_str.starts_with("cron/") {
-            if !sections_found.contains(&"cron".to_string()) {
-                sections_found.push("cron".to_string());
-            }
-        } else if path_str.starts_with("usage/") && !sections_found.contains(&"usage".to_string()) {
-            sections_found.push("usage".to_string());
-        }
-    }
-
-    if !found_marker {
-        eprintln!("Invalid backup: archive does not contain a carapace backup marker.");
-        eprintln!("The file may be corrupt or was not created by `carapace backup`.");
-        std::process::exit(1);
-    }
+    let sections_found = validate_backup_file(&archive_path)?;
 
     // Prompt for confirmation unless --force is given.
     if !force {
@@ -583,12 +542,80 @@ pub fn handle_restore(archive_path: &str, force: bool) -> Result<(), Box<dyn std
         std::process::exit(1);
     }
 
-    // Second pass: extract files to the appropriate locations.
+    let (restored, restored_sessions) = restore_files_from_tar(&archive_path)?;
+
+    println!("Restore completed successfully");
+    println!(
+        "  Restored: {}",
+        if restored.is_empty() {
+            "(nothing)".to_string()
+        } else {
+            restored.join(", ")
+        }
+    );
+    if restored_sessions > 0 {
+        println!("  Sessions: {}", restored_sessions);
+    }
+
+    Ok(())
+}
+
+/// Validate a backup archive by checking for the marker file and discovering sections.
+fn validate_backup_file(archive_path: &PathBuf) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let file = std::fs::File::open(archive_path)?;
+    let dec = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(dec);
+
+    let mut found_marker = false;
+    let mut sections_found: Vec<String> = Vec::new();
+
+    for entry_result in archive.entries()? {
+        let entry = entry_result?;
+        let path = entry.path()?;
+        let path_str = path.to_string_lossy().to_string();
+
+        if path_str == BACKUP_MARKER {
+            found_marker = true;
+        } else {
+            let section = if path_str.starts_with("sessions/") {
+                Some("sessions")
+            } else if path_str.starts_with("config/") {
+                Some("config")
+            } else if path_str.starts_with("memory/") {
+                Some("memory")
+            } else if path_str.starts_with("cron/") {
+                Some("cron")
+            } else if path_str.starts_with("usage/") {
+                Some("usage")
+            } else {
+                None
+            };
+            if let Some(s) = section {
+                if !sections_found.contains(&s.to_string()) {
+                    sections_found.push(s.to_string());
+                }
+            }
+        }
+    }
+
+    if !found_marker {
+        eprintln!("Invalid backup: archive does not contain a carapace backup marker.");
+        eprintln!("The file may be corrupt or was not created by `carapace backup`.");
+        std::process::exit(1);
+    }
+
+    Ok(sections_found)
+}
+
+/// Extract files from a validated backup archive into the appropriate locations.
+fn restore_files_from_tar(
+    archive_path: &PathBuf,
+) -> Result<(Vec<String>, usize), Box<dyn std::error::Error>> {
     let state_dir = resolve_state_dir();
     let config_path = config::get_config_path();
     let memory_dir = resolve_memory_dir();
 
-    let file = std::fs::File::open(&archive_path)?;
+    let file = std::fs::File::open(archive_path)?;
     let dec = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(dec);
 
@@ -605,7 +632,6 @@ pub fn handle_restore(archive_path: &str, force: bool) -> Result<(), Box<dyn std
         }
 
         if path_str.starts_with("sessions/") {
-            // Strip "sessions/" prefix and place into state_dir/sessions/.
             let rel = path.strip_prefix("sessions").unwrap_or(&path);
             let target = state_dir.join("sessions").join(rel);
             extract_entry(&mut entry, &target)?;
@@ -616,9 +642,7 @@ pub fn handle_restore(archive_path: &str, force: bool) -> Result<(), Box<dyn std
                 restored.push("sessions".to_string());
             }
         } else if path_str.starts_with("config/") {
-            // Restore config to the resolved config path.
             let rel = path.strip_prefix("config").unwrap_or(&path);
-            // Use the resolved config path's parent directory.
             let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
             let target = config_dir.join(rel);
             extract_entry(&mut entry, &target)?;
@@ -649,20 +673,7 @@ pub fn handle_restore(archive_path: &str, force: bool) -> Result<(), Box<dyn std
         }
     }
 
-    println!("Restore completed successfully");
-    println!(
-        "  Restored: {}",
-        if restored.is_empty() {
-            "(nothing)".to_string()
-        } else {
-            restored.join(", ")
-        }
-    );
-    if restored_sessions > 0 {
-        println!("  Sessions: {}", restored_sessions);
-    }
-
-    Ok(())
+    Ok((restored, restored_sessions))
 }
 
 /// Extract a single tar entry to a target path, creating parent directories.
@@ -929,41 +940,8 @@ pub async fn handle_update(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let current_version = env!("CARGO_PKG_VERSION");
 
-    // Determine the API endpoint.
-    let api_url = match version {
-        Some(v) => format!(
-            "https://api.github.com/repos/moltbot/carapace/releases/tags/v{}",
-            v
-        ),
-        None => "https://api.github.com/repos/moltbot/carapace/releases/latest".to_string(),
-    };
+    let (release, client) = fetch_release_info(current_version, version).await?;
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?;
-
-    let response = match client
-        .get(&api_url)
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", format!("carapace/{}", current_version))
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Failed to check for updates: {}", e);
-            return Err(e.into());
-        }
-    };
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body_text = response.text().await.unwrap_or_default();
-        eprintln!("GitHub API error (HTTP {}): {}", status, body_text);
-        return Err(format!("HTTP {}", status).into());
-    }
-
-    let release: Value = response.json().await?;
     let tag_name = release
         .get("tag_name")
         .and_then(|v| v.as_str())
@@ -1006,14 +984,65 @@ pub async fn handle_update(
         current_version, target_version
     );
 
-    // Determine the correct asset name for the current platform.
+    download_and_install_binary(&release, &client, current_version, target_version, html_url).await
+}
+
+/// Fetch release information from the GitHub API.
+async fn fetch_release_info(
+    current_version: &str,
+    version: Option<&str>,
+) -> Result<(Value, reqwest::Client), Box<dyn std::error::Error>> {
+    let api_url = match version {
+        Some(v) => format!(
+            "https://api.github.com/repos/moltbot/carapace/releases/tags/v{}",
+            v
+        ),
+        None => "https://api.github.com/repos/moltbot/carapace/releases/latest".to_string(),
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+
+    let response = match client
+        .get(&api_url)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", format!("carapace/{}", current_version))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Failed to check for updates: {}", e);
+            return Err(e.into());
+        }
+    };
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body_text = response.text().await.unwrap_or_default();
+        eprintln!("GitHub API error (HTTP {}): {}", status, body_text);
+        return Err(format!("HTTP {}", status).into());
+    }
+
+    let release: Value = response.json().await?;
+    Ok((release, client))
+}
+
+/// Download and install a binary from a GitHub release.
+async fn download_and_install_binary(
+    release: &Value,
+    client: &reqwest::Client,
+    current_version: &str,
+    target_version: &str,
+    html_url: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let asset_name = format!(
         "carapace-{}-{}",
         std::env::consts::OS,
         std::env::consts::ARCH
     );
 
-    // Look for matching asset in the release.
     let assets = release
         .get("assets")
         .and_then(|v| v.as_array())
@@ -1047,7 +1076,6 @@ pub async fn handle_update(
 
     println!("Downloading {}...", name);
 
-    // Download the binary
     let dl_response = client
         .get(download_url)
         .header("User-Agent", format!("carapace/{}", current_version))
@@ -1071,7 +1099,6 @@ pub async fn handle_update(
     let staged_path = updates_dir.join(format!("carapace-{}", target_version));
     std::fs::write(&staged_path, &bytes)?;
 
-    // Set executable permissions on Unix
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1080,14 +1107,12 @@ pub async fn handle_update(
 
     println!("Applying update...");
 
-    // Apply the staged binary
     let staged_str = staged_path.to_string_lossy();
     match crate::server::ws::apply_staged_update(&staged_str) {
         Ok(result) => {
             println!("Update applied successfully.");
             println!("  Binary: {}", result.binary_path);
             println!("  SHA-256: {}", result.sha256);
-            // Clean up old backup files
             crate::server::ws::cleanup_old_binaries();
             println!("Restart carapace to use v{}.", target_version);
         }

@@ -242,28 +242,33 @@ async fn writer_task(mut rx: mpsc::Receiver<AuditEntry>, log_path: PathBuf, rota
             }
         };
 
-        // Rotate if necessary (before writing).
-        if let Ok(meta) = fs::metadata(&log_path) {
-            if meta.len() >= MAX_FILE_SIZE {
-                if let Err(e) = fs::rename(&log_path, &rotated_path) {
-                    tracing::error!("audit: rotation rename failed: {e}");
-                }
+        write_entry_to_disk(&line, &log_path, &rotated_path);
+    }
+}
+
+/// Rotate the audit log file if needed, then append a serialized entry line.
+fn write_entry_to_disk(line: &str, log_path: &PathBuf, rotated_path: &PathBuf) {
+    // Rotate if necessary (before writing).
+    if let Ok(meta) = fs::metadata(log_path) {
+        if meta.len() >= MAX_FILE_SIZE {
+            if let Err(e) = fs::rename(log_path, rotated_path) {
+                tracing::error!("audit: rotation rename failed: {e}");
             }
         }
+    }
 
-        // Append line.
-        let result = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .and_then(|mut f| {
-                writeln!(f, "{line}")?;
-                f.sync_all()
-            });
+    // Append line.
+    let result = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .and_then(|mut f| {
+            writeln!(f, "{line}")?;
+            f.sync_all()
+        });
 
-        if let Err(e) = result {
-            tracing::error!("audit: failed to write entry: {e}");
-        }
+    if let Err(e) = result {
+        tracing::error!("audit: failed to write entry: {e}");
     }
 }
 

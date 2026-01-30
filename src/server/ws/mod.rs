@@ -897,17 +897,40 @@ pub async fn build_ws_state_from_config() -> Result<Arc<WsServerState>, WsConfig
 pub async fn build_ws_config_from_files() -> Result<WsServerConfig, WsConfigError> {
     let cfg = config::load_config()?;
     let gateway = cfg.get("gateway").and_then(|v| v.as_object());
+
+    let resolved_auth = resolve_gateway_auth_config(gateway, &cfg).await?;
+    let options = parse_ws_server_options(gateway, &cfg);
+
+    Ok(WsServerConfig {
+        auth: WsAuthConfig {
+            resolved: resolved_auth,
+        },
+        policy: WsPolicy::default(),
+        trusted_proxies: options.trusted_proxies,
+        control_ui_allow_insecure_auth: options.control_ui_allow_insecure_auth,
+        control_ui_disable_device_auth: options.control_ui_disable_device_auth,
+        node_allow_commands: options.node_allow_commands,
+        node_deny_commands: options.node_deny_commands,
+        session_retention_days: options.session_retention_days,
+        max_ws_connections: options.max_ws_connections,
+        max_ws_per_ip: options.max_ws_per_ip,
+        max_json_depth: options.max_json_depth,
+        ws_message_rate: options.ws_message_rate,
+        ws_message_burst: options.ws_message_burst,
+    })
+}
+
+/// Resolve gateway auth configuration from config objects, environment variables,
+/// and stored credentials.
+async fn resolve_gateway_auth_config(
+    gateway: Option<&serde_json::Map<String, Value>>,
+    _cfg: &Value,
+) -> Result<auth::ResolvedGatewayAuth, WsConfigError> {
     let auth_obj = gateway
         .and_then(|g| g.get("auth"))
         .and_then(|v| v.as_object());
     let tailscale_obj = gateway
         .and_then(|g| g.get("tailscale"))
-        .and_then(|v| v.as_object());
-    let control_ui_obj = gateway
-        .and_then(|g| g.get("controlUi"))
-        .and_then(|v| v.as_object());
-    let nodes_obj = gateway
-        .and_then(|g| g.get("nodes"))
         .and_then(|v| v.as_object());
 
     let mode = auth_obj
@@ -961,6 +984,41 @@ pub async fn build_ws_config_from_files() -> Result<WsServerConfig, WsConfigErro
     let allow_tailscale = allow_tailscale_cfg.unwrap_or_else(|| {
         tailscale_mode == "serve" && !matches!(resolved_mode, auth::AuthMode::Password)
     });
+
+    Ok(auth::ResolvedGatewayAuth {
+        mode: resolved_mode,
+        token,
+        password,
+        allow_tailscale,
+    })
+}
+
+/// Parsed WS server options (non-auth fields).
+struct WsServerOptions {
+    trusted_proxies: Vec<String>,
+    control_ui_allow_insecure_auth: bool,
+    control_ui_disable_device_auth: bool,
+    node_allow_commands: Vec<String>,
+    node_deny_commands: Vec<String>,
+    session_retention_days: Option<u32>,
+    max_ws_connections: Option<usize>,
+    max_ws_per_ip: Option<usize>,
+    max_json_depth: Option<usize>,
+    ws_message_rate: Option<f64>,
+    ws_message_burst: Option<f64>,
+}
+
+/// Parse non-auth WS server options from the gateway config section.
+fn parse_ws_server_options(
+    gateway: Option<&serde_json::Map<String, Value>>,
+    cfg: &Value,
+) -> WsServerOptions {
+    let control_ui_obj = gateway
+        .and_then(|g| g.get("controlUi"))
+        .and_then(|v| v.as_object());
+    let nodes_obj = gateway
+        .and_then(|g| g.get("nodes"))
+        .and_then(|v| v.as_object());
 
     let trusted_proxies = gateway
         .and_then(|g| g.get("trustedProxies"))
@@ -1030,16 +1088,7 @@ pub async fn build_ws_config_from_files() -> Result<WsServerConfig, WsConfigErro
         .and_then(|w| w.get("messageBurst"))
         .and_then(|v| v.as_f64());
 
-    Ok(WsServerConfig {
-        auth: WsAuthConfig {
-            resolved: auth::ResolvedGatewayAuth {
-                mode: resolved_mode,
-                token,
-                password,
-                allow_tailscale,
-            },
-        },
-        policy: WsPolicy::default(),
+    WsServerOptions {
         trusted_proxies,
         control_ui_allow_insecure_auth,
         control_ui_disable_device_auth,
@@ -1051,7 +1100,7 @@ pub async fn build_ws_config_from_files() -> Result<WsServerConfig, WsConfigErro
         max_json_depth,
         ws_message_rate,
         ws_message_burst,
-    })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1426,6 +1475,102 @@ async fn handle_socket(
     });
 
     let nonce = Uuid::new_v4().to_string();
+    send_challenge(&tx, &nonce);
+
+    let json_depth_limit = state.config.max_json_depth.unwrap_or(MAX_JSON_DEPTH);
+
+    let (req_id, mut connect_params) =
+        match receive_initial_handshake(&mut receiver, &tx, json_depth_limit).await {
+            Ok(result) => result,
+            Err(()) => return,
+        };
+
+    let is_local =
+        auth::is_local_direct_request(remote_addr, &headers, &state.config.trusted_proxies);
+
+    let (role, scopes) = match validate_connect_params(&tx, &req_id, &mut connect_params, is_local)
+    {
+        Ok(result) => result,
+        Err(()) => return,
+    };
+
+    let device_id = match authenticate_connection(
+        &state,
+        &tx,
+        &req_id,
+        &connect_params,
+        &headers,
+        remote_addr,
+        &nonce,
+        is_local,
+        &role,
+        &scopes,
+    ) {
+        Ok(id) => id,
+        Err(()) => return,
+    };
+
+    let conn_id = Uuid::new_v4().to_string();
+    let issued_token = device_id
+        .as_ref()
+        .map(|id| ensure_device_token(&state, id, &role, &scopes));
+
+    if role == "node" {
+        finalize_node_commands(&state, &mut connect_params);
+        register_node_session(
+            &state,
+            &connect_params,
+            &conn_id,
+            device_id.clone(),
+            is_local,
+            remote_addr,
+        );
+    }
+
+    let remote_ip_for_presence = if is_local {
+        None
+    } else {
+        Some(remote_addr.ip().to_string())
+    };
+
+    let hello = build_hello_response(&state, &conn_id, issued_token);
+    let _ = send_response(&tx, &req_id, true, Some(json!(hello)), None);
+
+    let conn = ConnectionContext {
+        conn_id: conn_id.clone(),
+        role,
+        scopes,
+        client: connect_params.client.clone(),
+        device_id,
+    };
+
+    state.register_connection(&conn, tx.clone(), remote_ip_for_presence);
+
+    let tick_task = spawn_tick_task(tx.clone(), state.clone());
+    let mut ws_rate_limiter = create_ws_rate_limiter(&state);
+    let mut ws_rate_warn_count: u32 = 0;
+
+    run_message_loop(
+        &mut receiver,
+        &tx,
+        &state,
+        &conn,
+        json_depth_limit,
+        &mut ws_rate_limiter,
+        &mut ws_rate_warn_count,
+    )
+    .await;
+
+    tick_task.abort();
+    drop(tx);
+    let _ = send_task.await;
+
+    state.unregister_connection(&conn.conn_id);
+    state.node_registry.lock().unregister(&conn.conn_id);
+}
+
+/// Send the connect challenge event containing a nonce.
+fn send_challenge(tx: &mpsc::UnboundedSender<Message>, nonce: &str) {
     let challenge = EventFrame {
         frame_type: "event",
         event: "connect.challenge",
@@ -1433,38 +1578,271 @@ async fn handle_socket(
         seq: None,
         state_version: None,
     };
-    let _ = send_json(&tx, &challenge);
+    let _ = send_json(tx, &challenge);
+}
 
-    let text = match recv_text_with_timeout(&mut receiver, HANDSHAKE_TIMEOUT_MS).await {
+/// Filter declared node commands through the configured allowlist.
+fn finalize_node_commands(state: &WsServerState, connect_params: &mut ConnectParams) {
+    let allowlist = resolve_node_command_allowlist(
+        &state.config.node_allow_commands,
+        &state.config.node_deny_commands,
+        Some(connect_params.client.platform.as_str()),
+        connect_params.client.device_family.as_deref(),
+    );
+    let declared = connect_params.commands.clone().unwrap_or_default();
+    let filtered = declared
+        .into_iter()
+        .map(|cmd| cmd.trim().to_string())
+        .filter(|cmd| !cmd.is_empty() && allowlist.contains(cmd))
+        .collect::<Vec<_>>();
+    connect_params.commands = Some(filtered);
+}
+
+/// Spawn the periodic tick event task. Returns the join handle for cleanup.
+fn spawn_tick_task(
+    tick_tx: mpsc::UnboundedSender<Message>,
+    tick_state: Arc<WsServerState>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(TICK_INTERVAL_MS));
+        loop {
+            ticker.tick().await;
+            let event = EventFrame {
+                frame_type: "event",
+                event: "tick",
+                payload: json!({ "ts": now_ms() }),
+                seq: Some(tick_state.next_event_seq()),
+                state_version: None,
+            };
+            if send_json(&tick_tx, &event).is_err() {
+                break;
+            }
+        }
+    })
+}
+
+/// Create a per-connection WebSocket rate limiter from server config.
+fn create_ws_rate_limiter(state: &WsServerState) -> crate::server::ratelimit::WsRateLimiter {
+    let rate = state
+        .config
+        .ws_message_rate
+        .unwrap_or(crate::server::ratelimit::DEFAULT_WS_MESSAGE_RATE);
+    let burst = state
+        .config
+        .ws_message_burst
+        .unwrap_or(crate::server::ratelimit::DEFAULT_WS_MESSAGE_BURST);
+    crate::server::ratelimit::WsRateLimiter::new(rate, burst)
+}
+
+/// Decode a raw WebSocket message into a parsed request frame.
+/// Returns `Ok(request)` on success, `Err(LoopSignal::Continue)` to skip this
+/// message, or `Err(LoopSignal::Break)` to close the connection.
+fn decode_inbound_message(
+    msg: Message,
+    tx: &mpsc::UnboundedSender<Message>,
+    json_depth_limit: usize,
+) -> Result<ParsedRequest, LoopSignal> {
+    let text = match message_to_text(msg) {
+        Ok(InboundText::Text(text)) => text,
+        Ok(InboundText::Control) => return Err(LoopSignal::Continue),
+        Ok(InboundText::Close) => return Err(LoopSignal::Break),
+        Err(reason) => {
+            let _ = send_close(tx, 1008, reason);
+            return Err(LoopSignal::Break);
+        }
+    };
+    if text.len() > MAX_PAYLOAD_BYTES {
+        let _ = send_close(tx, 1008, "payload too large");
+        return Err(LoopSignal::Break);
+    }
+    let parsed = match serde_json::from_str::<Value>(&text) {
+        Ok(val) => val,
+        Err(_) => {
+            let _ = send_close(tx, 1008, "invalid request frame");
+            return Err(LoopSignal::Break);
+        }
+    };
+    if let Err(depth_err) = validate_json_depth(&parsed, json_depth_limit) {
+        let _ = send_close(tx, 1008, &depth_err);
+        return Err(LoopSignal::Break);
+    }
+    match parse_request_frame(&parsed) {
+        Ok(req) => Ok(req),
+        Err(err) => {
+            if let Some(id) = err.id {
+                let _ = send_response(tx, &id, false, None, Some(err.error));
+            } else {
+                let _ = send_close(tx, 1008, "invalid request frame");
+            }
+            Err(LoopSignal::Continue)
+        }
+    }
+}
+
+/// Check the per-connection rate limiter. Returns `Ok(())` if the request
+/// should proceed, `Err(LoopSignal::Continue)` if rate-limited (warning sent),
+/// or `Err(LoopSignal::Break)` if the warning threshold was exceeded.
+fn check_rate_limit(
+    tx: &mpsc::UnboundedSender<Message>,
+    req_id: &str,
+    rate_limiter: &mut crate::server::ratelimit::WsRateLimiter,
+    warn_count: &mut u32,
+) -> Result<(), LoopSignal> {
+    if !rate_limiter.try_consume() {
+        *warn_count += 1;
+        if *warn_count >= 3 {
+            let _ = send_close(tx, 1008, "rate limit exceeded");
+            return Err(LoopSignal::Break);
+        }
+        let err = error_shape(ERROR_RATE_LIMITED, "rate limit exceeded", None);
+        let _ = send_response(tx, req_id, false, None, Some(err));
+        return Err(LoopSignal::Continue);
+    }
+    *warn_count = 0;
+    Ok(())
+}
+
+/// Validate request params depth and reject duplicate connect calls.
+/// Returns `Ok(())` if the request should proceed, `Err(LoopSignal::Continue)`
+/// to skip this message.
+fn validate_request_params(
+    tx: &mpsc::UnboundedSender<Message>,
+    req_id: &str,
+    method: &str,
+    params: &Option<Value>,
+    json_depth_limit: usize,
+) -> Result<(), LoopSignal> {
+    if let Some(ref p) = *params {
+        if let Err(depth_err) = validate_json_depth(p, json_depth_limit) {
+            let err = error_shape(ERROR_INVALID_REQUEST, &depth_err, None);
+            let _ = send_response(tx, req_id, false, None, Some(err));
+            return Err(LoopSignal::Continue);
+        }
+    }
+    if method == "connect" {
+        let err = error_shape(ERROR_INVALID_REQUEST, "connect already completed", None);
+        let _ = send_response(tx, req_id, false, None, Some(err));
+        return Err(LoopSignal::Continue);
+    }
+    Ok(())
+}
+
+/// Send the result of method dispatch back to the client.
+fn send_dispatch_result(
+    tx: &mpsc::UnboundedSender<Message>,
+    req_id: &str,
+    method: &str,
+    method_known: bool,
+    result: Result<Value, ErrorShape>,
+) {
+    match result {
+        Ok(payload) => {
+            let _ = send_response(tx, req_id, true, Some(payload), None);
+        }
+        Err(err) => {
+            if method_known {
+                let _ = send_response(tx, req_id, false, None, Some(err));
+            } else {
+                let _ = send_response(
+                    tx,
+                    req_id,
+                    false,
+                    None,
+                    Some(error_shape(
+                        ERROR_INVALID_REQUEST,
+                        "unknown method",
+                        Some(json!({ "method": method })),
+                    )),
+                );
+            }
+        }
+    }
+}
+
+/// Signal used to communicate loop control flow from helper functions.
+enum LoopSignal {
+    Continue,
+    Break,
+}
+
+/// Main message receive loop. Processes inbound WebSocket frames until the
+/// connection is closed or an unrecoverable error occurs.
+async fn run_message_loop(
+    receiver: &mut futures_util::stream::SplitStream<WebSocket>,
+    tx: &mpsc::UnboundedSender<Message>,
+    state: &Arc<WsServerState>,
+    conn: &ConnectionContext,
+    json_depth_limit: usize,
+    ws_rate_limiter: &mut crate::server::ratelimit::WsRateLimiter,
+    ws_rate_warn_count: &mut u32,
+) {
+    while let Some(next) = receiver.next().await {
+        let msg = match next {
+            Ok(msg) => msg,
+            Err(_) => break,
+        };
+        let request = match decode_inbound_message(msg, tx, json_depth_limit) {
+            Ok(req) => req,
+            Err(LoopSignal::Continue) => continue,
+            Err(LoopSignal::Break) => break,
+        };
+        let ParsedRequest {
+            id: req_id,
+            method,
+            params,
+        } = request;
+
+        match check_rate_limit(tx, &req_id, ws_rate_limiter, ws_rate_warn_count) {
+            Ok(()) => {}
+            Err(LoopSignal::Continue) => continue,
+            Err(LoopSignal::Break) => break,
+        }
+        if validate_request_params(tx, &req_id, &method, &params, json_depth_limit).is_err() {
+            continue;
+        }
+        let method_known = GATEWAY_METHODS.contains(&method.as_str());
+        let result = dispatch_method(&method, params.as_ref(), state, conn).await;
+        send_dispatch_result(tx, &req_id, &method, method_known, result);
+    }
+}
+
+/// Receive the initial handshake message: timeout-bounded first message receive,
+/// payload parsing, and connect method validation.
+/// Returns (request_id, ConnectParams) on success, Err(()) if the connection should close.
+async fn receive_initial_handshake(
+    receiver: &mut futures_util::stream::SplitStream<WebSocket>,
+    tx: &mpsc::UnboundedSender<Message>,
+    json_depth_limit: usize,
+) -> Result<(String, ConnectParams), ()> {
+    let text = match recv_text_with_timeout(receiver, HANDSHAKE_TIMEOUT_MS).await {
         Ok(Some(text)) => text,
-        Ok(None) => return,
+        Ok(None) => return Err(()),
         Err(reason) => {
             if reason == "handshake timeout" {
-                let _ = send_close(&tx, 1000, "");
+                let _ = send_close(tx, 1000, "");
             } else {
-                let _ = send_close(&tx, 1008, reason);
+                let _ = send_close(tx, 1008, reason);
             }
-            return;
+            return Err(());
         }
     };
 
     if text.len() > MAX_PAYLOAD_BYTES {
-        let _ = send_close(&tx, 1008, "payload too large");
-        return;
+        let _ = send_close(tx, 1008, "payload too large");
+        return Err(());
     }
 
     let parsed = match serde_json::from_str::<Value>(&text) {
         Ok(val) => val,
         Err(_) => {
-            let _ = send_close(&tx, 1008, "invalid request frame");
-            return;
+            let _ = send_close(tx, 1008, "invalid request frame");
+            return Err(());
         }
     };
 
-    let json_depth_limit = state.config.max_json_depth.unwrap_or(MAX_JSON_DEPTH);
     if let Err(depth_err) = validate_json_depth(&parsed, json_depth_limit) {
-        let _ = send_close(&tx, 1008, &depth_err);
-        return;
+        let _ = send_close(tx, 1008, &depth_err);
+        return Err(());
     }
 
     let ParsedRequest {
@@ -1476,10 +1854,10 @@ async fn handle_socket(
         Err(err) => {
             let close_reason = err.error.message.clone();
             if let Some(id) = err.id {
-                let _ = send_response(&tx, &id, false, None, Some(err.error));
+                let _ = send_response(tx, &id, false, None, Some(err.error));
             }
-            let _ = send_close(&tx, 1008, &close_reason);
-            return;
+            let _ = send_close(tx, 1008, &close_reason);
+            return Err(());
         }
     };
 
@@ -1489,38 +1867,46 @@ async fn handle_socket(
             "invalid handshake: first request must be connect",
             None,
         );
-        let _ = send_response(&tx, &req_id, false, None, Some(err));
-        let _ = send_close(
-            &tx,
-            1008,
-            "invalid handshake: first request must be connect",
-        );
-        return;
+        let _ = send_response(tx, &req_id, false, None, Some(err));
+        let _ = send_close(tx, 1008, "invalid handshake: first request must be connect");
+        return Err(());
     }
 
-    let mut connect_params = match params {
+    let connect_params = match params {
         Some(value) => match serde_json::from_value::<ConnectParams>(value) {
             Ok(val) => val,
             Err(_) => {
                 let err = error_shape(ERROR_INVALID_REQUEST, "invalid connect params", None);
-                let _ = send_response(&tx, &req_id, false, None, Some(err));
-                let _ = send_close(&tx, 1008, "invalid connect params");
-                return;
+                let _ = send_response(tx, &req_id, false, None, Some(err));
+                let _ = send_close(tx, 1008, "invalid connect params");
+                return Err(());
             }
         },
         None => {
             let err = error_shape(ERROR_INVALID_REQUEST, "invalid connect params", None);
-            let _ = send_response(&tx, &req_id, false, None, Some(err));
-            let _ = send_close(&tx, 1008, "invalid connect params");
-            return;
+            let _ = send_response(tx, &req_id, false, None, Some(err));
+            let _ = send_close(tx, 1008, "invalid connect params");
+            return Err(());
         }
     };
 
+    Ok((req_id, connect_params))
+}
+
+/// Validate connect parameters: protocol version, client fields, role, and scopes.
+/// Updates connect_params.role and connect_params.scopes in place.
+/// Returns (role, scopes) on success, Err(()) if the connection should close.
+fn validate_connect_params(
+    tx: &mpsc::UnboundedSender<Message>,
+    req_id: &str,
+    connect_params: &mut ConnectParams,
+    _is_local: bool,
+) -> Result<(String, Vec<String>), ()> {
     if connect_params.min_protocol == 0 || connect_params.max_protocol == 0 {
         let err = error_shape(ERROR_INVALID_REQUEST, "invalid connect params", None);
-        let _ = send_response(&tx, &req_id, false, None, Some(err));
-        let _ = send_close(&tx, 1008, "invalid connect params");
-        return;
+        let _ = send_response(tx, req_id, false, None, Some(err));
+        let _ = send_close(tx, 1008, "invalid connect params");
+        return Err(());
     }
 
     if !ALLOWED_CLIENT_IDS.contains(&connect_params.client.id.as_str())
@@ -1529,9 +1915,9 @@ async fn handle_socket(
         || connect_params.client.platform.trim().is_empty()
     {
         let err = error_shape(ERROR_INVALID_REQUEST, "invalid connect params", None);
-        let _ = send_response(&tx, &req_id, false, None, Some(err));
-        let _ = send_close(&tx, 1008, "invalid connect params");
-        return;
+        let _ = send_response(tx, req_id, false, None, Some(err));
+        let _ = send_close(tx, 1008, "invalid connect params");
+        return Err(());
     }
 
     if connect_params.max_protocol < PROTOCOL_VERSION
@@ -1542,22 +1928,20 @@ async fn handle_socket(
             "protocol mismatch",
             Some(json!({ "expectedProtocol": PROTOCOL_VERSION })),
         );
-        let _ = send_response(&tx, &req_id, false, None, Some(err));
-        let _ = send_close(&tx, 1002, "protocol mismatch");
-        return;
+        let _ = send_response(tx, req_id, false, None, Some(err));
+        let _ = send_close(tx, 1002, "protocol mismatch");
+        return Err(());
     }
 
-    let is_local =
-        auth::is_local_direct_request(remote_addr, &headers, &state.config.trusted_proxies);
     let role = connect_params
         .role
         .clone()
         .unwrap_or_else(|| "operator".to_string());
     if role != "operator" && role != "node" {
         let err = error_shape(ERROR_INVALID_REQUEST, "invalid role", None);
-        let _ = send_response(&tx, &req_id, false, None, Some(err));
-        let _ = send_close(&tx, 1008, "invalid role");
-        return;
+        let _ = send_response(tx, req_id, false, None, Some(err));
+        let _ = send_close(tx, 1008, "invalid role");
+        return Err(());
     }
     let requested_scopes = connect_params.scopes.clone().unwrap_or_default();
     let scopes = if requested_scopes.is_empty() && role == "operator" {
@@ -1568,6 +1952,25 @@ async fn handle_socket(
     connect_params.role = Some(role.clone());
     connect_params.scopes = Some(scopes.clone());
 
+    Ok((role, scopes))
+}
+
+/// Authenticate the connection: token/password auth, local auth, control UI bypass,
+/// device identity validation, and device pairing.
+/// Returns the device_id (if any) on success, Err(()) if the connection should close.
+#[allow(clippy::too_many_arguments)]
+fn authenticate_connection(
+    state: &WsServerState,
+    tx: &mpsc::UnboundedSender<Message>,
+    req_id: &str,
+    connect_params: &ConnectParams,
+    headers: &HeaderMap,
+    remote_addr: SocketAddr,
+    nonce: &str,
+    is_local: bool,
+    role: &str,
+    scopes: &[String],
+) -> Result<Option<String>, ()> {
     let has_token_auth = connect_params
         .auth
         .as_ref()
@@ -1591,9 +1994,9 @@ async fn handle_socket(
         };
         if !can_skip_device {
             let err = error_shape(ERROR_NOT_PAIRED, "device identity required", None);
-            let _ = send_response(&tx, &req_id, false, None, Some(err));
-            let _ = send_close(&tx, 1008, "device identity required");
-            return;
+            let _ = send_response(tx, req_id, false, None, Some(err));
+            let _ = send_close(tx, 1008, "device identity required");
+            return Err(());
         }
     }
 
@@ -1603,13 +2006,49 @@ async fn handle_socket(
         connect_params.device.as_ref()
     };
 
+    let device_id = match validate_and_pair_device(
+        state,
+        tx,
+        req_id,
+        connect_params,
+        headers,
+        remote_addr,
+        nonce,
+        is_local,
+        role,
+        scopes,
+        device_opt,
+    ) {
+        Ok(id) => id,
+        Err(()) => return Err(()),
+    };
+
+    Ok(device_id)
+}
+
+/// Validate device identity and ensure pairing.
+/// Returns the device_id (if any) on success, Err(()) if the connection should close.
+#[allow(clippy::too_many_arguments)]
+fn validate_and_pair_device(
+    state: &WsServerState,
+    tx: &mpsc::UnboundedSender<Message>,
+    req_id: &str,
+    connect_params: &ConnectParams,
+    headers: &HeaderMap,
+    remote_addr: SocketAddr,
+    nonce: &str,
+    is_local: bool,
+    role: &str,
+    scopes: &[String],
+    device_opt: Option<&DeviceIdentity>,
+) -> Result<Option<String>, ()> {
     let device_id = match device_opt {
         Some(device) => {
-            if let Err(err) = validate_device_identity(device, &connect_params, &nonce, is_local) {
+            if let Err(err) = validate_device_identity(device, connect_params, nonce, is_local) {
                 let err_clone = err.clone();
-                let _ = send_response(&tx, &req_id, false, None, Some(err));
-                let _ = send_close(&tx, 1008, err_clone.message.as_str());
-                return;
+                let _ = send_response(tx, req_id, false, None, Some(err));
+                let _ = send_close(tx, 1008, err_clone.message.as_str());
+                return Err(());
             }
             Some(device.id.clone())
         }
@@ -1617,108 +2056,94 @@ async fn handle_socket(
     };
 
     if let Err(err) = authorize_connection(
-        &state,
-        &connect_params,
-        &headers,
+        state,
+        connect_params,
+        headers,
         remote_addr,
         device_id.as_deref(),
-        &role,
-        &scopes,
+        role,
+        scopes,
     ) {
-        let _ = send_response(&tx, &req_id, false, None, Some(err.clone()));
-        let _ = send_close(&tx, 1008, err.message.as_str());
-        return;
+        let _ = send_response(tx, req_id, false, None, Some(err.clone()));
+        let _ = send_close(tx, 1008, err.message.as_str());
+        return Err(());
     }
 
     if let Some(device) = device_opt {
         if let Err(err) = ensure_paired(
-            &state,
+            state,
             device,
-            &connect_params,
-            &role,
-            &scopes,
+            connect_params,
+            role,
+            scopes,
             is_local,
             remote_addr,
         ) {
-            let _ = send_response(&tx, &req_id, false, None, Some(err.clone()));
-            let _ = send_close(&tx, 1008, err.message.as_str());
-            return;
+            let _ = send_response(tx, req_id, false, None, Some(err.clone()));
+            let _ = send_close(tx, 1008, err.message.as_str());
+            return Err(());
         }
     }
 
-    let conn_id = Uuid::new_v4().to_string();
-    let issued_token = device_id
-        .as_ref()
-        .map(|id| ensure_device_token(&state, id, &role, &scopes));
+    Ok(device_id)
+}
 
-    if role == "node" {
-        let allowlist = resolve_node_command_allowlist(
-            &state.config.node_allow_commands,
-            &state.config.node_deny_commands,
-            Some(connect_params.client.platform.as_str()),
-            connect_params.client.device_family.as_deref(),
-        );
-        let declared = connect_params.commands.clone().unwrap_or_default();
-        let filtered = declared
-            .into_iter()
-            .map(|cmd| cmd.trim().to_string())
-            .filter(|cmd| !cmd.is_empty() && allowlist.contains(cmd))
-            .collect::<Vec<_>>();
-        connect_params.commands = Some(filtered);
-    }
-
-    if role == "node" {
-        let node_id = device_id
-            .clone()
-            .unwrap_or_else(|| connect_params.client.id.clone());
-        let commands = connect_params
-            .commands
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
-            .collect::<HashSet<String>>();
-        let remote_ip = if is_local {
-            None
-        } else {
-            Some(remote_addr.ip().to_string())
-        };
-        state.node_registry.lock().register(NodeSession {
-            node_id,
-            conn_id: conn_id.clone(),
-            display_name: connect_params.client.display_name.clone(),
-            platform: Some(connect_params.client.platform.clone()),
-            version: Some(connect_params.client.version.clone()),
-            device_family: connect_params.client.device_family.clone(),
-            model_identifier: connect_params.client.model_identifier.clone(),
-            remote_ip,
-            caps: connect_params.caps.clone().unwrap_or_default(),
-            commands,
-            permissions: connect_params.permissions.clone(),
-            path_env: connect_params.path_env.clone(),
-            connected_at_ms: now_ms(),
-        });
-    }
-
-    // Compute remote IP for presence tracking
-    let remote_ip_for_presence = if is_local {
+/// Register a node session in the node registry.
+fn register_node_session(
+    state: &WsServerState,
+    connect_params: &ConnectParams,
+    conn_id: &str,
+    device_id: Option<String>,
+    is_local: bool,
+    remote_addr: SocketAddr,
+) {
+    let node_id = device_id.unwrap_or_else(|| connect_params.client.id.clone());
+    let commands = connect_params
+        .commands
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<HashSet<String>>();
+    let remote_ip = if is_local {
         None
     } else {
         Some(remote_addr.ip().to_string())
     };
+    state.node_registry.lock().register(NodeSession {
+        node_id,
+        conn_id: conn_id.to_string(),
+        display_name: connect_params.client.display_name.clone(),
+        platform: Some(connect_params.client.platform.clone()),
+        version: Some(connect_params.client.version.clone()),
+        device_family: connect_params.client.device_family.clone(),
+        model_identifier: connect_params.client.model_identifier.clone(),
+        remote_ip,
+        caps: connect_params.caps.clone().unwrap_or_default(),
+        commands,
+        permissions: connect_params.permissions.clone(),
+        path_env: connect_params.path_env.clone(),
+        connected_at_ms: now_ms(),
+    });
+}
 
-    // Get current state version and snapshots for hello response
+/// Build the hello-ok response payload.
+fn build_hello_response(
+    state: &WsServerState,
+    conn_id: &str,
+    issued_token: Option<devices::IssuedDeviceToken>,
+) -> HelloOkPayload {
     let current_state_version = state.current_state_version();
     let presence_list = state.get_presence_list();
     let health_snapshot = state.get_health_snapshot();
 
-    let hello = HelloOkPayload {
+    HelloOkPayload {
         payload_type: "hello-ok",
         protocol: PROTOCOL_VERSION,
         server: ServerInfo {
             version: server_version(),
             commit: server_commit(),
             host: server_hostname(),
-            conn_id: conn_id.clone(),
+            conn_id: conn_id.to_string(),
         },
         features: Features {
             methods: GATEWAY_METHODS.iter().map(|s| s.to_string()).collect(),
@@ -1745,155 +2170,7 @@ async fn handle_socket(
             max_buffered_bytes: state.config.policy.max_buffered_bytes,
             tick_interval_ms: state.config.policy.tick_interval_ms,
         },
-    };
-
-    let _ = send_response(&tx, &req_id, true, Some(json!(hello)), None);
-
-    let conn = ConnectionContext {
-        conn_id: conn_id.clone(),
-        role,
-        scopes,
-        client: connect_params.client.clone(),
-        device_id,
-    };
-
-    state.register_connection(&conn, tx.clone(), remote_ip_for_presence);
-
-    let tick_tx = tx.clone();
-    let tick_state = state.clone();
-    let tick_task = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_millis(TICK_INTERVAL_MS));
-        loop {
-            ticker.tick().await;
-            let event = EventFrame {
-                frame_type: "event",
-                event: "tick",
-                payload: json!({ "ts": now_ms() }),
-                seq: Some(tick_state.next_event_seq()),
-                state_version: None,
-            };
-            if send_json(&tick_tx, &event).is_err() {
-                break;
-            }
-        }
-    });
-
-    // Per-connection rate limiter
-    let mut ws_rate_limiter = {
-        let rate = state
-            .config
-            .ws_message_rate
-            .unwrap_or(crate::server::ratelimit::DEFAULT_WS_MESSAGE_RATE);
-        let burst = state
-            .config
-            .ws_message_burst
-            .unwrap_or(crate::server::ratelimit::DEFAULT_WS_MESSAGE_BURST);
-        crate::server::ratelimit::WsRateLimiter::new(rate, burst)
-    };
-    let mut ws_rate_warn_count: u32 = 0;
-
-    while let Some(next) = receiver.next().await {
-        let msg = match next {
-            Ok(msg) => msg,
-            Err(_) => break,
-        };
-        let text = match message_to_text(msg) {
-            Ok(InboundText::Text(text)) => text,
-            Ok(InboundText::Control) => continue,
-            Ok(InboundText::Close) => break,
-            Err(reason) => {
-                let _ = send_close(&tx, 1008, reason);
-                break;
-            }
-        };
-        if text.len() > MAX_PAYLOAD_BYTES {
-            let _ = send_close(&tx, 1008, "payload too large");
-            break;
-        }
-        let parsed = match serde_json::from_str::<Value>(&text) {
-            Ok(val) => val,
-            Err(_) => {
-                let _ = send_close(&tx, 1008, "invalid request frame");
-                break;
-            }
-        };
-        if let Err(depth_err) = validate_json_depth(&parsed, json_depth_limit) {
-            let _ = send_close(&tx, 1008, &depth_err);
-            break;
-        }
-        let ParsedRequest {
-            id: req_id,
-            method,
-            params,
-        } = match parse_request_frame(&parsed) {
-            Ok(req) => req,
-            Err(err) => {
-                if let Some(id) = err.id {
-                    let _ = send_response(&tx, &id, false, None, Some(err.error));
-                } else {
-                    let _ = send_close(&tx, 1008, "invalid request frame");
-                }
-                continue;
-            }
-        };
-
-        // Per-connection rate limiting
-        if !ws_rate_limiter.try_consume() {
-            ws_rate_warn_count += 1;
-            if ws_rate_warn_count >= 3 {
-                let _ = send_close(&tx, 1008, "rate limit exceeded");
-                break;
-            }
-            let err = error_shape(ERROR_RATE_LIMITED, "rate limit exceeded", None);
-            let _ = send_response(&tx, &req_id, false, None, Some(err));
-            continue;
-        }
-        // Reset warning count on successful consume
-        ws_rate_warn_count = 0;
-        if let Some(ref p) = params {
-            if let Err(depth_err) = validate_json_depth(p, json_depth_limit) {
-                let err = error_shape(ERROR_INVALID_REQUEST, &depth_err, None);
-                let _ = send_response(&tx, &req_id, false, None, Some(err));
-                continue;
-            }
-        }
-        if method == "connect" {
-            let err = error_shape(ERROR_INVALID_REQUEST, "connect already completed", None);
-            let _ = send_response(&tx, &req_id, false, None, Some(err));
-            continue;
-        }
-        let method_known = GATEWAY_METHODS.contains(&method.as_str());
-        let result = dispatch_method(&method, params.as_ref(), &state, &conn).await;
-        match result {
-            Ok(payload) => {
-                let _ = send_response(&tx, &req_id, true, Some(payload), None);
-            }
-            Err(err) => {
-                if method_known {
-                    let _ = send_response(&tx, &req_id, false, None, Some(err));
-                } else {
-                    let _ = send_response(
-                        &tx,
-                        &req_id,
-                        false,
-                        None,
-                        Some(error_shape(
-                            ERROR_INVALID_REQUEST,
-                            "unknown method",
-                            Some(json!({ "method": method })),
-                        )),
-                    );
-                }
-            }
-        }
     }
-
-    tick_task.abort();
-    drop(tx);
-    let _ = send_task.await;
-
-    state.unregister_connection(&conn.conn_id);
-    state.node_registry.lock().unregister(&conn.conn_id);
 }
 
 struct ParsedRequest {

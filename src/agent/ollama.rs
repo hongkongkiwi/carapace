@@ -86,7 +86,6 @@ impl OllamaProvider {
 
         let mut messages: Vec<Value> = Vec::new();
 
-        // System message
         if let Some(ref system) = request.system {
             messages.push(json!({
                 "role": "system",
@@ -94,113 +93,10 @@ impl OllamaProvider {
             }));
         }
 
-        // Convert LlmMessages to OpenAI format (same logic as OpenAiProvider)
         for msg in &request.messages {
             match msg.role {
-                LlmRole::User => {
-                    let has_tool_result = msg
-                        .content
-                        .iter()
-                        .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
-
-                    if has_tool_result {
-                        for block in &msg.content {
-                            match block {
-                                ContentBlock::ToolResult {
-                                    tool_use_id,
-                                    content,
-                                    ..
-                                } => {
-                                    messages.push(json!({
-                                        "role": "tool",
-                                        "tool_call_id": tool_use_id,
-                                        "content": content,
-                                    }));
-                                }
-                                ContentBlock::Text { text } => {
-                                    messages.push(json!({
-                                        "role": "user",
-                                        "content": text,
-                                    }));
-                                }
-                                _ => {}
-                            }
-                        }
-                    } else {
-                        let text = msg
-                            .content
-                            .iter()
-                            .filter_map(|b| match b {
-                                ContentBlock::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("");
-                        if !text.is_empty() {
-                            messages.push(json!({
-                                "role": "user",
-                                "content": text,
-                            }));
-                        }
-                    }
-                }
-                LlmRole::Assistant => {
-                    let has_tool_use = msg
-                        .content
-                        .iter()
-                        .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
-
-                    if has_tool_use {
-                        let text_content: String = msg
-                            .content
-                            .iter()
-                            .filter_map(|b| match b {
-                                ContentBlock::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("");
-
-                        let tool_calls: Vec<Value> = msg
-                            .content
-                            .iter()
-                            .filter_map(|b| match b {
-                                ContentBlock::ToolUse { id, name, input } => Some(json!({
-                                    "id": id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": name,
-                                        "arguments": input.to_string(),
-                                    }
-                                })),
-                                _ => None,
-                            })
-                            .collect();
-
-                        let mut msg_obj = json!({
-                            "role": "assistant",
-                            "tool_calls": tool_calls,
-                        });
-                        if !text_content.is_empty() {
-                            msg_obj["content"] = json!(text_content);
-                        }
-                        messages.push(msg_obj);
-                    } else {
-                        let text = msg
-                            .content
-                            .iter()
-                            .filter_map(|b| match b {
-                                ContentBlock::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("");
-                        messages.push(json!({
-                            "role": "assistant",
-                            "content": text,
-                        }));
-                    }
-                }
+                LlmRole::User => convert_user_message_ollama(msg, &mut messages),
+                LlmRole::Assistant => convert_assistant_message_ollama(msg, &mut messages),
             }
         }
 
@@ -218,23 +114,7 @@ impl OllamaProvider {
             body["temperature"] = json!(temp);
         }
 
-        if !request.tools.is_empty() {
-            let tools: Vec<Value> = request
-                .tools
-                .iter()
-                .map(|t| {
-                    json!({
-                        "type": "function",
-                        "function": {
-                            "name": t.name,
-                            "description": t.description,
-                            "parameters": t.input_schema,
-                        }
-                    })
-                })
-                .collect();
-            body["tools"] = json!(tools);
-        }
+        append_tools_ollama(&request.tools, &mut body);
 
         body
     }
@@ -288,6 +168,128 @@ impl OllamaProvider {
             .unwrap_or_default();
 
         Ok(models)
+    }
+}
+
+/// Convert a user-role `LlmMessage` into one or more OpenAI-compat messages.
+fn convert_user_message_ollama(msg: &LlmMessage, messages: &mut Vec<Value>) {
+    use serde_json::json;
+
+    let has_tool_result = msg
+        .content
+        .iter()
+        .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
+
+    if has_tool_result {
+        for block in &msg.content {
+            match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } => {
+                    messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": tool_use_id,
+                        "content": content,
+                    }));
+                }
+                ContentBlock::Text { text } => {
+                    messages.push(json!({
+                        "role": "user",
+                        "content": text,
+                    }));
+                }
+                _ => {}
+            }
+        }
+    } else {
+        let text = collect_text_blocks_ollama(&msg.content);
+        if !text.is_empty() {
+            messages.push(json!({
+                "role": "user",
+                "content": text,
+            }));
+        }
+    }
+}
+
+/// Convert an assistant-role `LlmMessage` into an OpenAI-compat message.
+fn convert_assistant_message_ollama(msg: &LlmMessage, messages: &mut Vec<Value>) {
+    use serde_json::json;
+
+    let has_tool_use = msg
+        .content
+        .iter()
+        .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+
+    if has_tool_use {
+        let text_content = collect_text_blocks_ollama(&msg.content);
+
+        let tool_calls: Vec<Value> = msg
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse { id, name, input } => Some(json!({
+                    "id": id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": input.to_string(),
+                    }
+                })),
+                _ => None,
+            })
+            .collect();
+
+        let mut msg_obj = json!({
+            "role": "assistant",
+            "tool_calls": tool_calls,
+        });
+        if !text_content.is_empty() {
+            msg_obj["content"] = json!(text_content);
+        }
+        messages.push(msg_obj);
+    } else {
+        let text = collect_text_blocks_ollama(&msg.content);
+        messages.push(json!({
+            "role": "assistant",
+            "content": text,
+        }));
+    }
+}
+
+/// Concatenate all `Text` blocks in a content slice into a single string.
+fn collect_text_blocks_ollama(content: &[ContentBlock]) -> String {
+    content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// Append tool definitions to the body if any are present.
+fn append_tools_ollama(tools: &[ToolDefinition], body: &mut Value) {
+    use serde_json::json;
+
+    if !tools.is_empty() {
+        let tool_values: Vec<Value> = tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.input_schema,
+                    }
+                })
+            })
+            .collect();
+        body["tools"] = json!(tool_values);
     }
 }
 

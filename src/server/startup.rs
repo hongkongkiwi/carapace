@@ -85,6 +85,7 @@ impl ServerHandle {
 
     /// Trigger graceful shutdown: notify background tasks, broadcast to WS
     /// clients, flush sessions, then await the server task.
+    #[allow(clippy::cognitive_complexity)]
     pub async fn shutdown(self) {
         // Signal background tasks to stop
         let _ = self.shutdown_tx.send(true);
@@ -107,6 +108,97 @@ impl ServerHandle {
             Ok(Err(e)) => error!("Server task panicked: {}", e),
             Err(_) => warn!("Server task did not finish within 5s timeout"),
         }
+    }
+}
+
+/// Spawn the SIGHUP handler that triggers config reload on Unix systems.
+#[cfg(unix)]
+fn spawn_sighup_handler(
+    ws_state: &Arc<WsServerState>,
+    config_watcher: &config::watcher::ConfigWatcher,
+    shutdown_rx: &watch::Receiver<bool>,
+) {
+    let ws_state_for_sighup = ws_state.clone();
+    let config_event_tx = config_watcher.event_sender();
+    let mut sighup_shutdown_rx = shutdown_rx.clone();
+    tokio::spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sighup = match signal(SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Failed to install SIGHUP handler: {}", e);
+                return;
+            }
+        };
+        loop {
+            tokio::select! {
+                _ = sighup.recv() => {
+                    info!("SIGHUP received, triggering config reload");
+                    let current_cfg = config::load_config()
+                        .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+                    let mode_str = current_cfg
+                        .get("gateway")
+                        .and_then(|g| g.get("reload"))
+                        .and_then(|r| r.get("mode"))
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("hot");
+                    let mode = match config::watcher::ReloadMode::parse_mode(mode_str) {
+                        config::watcher::ReloadMode::Off => config::watcher::ReloadMode::Hot,
+                        other => other,
+                    };
+                    let result = config::watcher::perform_reload(&mode);
+                    if result.success {
+                        crate::server::ws::broadcast_config_changed(
+                            &ws_state_for_sighup,
+                            &result.mode,
+                        );
+                        let _ = config_event_tx.send(
+                            config::watcher::ConfigEvent::Reloaded(result),
+                        );
+                    } else {
+                        let _ = config_event_tx.send(
+                            config::watcher::ConfigEvent::ReloadFailed(result),
+                        );
+                    }
+                }
+                _ = sighup_shutdown_rx.changed() => {
+                    if *sighup_shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Spawn the resource monitor and session retention cleanup tasks.
+fn spawn_monitoring_and_retention(
+    ws_state: &Arc<WsServerState>,
+    raw_config: &Value,
+    shutdown_rx: &watch::Receiver<bool>,
+) {
+    // Resource monitor (60s sampling interval)
+    let state_dir = crate::server::ws::resolve_state_dir();
+    let health_checker = Arc::new(crate::server::health::HealthChecker::new(state_dir));
+    let monitor = Arc::new(crate::server::resource_monitor::ResourceMonitor::new(
+        health_checker,
+    ));
+    let monitor_rx = shutdown_rx.clone();
+    tokio::spawn(crate::server::resource_monitor::run_resource_monitor(
+        monitor,
+        Duration::from_secs(60),
+        crate::server::resource_monitor::ResourceThresholds::default(),
+        monitor_rx,
+    ));
+
+    // Session retention cleanup loop
+    let retention_config = sessions::retention::build_retention_config(raw_config);
+    if retention_config.enabled {
+        tokio::spawn(sessions::retention::retention_cleanup_loop(
+            ws_state.session_store().clone(),
+            retention_config,
+            shutdown_rx.clone(),
+        ));
     }
 }
 
@@ -145,151 +237,85 @@ pub fn spawn_background_tasks(
     }
 
     // Bridge config watcher events to WS broadcasts + provider hot-swap
-    {
-        let mut config_rx = config_watcher.subscribe();
-        let ws_state_for_config = ws_state.clone();
-        let mut config_shutdown_rx = shutdown_rx.clone();
-        // Track current provider fingerprint for change detection
-        let mut current_fingerprint = crate::agent::factory::fingerprint_providers(raw_config);
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    event = config_rx.recv() => {
-                        match event {
-                            Ok(config::watcher::ConfigEvent::Reloaded(result)) => {
-                                crate::server::ws::broadcast_config_changed(
-                                    &ws_state_for_config,
-                                    &result.mode,
-                                );
-                                // Hot-swap LLM providers if config changed
-                                if let Ok(new_cfg) = config::load_config() {
-                                    let new_fingerprint =
-                                        crate::agent::factory::fingerprint_providers(&new_cfg);
-                                    if new_fingerprint != current_fingerprint {
-                                        info!("LLM provider configuration changed, rebuilding providers");
-                                        match crate::agent::factory::build_providers(&new_cfg) {
-                                            Ok(Some(mp)) => {
-                                                ws_state_for_config
-                                                    .set_llm_provider(Some(std::sync::Arc::new(mp)));
-                                                info!("LLM providers hot-swapped successfully");
-                                            }
-                                            Ok(None) => {
-                                                ws_state_for_config.set_llm_provider(None);
-                                                info!("LLM providers removed (none configured)");
-                                            }
-                                            Err(e) => {
-                                                warn!(
-                                                    "Failed to rebuild LLM providers: {} (keeping previous)",
-                                                    e
-                                                );
-                                                // Don't update fingerprint on failure
-                                                continue;
-                                            }
-                                        }
-                                        current_fingerprint = new_fingerprint;
-                                    }
-                                }
-                            }
-                            Ok(config::watcher::ConfigEvent::ReloadFailed(_)) => {}
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                warn!("Config event receiver lagged by {} events", n);
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                break;
-                            }
-                        }
-                    }
-                    _ = config_shutdown_rx.changed() => {
-                        if *config_shutdown_rx.borrow() {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-    }
+    spawn_config_watcher_bridge(&config_watcher, ws_state, raw_config, shutdown_rx);
 
     // SIGHUP handler for manual config reload (Unix only)
     #[cfg(unix)]
-    {
-        let ws_state_for_sighup = ws_state.clone();
-        let config_event_tx = config_watcher.event_sender();
-        let mut sighup_shutdown_rx = shutdown_rx.clone();
-        tokio::spawn(async move {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut sighup = match signal(SignalKind::hangup()) {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("Failed to install SIGHUP handler: {}", e);
-                    return;
-                }
-            };
-            loop {
-                tokio::select! {
-                    _ = sighup.recv() => {
-                        info!("SIGHUP received, triggering config reload");
-                        let current_cfg = config::load_config()
-                            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
-                        let mode_str = current_cfg
-                            .get("gateway")
-                            .and_then(|g| g.get("reload"))
-                            .and_then(|r| r.get("mode"))
-                            .and_then(|m| m.as_str())
-                            .unwrap_or("hot");
-                        let mode = match config::watcher::ReloadMode::parse_mode(mode_str) {
-                            config::watcher::ReloadMode::Off => config::watcher::ReloadMode::Hot,
-                            other => other,
-                        };
-                        let result = config::watcher::perform_reload(&mode);
-                        if result.success {
+    spawn_sighup_handler(ws_state, &config_watcher, shutdown_rx);
+
+    // Resource monitor and session retention cleanup
+    spawn_monitoring_and_retention(ws_state, raw_config, shutdown_rx);
+}
+
+/// Spawn a task that bridges config watcher reload events to WebSocket broadcasts
+/// and performs LLM provider hot-swap when the provider fingerprint changes.
+fn spawn_config_watcher_bridge(
+    config_watcher: &config::watcher::ConfigWatcher,
+    ws_state: &Arc<WsServerState>,
+    raw_config: &Value,
+    shutdown_rx: &watch::Receiver<bool>,
+) {
+    let mut config_rx = config_watcher.subscribe();
+    let ws_state_for_config = ws_state.clone();
+    let mut config_shutdown_rx = shutdown_rx.clone();
+    // Track current provider fingerprint for change detection
+    let mut current_fingerprint = crate::agent::factory::fingerprint_providers(raw_config);
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                event = config_rx.recv() => {
+                    match event {
+                        Ok(config::watcher::ConfigEvent::Reloaded(result)) => {
                             crate::server::ws::broadcast_config_changed(
-                                &ws_state_for_sighup,
+                                &ws_state_for_config,
                                 &result.mode,
                             );
-                            let _ = config_event_tx.send(
-                                config::watcher::ConfigEvent::Reloaded(result),
-                            );
-                        } else {
-                            let _ = config_event_tx.send(
-                                config::watcher::ConfigEvent::ReloadFailed(result),
-                            );
+                            // Hot-swap LLM providers if config changed
+                            if let Ok(new_cfg) = config::load_config() {
+                                let new_fingerprint =
+                                    crate::agent::factory::fingerprint_providers(&new_cfg);
+                                if new_fingerprint != current_fingerprint {
+                                    info!("LLM provider configuration changed, rebuilding providers");
+                                    match crate::agent::factory::build_providers(&new_cfg) {
+                                        Ok(Some(mp)) => {
+                                            ws_state_for_config
+                                                .set_llm_provider(Some(std::sync::Arc::new(mp)));
+                                            info!("LLM providers hot-swapped successfully");
+                                        }
+                                        Ok(None) => {
+                                            ws_state_for_config.set_llm_provider(None);
+                                            info!("LLM providers removed (none configured)");
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "Failed to rebuild LLM providers: {} (keeping previous)",
+                                                e
+                                            );
+                                            // Don't update fingerprint on failure
+                                            continue;
+                                        }
+                                    }
+                                    current_fingerprint = new_fingerprint;
+                                }
+                            }
                         }
-                    }
-                    _ = sighup_shutdown_rx.changed() => {
-                        if *sighup_shutdown_rx.borrow() {
+                        Ok(config::watcher::ConfigEvent::ReloadFailed(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("Config event receiver lagged by {} events", n);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             break;
                         }
                     }
                 }
+                _ = config_shutdown_rx.changed() => {
+                    if *config_shutdown_rx.borrow() {
+                        break;
+                    }
+                }
             }
-        });
-    }
-
-    // Resource monitor (60s sampling interval)
-    {
-        let state_dir = crate::server::ws::resolve_state_dir();
-        let health_checker = Arc::new(crate::server::health::HealthChecker::new(state_dir));
-        let monitor = Arc::new(crate::server::resource_monitor::ResourceMonitor::new(
-            health_checker,
-        ));
-        let monitor_rx = shutdown_rx.clone();
-        tokio::spawn(crate::server::resource_monitor::run_resource_monitor(
-            monitor,
-            Duration::from_secs(60),
-            crate::server::resource_monitor::ResourceThresholds::default(),
-            monitor_rx,
-        ));
-    }
-
-    // Session retention cleanup loop
-    let retention_config = sessions::retention::build_retention_config(raw_config);
-    if retention_config.enabled {
-        tokio::spawn(sessions::retention::retention_cleanup_loop(
-            ws_state.session_store().clone(),
-            retention_config,
-            shutdown_rx.clone(),
-        ));
-    }
+        }
+    });
 }
 
 /// Start a non-TLS server from a fully-assembled [`ServerConfig`].

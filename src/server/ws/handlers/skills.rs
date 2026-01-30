@@ -277,13 +277,10 @@ fn verify_skill_hash(
     }
 }
 
-/// Download a WASM binary from the given URL and save it atomically to the skills
-/// directory.  Returns the final file path and the raw bytes on success.
-fn download_skill_wasm(
-    url: &url::Url,
-    skills_dir: &Path,
-    file_name: &str,
-) -> Result<(PathBuf, Vec<u8>), ErrorShape> {
+/// Validate the download URL against SSRF attacks and resolve DNS for hostname-based
+/// URLs.  Returns `(host, port, resolved_ip)` where `resolved_ip` is `Some` only when
+/// the host is a hostname (not an IP literal) and DNS resolution succeeded.
+fn validate_and_resolve_dns(url: &url::Url) -> Result<(String, u16, Option<IpAddr>), ErrorShape> {
     // Validate URL against SSRF attacks (blocks localhost, private IPs, metadata endpoints)
     SsrfProtection::validate_url(url.as_str()).map_err(|e| {
         error_shape(
@@ -293,11 +290,6 @@ fn download_skill_wasm(
         )
     })?;
 
-    // --- DNS rebinding defense ---
-    // Extract the hostname and resolve DNS to get actual IPs. Validate each
-    // resolved IP against SSRF rules, then pin the validated IP to the HTTP
-    // client so that the connection cannot be redirected to a different IP
-    // between DNS resolution and the actual HTTP request.
     let host = url
         .host_str()
         .ok_or_else(|| {
@@ -314,7 +306,7 @@ fn download_skill_wasm(
         // Host is already an IP literal; URL validation above already checked it.
         None
     } else {
-        // Host is a hostname — resolve DNS and validate every returned IP.
+        // Host is a hostname -- resolve DNS and validate every returned IP.
         let ip = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let resolver =
@@ -362,14 +354,17 @@ fn download_skill_wasm(
         Some(ip)
     };
 
-    std::fs::create_dir_all(skills_dir).map_err(|e| {
-        error_shape(
-            ERROR_UNAVAILABLE,
-            &format!("failed to create skills directory: {}", e),
-            None,
-        )
-    })?;
+    Ok((host, port, resolved_ip))
+}
 
+/// Build an HTTP client pinned to the validated IP (if any) and download the WASM
+/// binary.  Validates response status, size limit, and WASM magic bytes.
+fn download_with_pinned_ip(
+    url: &url::Url,
+    host: &str,
+    port: u16,
+    resolved_ip: Option<IpAddr>,
+) -> Result<bytes::Bytes, ErrorShape> {
     let mut client_builder = reqwest::blocking::Client::builder()
         .timeout(SKILL_DOWNLOAD_TIMEOUT)
         // SECURITY: Disable redirects to prevent redirect-based SSRF bypass.
@@ -380,7 +375,7 @@ fn download_skill_wasm(
     // preventing any second DNS lookup from returning a different address.
     if let Some(ip) = resolved_ip {
         let socket_addr = std::net::SocketAddr::new(ip, port);
-        client_builder = client_builder.resolve(&host, socket_addr);
+        client_builder = client_builder.resolve(host, socket_addr);
     }
 
     let client = client_builder.build().map_err(|e| {
@@ -439,6 +434,16 @@ fn download_skill_wasm(
         ));
     }
 
+    Ok(bytes)
+}
+
+/// Write the downloaded bytes to a temporary file, fsync, then atomically rename
+/// into the final destination.  Returns the final file path.
+fn atomic_write_skill_file(
+    skills_dir: &Path,
+    file_name: &str,
+    bytes: &[u8],
+) -> Result<PathBuf, ErrorShape> {
     let dest_path = skills_dir.join(file_name);
     let tmp_path = skills_dir.join(format!("{}.tmp", file_name));
 
@@ -450,7 +455,7 @@ fn download_skill_wasm(
                 None,
             )
         })?;
-        file.write_all(&bytes).map_err(|e| {
+        file.write_all(bytes).map_err(|e| {
             error_shape(
                 ERROR_UNAVAILABLE,
                 &format!("failed to write skill binary: {}", e),
@@ -472,6 +477,29 @@ fn download_skill_wasm(
             None,
         )
     })?;
+
+    Ok(dest_path)
+}
+
+/// Download a WASM binary from the given URL and save it atomically to the skills
+/// directory.  Returns the final file path and the raw bytes on success.
+fn download_skill_wasm(
+    url: &url::Url,
+    skills_dir: &Path,
+    file_name: &str,
+) -> Result<(PathBuf, Vec<u8>), ErrorShape> {
+    let (host, port, resolved_ip) = validate_and_resolve_dns(url)?;
+
+    std::fs::create_dir_all(skills_dir).map_err(|e| {
+        error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("failed to create skills directory: {}", e),
+            None,
+        )
+    })?;
+
+    let bytes = download_with_pinned_ip(url, &host, port, resolved_ip)?;
+    let dest_path = atomic_write_skill_file(skills_dir, file_name, &bytes)?;
 
     Ok((dest_path, bytes.to_vec()))
 }

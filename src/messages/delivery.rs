@@ -40,72 +40,85 @@ pub async fn delivery_loop(
 
         let channel_ids = pipeline.channels_with_messages();
 
-        for channel_id in channel_ids {
-            // Skip if channel is not connected
-            if !channel_registry.is_connected(&channel_id) {
-                continue;
-            }
-
-            let msg = match pipeline.next_for_channel(&channel_id) {
-                Some(m) => m,
-                None => continue,
-            };
-
-            let message_id = msg.message.id.clone();
-
-            // Mark as sending
-            if let Err(e) = pipeline.mark_sending(&message_id) {
-                warn!(id = %message_id, error = %e, "failed to mark message as sending");
-                continue;
-            }
-
-            // Look up channel plugin
-            let plugin = match plugin_registry.get_channel(&channel_id) {
-                Some(p) => p,
-                None => {
-                    let _ = pipeline.mark_failed(&message_id, "no plugin registered for channel");
-                    continue;
-                }
-            };
-
-            // Build outbound context from message metadata
-            let metadata = &msg.message.metadata;
-
-            // Deliver based on content type
-            let result = deliver_message(
-                &plugin,
-                &msg.message.content,
-                metadata.recipient_id.as_deref().unwrap_or_default(),
-                metadata.reply_to.as_deref(),
-                metadata.thread_id.as_deref(),
-            )
+        process_channel_messages(&channel_ids, &pipeline, &plugin_registry, &channel_registry)
             .await;
+    }
+}
 
-            match result {
-                Ok(delivery) if delivery.ok => {
-                    let _ = pipeline.mark_sent(&message_id);
-                }
-                Ok(delivery) => {
-                    // Delivery reported failure
-                    let error = delivery
-                        .error
-                        .unwrap_or_else(|| "delivery failed".to_string());
-                    if delivery.retryable && pipeline.can_retry(&message_id) {
-                        // Reset status to Queued so the delivery loop picks it up again
-                        let _ = pipeline.mark_retry(&message_id, &error);
-                        warn!(
-                            id = %message_id,
-                            error = %error,
-                            "retryable delivery failure, reset to queued for retry"
-                        );
-                    } else {
-                        let _ = pipeline.mark_failed(&message_id, &error);
-                    }
-                }
-                Err(e) => {
-                    let _ = pipeline.mark_failed(&message_id, e.to_string());
-                }
+/// Process pending messages for each connected channel.
+async fn process_channel_messages(
+    channel_ids: &[String],
+    pipeline: &MessagePipeline,
+    plugin_registry: &PluginRegistry,
+    channel_registry: &ChannelRegistry,
+) {
+    for channel_id in channel_ids {
+        if !channel_registry.is_connected(channel_id) {
+            continue;
+        }
+
+        let msg = match pipeline.next_for_channel(channel_id) {
+            Some(m) => m,
+            None => continue,
+        };
+
+        let message_id = msg.message.id.clone();
+
+        if let Err(e) = pipeline.mark_sending(&message_id) {
+            warn!(id = %message_id, error = %e, "failed to mark message as sending");
+            continue;
+        }
+
+        let plugin = match plugin_registry.get_channel(channel_id) {
+            Some(p) => p,
+            None => {
+                let _ = pipeline.mark_failed(&message_id, "no plugin registered for channel");
+                continue;
             }
+        };
+
+        let metadata = &msg.message.metadata;
+
+        let result = deliver_message(
+            &plugin,
+            &msg.message.content,
+            metadata.recipient_id.as_deref().unwrap_or_default(),
+            metadata.reply_to.as_deref(),
+            metadata.thread_id.as_deref(),
+        )
+        .await;
+
+        handle_delivery_result(pipeline, &message_id, result);
+    }
+}
+
+/// Handle the result of a message delivery attempt.
+fn handle_delivery_result(
+    pipeline: &MessagePipeline,
+    message_id: &crate::messages::outbound::MessageId,
+    result: Result<plugins::DeliveryResult, plugins::BindingError>,
+) {
+    match result {
+        Ok(delivery) if delivery.ok => {
+            let _ = pipeline.mark_sent(message_id);
+        }
+        Ok(delivery) => {
+            let error = delivery
+                .error
+                .unwrap_or_else(|| "delivery failed".to_string());
+            if delivery.retryable && pipeline.can_retry(message_id) {
+                let _ = pipeline.mark_retry(message_id, &error);
+                warn!(
+                    id = %message_id,
+                    error = %error,
+                    "retryable delivery failure, reset to queued for retry"
+                );
+            } else {
+                let _ = pipeline.mark_failed(message_id, &error);
+            }
+        }
+        Err(e) => {
+            let _ = pipeline.mark_failed(message_id, e.to_string());
         }
     }
 }

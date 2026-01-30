@@ -169,39 +169,56 @@ pub fn apply_staged_update(staged_path: &str) -> Result<ApplyResult, String> {
 
 /// Remove stale backup and old update files.
 pub fn cleanup_old_binaries() {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            if let Ok(entries) = std::fs::read_dir(parent) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if let Some(ext) = path.extension() {
-                        if ext == "bak" || ext == "old" {
-                            if let Err(e) = std::fs::remove_file(&path) {
-                                warn!("failed to remove old binary {}: {e}", path.display());
-                            }
-                        }
-                    }
-                }
+    cleanup_bak_files_near_exe();
+    cleanup_stale_staged_updates();
+}
+
+/// Remove `.bak` and `.old` files next to the current executable.
+fn cleanup_bak_files_near_exe() {
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let parent = match exe.parent() {
+        Some(p) => p,
+        None => return,
+    };
+    let entries = match std::fs::read_dir(parent) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let dominated = path
+            .extension()
+            .is_some_and(|ext| ext == "bak" || ext == "old");
+        if dominated {
+            if let Err(e) = std::fs::remove_file(&path) {
+                warn!("failed to remove old binary {}: {e}", path.display());
             }
         }
     }
+}
 
+/// Remove staged update files older than 7 days.
+fn cleanup_stale_staged_updates() {
     let updates_dir = resolve_state_dir().join("updates");
-    if let Ok(entries) = std::fs::read_dir(&updates_dir) {
-        let seven_days = Duration::from_secs(7 * 24 * 60 * 60);
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Ok(meta) = path.metadata() {
-                let stale = meta
-                    .modified()
-                    .ok()
-                    .and_then(|m| m.elapsed().ok())
-                    .is_some_and(|age| age > seven_days);
-                if stale {
-                    if let Err(e) = std::fs::remove_file(&path) {
-                        warn!("failed to remove stale staged file {}: {e}", path.display());
-                    }
-                }
+    let entries = match std::fs::read_dir(&updates_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let seven_days = Duration::from_secs(7 * 24 * 60 * 60);
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let stale = path
+            .metadata()
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age > seven_days);
+        if stale {
+            if let Err(e) = std::fs::remove_file(&path) {
+                warn!("failed to remove stale staged file {}: {e}", path.display());
             }
         }
     }

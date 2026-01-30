@@ -173,140 +173,153 @@ impl WizardManager {
     }
 }
 
+/// Build the steps for the initial setup wizard.
+fn setup_wizard_steps() -> Vec<WizardStep> {
+    vec![
+        WizardStep {
+            id: "welcome".to_string(),
+            title: "Welcome to Moltbot".to_string(),
+            description: Some("Let's get you set up with your AI assistant.".to_string()),
+            input_type: "confirm".to_string(),
+            options: None,
+            required: true,
+            default: Some(Value::Bool(true)),
+            validation: None,
+        },
+        WizardStep {
+            id: "provider".to_string(),
+            title: "Select AI Provider".to_string(),
+            description: Some("Choose your preferred AI model provider.".to_string()),
+            input_type: "select".to_string(),
+            options: Some(vec![
+                WizardOption {
+                    value: "anthropic".to_string(),
+                    label: "Anthropic (Claude)".to_string(),
+                    description: Some("Recommended for most users".to_string()),
+                },
+                WizardOption {
+                    value: "openai".to_string(),
+                    label: "OpenAI (GPT)".to_string(),
+                    description: None,
+                },
+            ]),
+            required: true,
+            default: Some(Value::String("anthropic".to_string())),
+            validation: None,
+        },
+        WizardStep {
+            id: "api_key".to_string(),
+            title: "Enter API Key".to_string(),
+            description: Some("Enter your API key for the selected provider.".to_string()),
+            input_type: "password".to_string(),
+            options: None,
+            required: true,
+            default: None,
+            validation: Some(WizardValidation {
+                min_length: Some(10),
+                max_length: Some(256),
+                pattern: None,
+            }),
+        },
+        WizardStep {
+            id: "complete".to_string(),
+            title: "Setup Complete".to_string(),
+            description: Some("You're all set! Start chatting with your assistant.".to_string()),
+            input_type: "confirm".to_string(),
+            options: None,
+            required: true,
+            default: Some(Value::Bool(true)),
+            validation: None,
+        },
+    ]
+}
+
+/// Build the steps for the channel configuration wizard.
+fn channel_wizard_steps() -> Vec<WizardStep> {
+    vec![
+        WizardStep {
+            id: "channel_type".to_string(),
+            title: "Select Channel".to_string(),
+            description: Some("Choose a messaging channel to configure.".to_string()),
+            input_type: "select".to_string(),
+            options: Some(vec![
+                WizardOption {
+                    value: "telegram".to_string(),
+                    label: "Telegram".to_string(),
+                    description: None,
+                },
+                WizardOption {
+                    value: "discord".to_string(),
+                    label: "Discord".to_string(),
+                    description: None,
+                },
+                WizardOption {
+                    value: "slack".to_string(),
+                    label: "Slack".to_string(),
+                    description: None,
+                },
+            ]),
+            required: true,
+            default: None,
+            validation: None,
+        },
+        WizardStep {
+            id: "channel_token".to_string(),
+            title: "Enter Bot Token".to_string(),
+            description: Some("Enter the bot token for your channel.".to_string()),
+            input_type: "password".to_string(),
+            options: None,
+            required: true,
+            default: None,
+            validation: Some(WizardValidation {
+                min_length: Some(10),
+                max_length: None,
+                pattern: None,
+            }),
+        },
+    ]
+}
+
+/// Build the steps for the agent configuration wizard.
+fn agent_wizard_steps() -> Vec<WizardStep> {
+    vec![
+        WizardStep {
+            id: "agent_name".to_string(),
+            title: "Agent Name".to_string(),
+            description: Some("Give your agent a name.".to_string()),
+            input_type: "text".to_string(),
+            options: None,
+            required: true,
+            default: Some(Value::String("Assistant".to_string())),
+            validation: Some(WizardValidation {
+                min_length: Some(1),
+                max_length: Some(50),
+                pattern: None,
+            }),
+        },
+        WizardStep {
+            id: "agent_personality".to_string(),
+            title: "Agent Personality".to_string(),
+            description: Some("Describe how your agent should behave.".to_string()),
+            input_type: "textarea".to_string(),
+            options: None,
+            required: false,
+            default: None,
+            validation: Some(WizardValidation {
+                min_length: None,
+                max_length: Some(1000),
+                pattern: None,
+            }),
+        },
+    ]
+}
+
 /// Create steps for a wizard type
 fn create_wizard_steps(wizard_type: &str) -> Vec<WizardStep> {
     match wizard_type {
-        "setup" => vec![
-            WizardStep {
-                id: "welcome".to_string(),
-                title: "Welcome to Moltbot".to_string(),
-                description: Some("Let's get you set up with your AI assistant.".to_string()),
-                input_type: "confirm".to_string(),
-                options: None,
-                required: true,
-                default: Some(Value::Bool(true)),
-                validation: None,
-            },
-            WizardStep {
-                id: "provider".to_string(),
-                title: "Select AI Provider".to_string(),
-                description: Some("Choose your preferred AI model provider.".to_string()),
-                input_type: "select".to_string(),
-                options: Some(vec![
-                    WizardOption {
-                        value: "anthropic".to_string(),
-                        label: "Anthropic (Claude)".to_string(),
-                        description: Some("Recommended for most users".to_string()),
-                    },
-                    WizardOption {
-                        value: "openai".to_string(),
-                        label: "OpenAI (GPT)".to_string(),
-                        description: None,
-                    },
-                ]),
-                required: true,
-                default: Some(Value::String("anthropic".to_string())),
-                validation: None,
-            },
-            WizardStep {
-                id: "api_key".to_string(),
-                title: "Enter API Key".to_string(),
-                description: Some("Enter your API key for the selected provider.".to_string()),
-                input_type: "password".to_string(),
-                options: None,
-                required: true,
-                default: None,
-                validation: Some(WizardValidation {
-                    min_length: Some(10),
-                    max_length: Some(256),
-                    pattern: None,
-                }),
-            },
-            WizardStep {
-                id: "complete".to_string(),
-                title: "Setup Complete".to_string(),
-                description: Some(
-                    "You're all set! Start chatting with your assistant.".to_string(),
-                ),
-                input_type: "confirm".to_string(),
-                options: None,
-                required: true,
-                default: Some(Value::Bool(true)),
-                validation: None,
-            },
-        ],
-        "channel" => vec![
-            WizardStep {
-                id: "channel_type".to_string(),
-                title: "Select Channel".to_string(),
-                description: Some("Choose a messaging channel to configure.".to_string()),
-                input_type: "select".to_string(),
-                options: Some(vec![
-                    WizardOption {
-                        value: "telegram".to_string(),
-                        label: "Telegram".to_string(),
-                        description: None,
-                    },
-                    WizardOption {
-                        value: "discord".to_string(),
-                        label: "Discord".to_string(),
-                        description: None,
-                    },
-                    WizardOption {
-                        value: "slack".to_string(),
-                        label: "Slack".to_string(),
-                        description: None,
-                    },
-                ]),
-                required: true,
-                default: None,
-                validation: None,
-            },
-            WizardStep {
-                id: "channel_token".to_string(),
-                title: "Enter Bot Token".to_string(),
-                description: Some("Enter the bot token for your channel.".to_string()),
-                input_type: "password".to_string(),
-                options: None,
-                required: true,
-                default: None,
-                validation: Some(WizardValidation {
-                    min_length: Some(10),
-                    max_length: None,
-                    pattern: None,
-                }),
-            },
-        ],
-        "agent" => vec![
-            WizardStep {
-                id: "agent_name".to_string(),
-                title: "Agent Name".to_string(),
-                description: Some("Give your agent a name.".to_string()),
-                input_type: "text".to_string(),
-                options: None,
-                required: true,
-                default: Some(Value::String("Assistant".to_string())),
-                validation: Some(WizardValidation {
-                    min_length: Some(1),
-                    max_length: Some(50),
-                    pattern: None,
-                }),
-            },
-            WizardStep {
-                id: "agent_personality".to_string(),
-                title: "Agent Personality".to_string(),
-                description: Some("Describe how your agent should behave.".to_string()),
-                input_type: "textarea".to_string(),
-                options: None,
-                required: false,
-                default: None,
-                validation: Some(WizardValidation {
-                    min_length: None,
-                    max_length: Some(1000),
-                    pattern: None,
-                }),
-            },
-        ],
+        "setup" => setup_wizard_steps(),
+        "channel" => channel_wizard_steps(),
+        "agent" => agent_wizard_steps(),
         _ => vec![WizardStep {
             id: "generic".to_string(),
             title: "Configuration".to_string(),

@@ -86,7 +86,6 @@ pub async fn retention_cleanup_loop(
     }
 
     let interval = Duration::from_secs(u64::from(config.interval_hours) * 3600);
-    let startup_delay = Duration::from_secs(30);
 
     info!(
         retention_days = config.retention_days,
@@ -94,13 +93,7 @@ pub async fn retention_cleanup_loop(
         "Session retention cleanup scheduled"
     );
 
-    // Wait for the startup delay (or shutdown).
-    tokio::select! {
-        _ = tokio::time::sleep(startup_delay) => {}
-        _ = shutdown.changed() => return,
-    }
-
-    if *shutdown.borrow() {
+    if !wait_for_startup_delay(&mut shutdown).await {
         return;
     }
 
@@ -124,6 +117,19 @@ pub async fn retention_cleanup_loop(
 
         run_cleanup(&store, config.retention_days);
     }
+}
+
+/// Wait for the initial startup delay, returning `false` if shutdown was
+/// signalled before the delay elapsed.
+async fn wait_for_startup_delay(shutdown: &mut watch::Receiver<bool>) -> bool {
+    let startup_delay = Duration::from_secs(30);
+
+    tokio::select! {
+        _ = tokio::time::sleep(startup_delay) => {}
+        _ = shutdown.changed() => return false,
+    }
+
+    !*shutdown.borrow()
 }
 
 /// Execute a single cleanup pass, logging the result.

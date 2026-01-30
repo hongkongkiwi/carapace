@@ -855,8 +855,19 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
             RuntimeError::WasmtimeError(format!("Failed to create host instance in linker: {}", e))
         })?;
 
-        // ---- Logging (sync) ----
+        Self::add_logging_fns(&mut host_instance)?;
+        Self::add_config_fns(&mut host_instance)?;
+        Self::add_credential_fns(&mut host_instance)?;
+        Self::add_http_fns(&mut host_instance)?;
+        Self::add_media_fns(&mut host_instance)?;
 
+        Ok(())
+    }
+
+    /// Register logging host functions (sync).
+    fn add_logging_fns(
+        host_instance: &mut wasmtime::component::LinkerInstance<'_, HostState<B>>,
+    ) -> Result<(), RuntimeError> {
         host_instance
             .func_wrap(
                 "log-debug",
@@ -901,8 +912,13 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
             )
             .map_err(|e| RuntimeError::WasmtimeError(format!("Failed to bind log-error: {}", e)))?;
 
-        // ---- Config (sync) ----
+        Ok(())
+    }
 
+    /// Register config host functions (sync).
+    fn add_config_fns(
+        host_instance: &mut wasmtime::component::LinkerInstance<'_, HostState<B>>,
+    ) -> Result<(), RuntimeError> {
         host_instance
             .func_wrap(
                 "config-get",
@@ -917,8 +933,13 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
                 RuntimeError::WasmtimeError(format!("Failed to bind config-get: {}", e))
             })?;
 
-        // ---- Credentials (async) ----
+        Ok(())
+    }
 
+    /// Register credential host functions (async).
+    fn add_credential_fns(
+        host_instance: &mut wasmtime::component::LinkerInstance<'_, HostState<B>>,
+    ) -> Result<(), RuntimeError> {
         host_instance
             .func_wrap_async(
                 "credential-get",
@@ -966,8 +987,13 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
                 RuntimeError::WasmtimeError(format!("Failed to bind credential-set: {}", e))
             })?;
 
-        // ---- HTTP (async) ----
+        Ok(())
+    }
 
+    /// Register HTTP host functions (async).
+    fn add_http_fns(
+        host_instance: &mut wasmtime::component::LinkerInstance<'_, HostState<B>>,
+    ) -> Result<(), RuntimeError> {
         host_instance
             .func_wrap_async(
                 "http-fetch",
@@ -1004,8 +1030,13 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
                 RuntimeError::WasmtimeError(format!("Failed to bind http-fetch: {}", e))
             })?;
 
-        // ---- Media (async) ----
+        Ok(())
+    }
 
+    /// Register media host functions (async).
+    fn add_media_fns(
+        host_instance: &mut wasmtime::component::LinkerInstance<'_, HostState<B>>,
+    ) -> Result<(), RuntimeError> {
         host_instance
             .func_wrap_async(
                 "media-fetch",

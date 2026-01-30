@@ -12,6 +12,115 @@ use tracing::{info, warn};
 use crate::agent;
 use crate::agent::provider::MultiProvider;
 
+/// Try to build a provider from an API key + optional base URL.
+///
+/// This is the shared pattern for Anthropic, OpenAI, and Gemini providers:
+/// resolve an API key (env var or config), optionally apply a base URL,
+/// and wrap in `Arc<dyn LlmProvider>`.
+fn try_build_provider<P: agent::LlmProvider + 'static>(
+    api_key: Option<String>,
+    base_url: Option<String>,
+    provider_name: &str,
+    make: impl FnOnce(String) -> Result<P, agent::AgentError>,
+    set_base_url: impl FnOnce(P, String) -> Result<P, agent::AgentError>,
+) -> Result<Option<Arc<dyn agent::LlmProvider>>, Box<dyn std::error::Error>> {
+    let key = match api_key {
+        Some(k) => k,
+        None => return Ok(None),
+    };
+    match make(key) {
+        Ok(provider) => {
+            let provider = if let Some(url) = base_url {
+                match set_base_url(provider, url) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!("Invalid {}_BASE_URL: {}", provider_name.to_uppercase(), e);
+                        return Err(e.into());
+                    }
+                }
+            } else {
+                provider
+            };
+            info!("LLM provider configured: {}", provider_name);
+            Ok(Some(Arc::new(provider)))
+        }
+        Err(e) => {
+            warn!("Failed to configure {} provider: {}", provider_name, e);
+            Ok(None)
+        }
+    }
+}
+
+/// Try to build the Ollama provider with optional base URL, API key, and
+/// a non-blocking connectivity check.
+fn try_build_ollama_provider(
+    cfg: &Value,
+) -> Result<Option<Arc<dyn agent::LlmProvider>>, Box<dyn std::error::Error>> {
+    let ollama_providers_cfg = cfg.get("providers").and_then(|v| v.get("ollama"));
+    let ollama_base_url = std::env::var("OLLAMA_BASE_URL").ok().or_else(|| {
+        ollama_providers_cfg
+            .and_then(|v| v.get("baseUrl"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+    let ollama_api_key = ollama_providers_cfg
+        .and_then(|v| v.get("apiKey"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let ollama_explicitly_configured = ollama_base_url.is_some() || ollama_providers_cfg.is_some();
+    if !ollama_explicitly_configured {
+        return Ok(None);
+    }
+
+    match agent::ollama::OllamaProvider::new() {
+        Ok(provider) => {
+            let provider = if let Some(url) = ollama_base_url {
+                match provider.with_base_url(url) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!("Invalid OLLAMA_BASE_URL: {}", e);
+                        return Err(e.into());
+                    }
+                }
+            } else {
+                provider
+            };
+            let provider = if let Some(key) = ollama_api_key {
+                provider.with_api_key(key)
+            } else {
+                provider
+            };
+            info!("LLM provider configured: Ollama ({})", provider.base_url());
+            // Connectivity check (non-blocking, best-effort)
+            let provider = Arc::new(provider);
+            let provider_clone = Arc::clone(&provider);
+            tokio::spawn(async move {
+                match provider_clone.check_connectivity().await {
+                    Ok(models) => {
+                        if models.is_empty() {
+                            info!("Ollama connected (no models pulled yet)");
+                        } else {
+                            info!("Ollama connected, available models: {}", models.join(", "));
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Ollama connectivity check failed: {} (provider will remain configured, requests may fail until Ollama is reachable)",
+                            e
+                        );
+                    }
+                }
+            });
+            Ok(Some(provider))
+        }
+        Err(e) => {
+            warn!("Failed to configure Ollama provider: {}", e);
+            Ok(None)
+        }
+    }
+}
+
 /// Build all configured LLM providers from the config and environment.
 ///
 /// Returns `None` if no providers are configured.
@@ -29,33 +138,13 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     });
-
-    let anthropic_provider: Option<Arc<dyn agent::LlmProvider>> =
-        if let Some(key) = anthropic_api_key {
-            match agent::anthropic::AnthropicProvider::new(key) {
-                Ok(provider) => {
-                    let provider = if let Some(url) = anthropic_base_url {
-                        match provider.with_base_url(url) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                warn!("Invalid ANTHROPIC_BASE_URL: {}", e);
-                                return Err(e.into());
-                            }
-                        }
-                    } else {
-                        provider
-                    };
-                    info!("LLM provider configured: Anthropic");
-                    Some(Arc::new(provider))
-                }
-                Err(e) => {
-                    warn!("Failed to configure Anthropic provider: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
+    let anthropic_provider = try_build_provider(
+        anthropic_api_key,
+        anthropic_base_url,
+        "Anthropic",
+        agent::anthropic::AnthropicProvider::new,
+        |p, url| p.with_base_url(url),
+    )?;
 
     // OpenAI
     let openai_api_key = std::env::var("OPENAI_API_KEY").ok().or_else(|| {
@@ -70,97 +159,16 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     });
-
-    let openai_provider: Option<Arc<dyn agent::LlmProvider>> = if let Some(key) = openai_api_key {
-        match agent::openai::OpenAiProvider::new(key) {
-            Ok(provider) => {
-                let provider = if let Some(url) = openai_base_url {
-                    match provider.with_base_url(url) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            warn!("Invalid OPENAI_BASE_URL: {}", e);
-                            return Err(e.into());
-                        }
-                    }
-                } else {
-                    provider
-                };
-                info!("LLM provider configured: OpenAI");
-                Some(Arc::new(provider))
-            }
-            Err(e) => {
-                warn!("Failed to configure OpenAI provider: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let openai_provider = try_build_provider(
+        openai_api_key,
+        openai_base_url,
+        "OpenAI",
+        agent::openai::OpenAiProvider::new,
+        |p, url| p.with_base_url(url),
+    )?;
 
     // Ollama
-    let ollama_providers_cfg = cfg.get("providers").and_then(|v| v.get("ollama"));
-    let ollama_base_url = std::env::var("OLLAMA_BASE_URL").ok().or_else(|| {
-        ollama_providers_cfg
-            .and_then(|v| v.get("baseUrl"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    });
-    let ollama_api_key = ollama_providers_cfg
-        .and_then(|v| v.get("apiKey"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    let ollama_explicitly_configured = ollama_base_url.is_some() || ollama_providers_cfg.is_some();
-    let ollama_provider: Option<Arc<dyn agent::LlmProvider>> = if ollama_explicitly_configured {
-        match agent::ollama::OllamaProvider::new() {
-            Ok(provider) => {
-                let provider = if let Some(url) = ollama_base_url {
-                    match provider.with_base_url(url) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            warn!("Invalid OLLAMA_BASE_URL: {}", e);
-                            return Err(e.into());
-                        }
-                    }
-                } else {
-                    provider
-                };
-                let provider = if let Some(key) = ollama_api_key {
-                    provider.with_api_key(key)
-                } else {
-                    provider
-                };
-                info!("LLM provider configured: Ollama ({})", provider.base_url());
-                // Connectivity check (non-blocking, best-effort)
-                let provider = Arc::new(provider);
-                let provider_clone = Arc::clone(&provider);
-                tokio::spawn(async move {
-                    match provider_clone.check_connectivity().await {
-                        Ok(models) => {
-                            if models.is_empty() {
-                                info!("Ollama connected (no models pulled yet)");
-                            } else {
-                                info!("Ollama connected, available models: {}", models.join(", "));
-                            }
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Ollama connectivity check failed: {} (provider will remain configured, requests may fail until Ollama is reachable)",
-                                e
-                            );
-                        }
-                    }
-                });
-                Some(provider)
-            }
-            Err(e) => {
-                warn!("Failed to configure Ollama provider: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let ollama_provider = try_build_ollama_provider(cfg)?;
 
     // Gemini
     let google_api_key = std::env::var("GOOGLE_API_KEY").ok().or_else(|| {
@@ -175,32 +183,13 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     });
-
-    let gemini_provider: Option<Arc<dyn agent::LlmProvider>> = if let Some(key) = google_api_key {
-        match agent::gemini::GeminiProvider::new(key) {
-            Ok(provider) => {
-                let provider = if let Some(url) = google_base_url {
-                    match provider.with_base_url(url) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            warn!("Invalid GOOGLE_API_BASE_URL: {}", e);
-                            return Err(e.into());
-                        }
-                    }
-                } else {
-                    provider
-                };
-                info!("LLM provider configured: Gemini");
-                Some(Arc::new(provider))
-            }
-            Err(e) => {
-                warn!("Failed to configure Gemini provider: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let gemini_provider = try_build_provider(
+        google_api_key,
+        google_base_url,
+        "Gemini",
+        agent::gemini::GeminiProvider::new,
+        |p, url| p.with_base_url(url),
+    )?;
 
     // Build multi-provider dispatcher
     let multi_provider = MultiProvider::new(anthropic_provider, openai_provider)

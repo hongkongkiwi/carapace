@@ -118,217 +118,15 @@ mod golden_trace {
     fn normalize_value(value: &mut Value) {
         match value {
             Value::Object(map) => {
-                // Replace session arrays with a placeholder to avoid disk-state dependency.
-                // The session store reads from disk, so the count varies between runs.
-                if map.contains_key("sessions") {
-                    if let Some(Value::Array(_)) = map.get("sessions") {
-                        map.insert("sessions".to_string(), json!("<SESSIONS_LIST>"));
-                    }
-                }
-
-                // Replace the "recent" sessions array in status output.
-                if map.contains_key("recent") {
-                    if let Some(Value::Array(_)) = map.get("recent") {
-                        map.insert("recent".to_string(), json!("<RECENT_LIST>"));
-                    }
-                }
-
-                // Normalize config-related fields that depend on filesystem.
-                if map.contains_key("raw") && map.contains_key("parsed") {
-                    // This is a config snapshot response; normalize volatile fields.
-                    if let Some(raw) = map.get("raw") {
-                        if raw.is_string() || raw.is_null() {
-                            map.insert("raw".to_string(), json!("<CONFIG_RAW>"));
-                        }
-                    }
-                    if map.contains_key("parsed") {
-                        map.insert("parsed".to_string(), json!("<CONFIG_PARSED>"));
-                    }
-                    if map.contains_key("config") {
-                        map.insert("config".to_string(), json!("<CONFIG_DATA>"));
-                    }
-                    // exists/valid depend on whether a config file is on disk.
-                    if map.contains_key("exists") {
-                        map.insert("exists".to_string(), json!("<CONFIG_EXISTS>"));
-                    }
-                    if map.contains_key("valid") {
-                        map.insert("valid".to_string(), json!("<CONFIG_VALID>"));
-                    }
-                    if let Some(hash) = map.get("hash") {
-                        if hash.is_string() || hash.is_null() {
-                            map.insert("hash".to_string(), json!("<CONFIG_HASH>"));
-                        }
-                    }
-                    if map.contains_key("issues") {
-                        // Keep structure but note it is present
-                        // (issues depend on config file content)
-                        map.insert("issues".to_string(), json!("<CONFIG_ISSUES>"));
-                    }
-                }
-
-                // exec.approvals.get response — depends on whether the approvals
-                // file exists on disk.
-                if map.contains_key("exists")
-                    && map.contains_key("file")
-                    && map.contains_key("hash")
-                {
-                    map.insert("exists".to_string(), json!("<APPROVALS_EXISTS>"));
-                    if let Some(hash) = map.get("hash") {
-                        if hash.is_string() || hash.is_null() {
-                            map.insert("hash".to_string(), json!("<APPROVALS_HASH>"));
-                        }
-                    }
-                    if let Some(Value::Object(file_obj)) = map.get_mut("file") {
-                        if let Some(mode) = file_obj.get_mut("mode") {
-                            *mode = json!("<APPROVALS_MODE>");
-                        }
-                    }
-                }
-
-                // Normalize config key lookup responses (config.get with a key param).
-                // The value depends on config file content on disk.
-                if map.contains_key("key") && map.contains_key("value") {
-                    if let Some(Value::String(_)) = map.get("key") {
-                        map.insert("value".to_string(), json!("<CONFIG_VALUE>"));
-                    }
-                }
-
-                // Normalize the "count" field for sessions when it depends on disk.
-                if map.contains_key("count") && map.contains_key("defaults") {
-                    // This is a sessions.list response.
-                    map.insert("count".to_string(), json!("<SESSION_COUNT>"));
-                }
-
-                // Normalize session count in status response.
-                if map.contains_key("count") && map.contains_key("recent") {
-                    map.insert("count".to_string(), json!("<SESSION_COUNT>"));
-                }
-
-                // Normalize boolean fields that depend on global static state
-                // (LazyLock<RwLock<...>>) which can be mutated by other tests
-                // running in parallel, or config files on disk.
-                //
-                // Specifically: usage.status reads from USAGE_STATE + config,
-                // tts.status reads from TTS_STATE, talk.status reads from TALK_STATE.
-                if map.contains_key("tracking") && map.contains_key("summary") {
-                    // This is a usage.status response.
-                    // All fields depend on global USAGE_STATE + config file.
-                    if let Some(val) = map.get_mut("enabled") {
-                        *val = json!("<ENABLED>");
-                    }
-                    if let Some(val) = map.get_mut("tracking") {
-                        *val = json!("<TRACKING>");
-                    }
-                    if let Some(val) = map.get_mut("sessionCount") {
-                        *val = json!("<USAGE_SESSION_COUNT>");
-                    }
-                    if let Some(val) = map.get_mut("providerCount") {
-                        *val = json!("<USAGE_PROVIDER_COUNT>");
-                    }
-                    if let Some(Value::Object(summary)) = map.get_mut("summary") {
-                        for (_, v) in summary.iter_mut() {
-                            *v = json!("<USAGE_METRIC>");
-                        }
-                    }
-                }
-
-                // Normalize mutable fields for TTS and Talk which use global
-                // LazyLock state that can be mutated by parallel tests.
-                if map.contains_key("provider") && map.contains_key("voice") {
-                    // tts.status response - all fields are global mutable state.
-                    for tts_key in &["enabled", "provider", "voice", "rate", "pitch", "volume"] {
-                        if let Some(val) = map.get_mut(*tts_key) {
-                            *val = json!(format!("<TTS_{}>", tts_key.to_uppercase()));
-                        }
-                    }
-                }
-                // tts.providers response — "current" depends on global TTS state.
-                if map.contains_key("current") && map.contains_key("providers") {
-                    if let Some(val) = map.get_mut("current") {
-                        *val = json!("<TTS_CURRENT>");
-                    }
-                }
-                if map.contains_key("active") && map.contains_key("availableModes") {
-                    // talk.status response - mutable fields from global state.
-                    for talk_key in &[
-                        "active",
-                        "mode",
-                        "vadThreshold",
-                        "silenceTimeoutMs",
-                        "autoRespond",
-                        "inputDevice",
-                        "outputDevice",
-                    ] {
-                        if let Some(val) = map.get_mut(*talk_key) {
-                            *val = json!(format!("<TALK_{}>", talk_key.to_uppercase()));
-                        }
-                    }
-                }
+                normalize_session_fields(map);
+                normalize_config_fields(map);
+                normalize_approvals_fields(map);
+                normalize_count_fields(map);
+                normalize_usage_fields(map);
+                normalize_tts_talk_fields(map);
 
                 for (key, val) in map.iter_mut() {
-                    // Replace timestamp-like numeric fields with a placeholder.
-                    if (key.ends_with("_ms")
-                        || key.ends_with("Ms")
-                        || key.ends_with("At")
-                        || key.ends_with("_at")
-                        || key.ends_with("AtMs")
-                        || key == "timestamp"
-                        || key == "time"
-                        || key == "uptime"
-                        || key == "uptimeMs"
-                        || key == "ts"
-                        || key == "nextRunAtMs"
-                        || key == "lastCheckAt")
-                        && val.is_number()
-                    {
-                        *val = json!("<TIMESTAMP>");
-                    }
-
-                    // Replace UUID-like string fields with a placeholder.
-                    if key == "id" || key == "connId" || key == "sessionId" || key.ends_with("Id") {
-                        if let Some(s) = val.as_str() {
-                            if s.len() >= 32 && s.contains('-') {
-                                *val = json!("<UUID>");
-                            }
-                        }
-                    }
-
-                    // Replace file-system paths with a placeholder.
-                    if key == "path"
-                        || key == "file"
-                        || key == "storePath"
-                        || key == "workspaceDir"
-                        || key == "managedSkillsDir"
-                    {
-                        if let Some(s) = val.as_str() {
-                            if s.contains('/') || s.contains('\\') {
-                                *val = json!("<PATH>");
-                            }
-                        }
-                    }
-
-                    // Replace host-name field to avoid machine-specific snapshots.
-                    if key == "host" && val.is_string() {
-                        *val = json!("<HOST>");
-                    }
-
-                    // Replace version field from cargo to avoid build-specific diffs.
-                    if key == "version" {
-                        if let Some(s) = val.as_str() {
-                            if s.contains('.')
-                                && s.chars().next().is_some_and(|c| c.is_ascii_digit())
-                            {
-                                *val = json!("<VERSION>");
-                            }
-                        }
-                    }
-
-                    // Replace the currentVersion field (update status).
-                    if key == "currentVersion" && (val.is_string() || val.is_null()) {
-                        *val = json!("<VERSION>");
-                    }
-
-                    // Recurse into nested values.
+                    normalize_per_key_field(key, val);
                     normalize_value(val);
                 }
             }
@@ -338,6 +136,201 @@ mod golden_trace {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Normalize session-related array fields.
+    fn normalize_session_fields(map: &mut serde_json::Map<String, Value>) {
+        if let Some(Value::Array(_)) = map.get("sessions") {
+            map.insert("sessions".to_string(), json!("<SESSIONS_LIST>"));
+        }
+        if let Some(Value::Array(_)) = map.get("recent") {
+            map.insert("recent".to_string(), json!("<RECENT_LIST>"));
+        }
+    }
+
+    /// Normalize config snapshot response fields.
+    fn normalize_config_fields(map: &mut serde_json::Map<String, Value>) {
+        // Config snapshot response (has both "raw" and "parsed" keys)
+        if map.contains_key("raw") && map.contains_key("parsed") {
+            if let Some(raw) = map.get("raw") {
+                if raw.is_string() || raw.is_null() {
+                    map.insert("raw".to_string(), json!("<CONFIG_RAW>"));
+                }
+            }
+            if map.contains_key("parsed") {
+                map.insert("parsed".to_string(), json!("<CONFIG_PARSED>"));
+            }
+            if map.contains_key("config") {
+                map.insert("config".to_string(), json!("<CONFIG_DATA>"));
+            }
+            if map.contains_key("exists") {
+                map.insert("exists".to_string(), json!("<CONFIG_EXISTS>"));
+            }
+            if map.contains_key("valid") {
+                map.insert("valid".to_string(), json!("<CONFIG_VALID>"));
+            }
+            if let Some(hash) = map.get("hash") {
+                if hash.is_string() || hash.is_null() {
+                    map.insert("hash".to_string(), json!("<CONFIG_HASH>"));
+                }
+            }
+            if map.contains_key("issues") {
+                map.insert("issues".to_string(), json!("<CONFIG_ISSUES>"));
+            }
+        }
+
+        // Config key lookup responses (config.get with a key param)
+        if map.contains_key("key") && map.contains_key("value") {
+            if let Some(Value::String(_)) = map.get("key") {
+                map.insert("value".to_string(), json!("<CONFIG_VALUE>"));
+            }
+        }
+    }
+
+    /// Normalize approvals-related fields.
+    fn normalize_approvals_fields(map: &mut serde_json::Map<String, Value>) {
+        if !(map.contains_key("exists") && map.contains_key("file") && map.contains_key("hash")) {
+            return;
+        }
+        map.insert("exists".to_string(), json!("<APPROVALS_EXISTS>"));
+        if let Some(hash) = map.get("hash") {
+            if hash.is_string() || hash.is_null() {
+                map.insert("hash".to_string(), json!("<APPROVALS_HASH>"));
+            }
+        }
+        if let Some(Value::Object(file_obj)) = map.get_mut("file") {
+            if let Some(mode) = file_obj.get_mut("mode") {
+                *mode = json!("<APPROVALS_MODE>");
+            }
+        }
+    }
+
+    /// Normalize session and status count fields.
+    fn normalize_count_fields(map: &mut serde_json::Map<String, Value>) {
+        if map.contains_key("count") && map.contains_key("defaults") {
+            map.insert("count".to_string(), json!("<SESSION_COUNT>"));
+        }
+        if map.contains_key("count") && map.contains_key("recent") {
+            map.insert("count".to_string(), json!("<SESSION_COUNT>"));
+        }
+    }
+
+    /// Normalize usage.status response fields.
+    fn normalize_usage_fields(map: &mut serde_json::Map<String, Value>) {
+        if !(map.contains_key("tracking") && map.contains_key("summary")) {
+            return;
+        }
+        if let Some(val) = map.get_mut("enabled") {
+            *val = json!("<ENABLED>");
+        }
+        if let Some(val) = map.get_mut("tracking") {
+            *val = json!("<TRACKING>");
+        }
+        if let Some(val) = map.get_mut("sessionCount") {
+            *val = json!("<USAGE_SESSION_COUNT>");
+        }
+        if let Some(val) = map.get_mut("providerCount") {
+            *val = json!("<USAGE_PROVIDER_COUNT>");
+        }
+        if let Some(Value::Object(summary)) = map.get_mut("summary") {
+            for (_, v) in summary.iter_mut() {
+                *v = json!("<USAGE_METRIC>");
+            }
+        }
+    }
+
+    /// Normalize TTS and Talk global-state fields.
+    fn normalize_tts_talk_fields(map: &mut serde_json::Map<String, Value>) {
+        if map.contains_key("provider") && map.contains_key("voice") {
+            for tts_key in &["enabled", "provider", "voice", "rate", "pitch", "volume"] {
+                if let Some(val) = map.get_mut(*tts_key) {
+                    *val = json!(format!("<TTS_{}>", tts_key.to_uppercase()));
+                }
+            }
+        }
+        if map.contains_key("current") && map.contains_key("providers") {
+            if let Some(val) = map.get_mut("current") {
+                *val = json!("<TTS_CURRENT>");
+            }
+        }
+        if map.contains_key("active") && map.contains_key("availableModes") {
+            for talk_key in &[
+                "active",
+                "mode",
+                "vadThreshold",
+                "silenceTimeoutMs",
+                "autoRespond",
+                "inputDevice",
+                "outputDevice",
+            ] {
+                if let Some(val) = map.get_mut(*talk_key) {
+                    *val = json!(format!("<TALK_{}>", talk_key.to_uppercase()));
+                }
+            }
+        }
+    }
+
+    /// Normalize a single key-value pair for volatile fields (timestamps, UUIDs, paths, etc.).
+    fn normalize_per_key_field(key: &str, val: &mut Value) {
+        // Replace timestamp-like numeric fields.
+        if (key.ends_with("_ms")
+            || key.ends_with("Ms")
+            || key.ends_with("At")
+            || key.ends_with("_at")
+            || key.ends_with("AtMs")
+            || key == "timestamp"
+            || key == "time"
+            || key == "uptime"
+            || key == "uptimeMs"
+            || key == "ts"
+            || key == "nextRunAtMs"
+            || key == "lastCheckAt")
+            && val.is_number()
+        {
+            *val = json!("<TIMESTAMP>");
+        }
+
+        // Replace UUID-like string fields.
+        if key == "id" || key == "connId" || key == "sessionId" || key.ends_with("Id") {
+            if let Some(s) = val.as_str() {
+                if s.len() >= 32 && s.contains('-') {
+                    *val = json!("<UUID>");
+                }
+            }
+        }
+
+        // Replace file-system paths.
+        if key == "path"
+            || key == "file"
+            || key == "storePath"
+            || key == "workspaceDir"
+            || key == "managedSkillsDir"
+        {
+            if let Some(s) = val.as_str() {
+                if s.contains('/') || s.contains('\\') {
+                    *val = json!("<PATH>");
+                }
+            }
+        }
+
+        // Replace host-name field.
+        if key == "host" && val.is_string() {
+            *val = json!("<HOST>");
+        }
+
+        // Replace version field.
+        if key == "version" {
+            if let Some(s) = val.as_str() {
+                if s.contains('.') && s.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                    *val = json!("<VERSION>");
+                }
+            }
+        }
+
+        // Replace the currentVersion field (update status).
+        if key == "currentVersion" && (val.is_string() || val.is_null()) {
+            *val = json!("<VERSION>");
         }
     }
 

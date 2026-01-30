@@ -89,7 +89,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Run the gateway server (the original `main` logic).
 async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Initialize logging
+    init_logging_from_env()?;
+    let cfg = load_and_validate_config()?;
+
+    let state_dir = server::ws::resolve_state_dir();
+    std::fs::create_dir_all(&state_dir)?;
+    std::fs::create_dir_all(state_dir.join("sessions"))?;
+
+    let resolved = resolve_bind_config(&cfg)?;
+    let ws_state = server::ws::build_ws_state_from_config().await?;
+    let ws_state = configure_ws_with_llm(ws_state, &cfg)?;
+    let ws_state = register_console_channel(ws_state)?;
+
+    let http_config = server::http::build_http_config(&cfg);
+    let tls_setup = setup_optional_tls(&cfg)?;
+
+    log_startup_banner(&tls_setup, &resolved, &state_dir, &ws_state);
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    spawn_network_services(&cfg, &tls_setup, resolved.address.port(), &shutdown_rx);
+
+    if let Some(tls_result) = tls_setup {
+        launch_tls_server(
+            tls_result,
+            http_config,
+            &ws_state,
+            &cfg,
+            &shutdown_rx,
+            shutdown_tx,
+            resolved.address,
+        )
+        .await?;
+    } else {
+        launch_non_tls_server(ws_state, http_config, cfg, resolved.address).await?;
+    }
+
+    info!("Gateway shut down");
+    Ok(())
+}
+
+/// Initialize logging based on the MOLTBOT_DEV environment variable.
+fn init_logging_from_env() -> Result<(), Box<dyn std::error::Error>> {
     let log_config = if std::env::var("MOLTBOT_DEV")
         .map(|v| !v.is_empty() && v != "0" && v.to_lowercase() != "false")
         .unwrap_or(false)
@@ -99,39 +139,13 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         logging::LogConfig::production()
     };
     logging::init_logging(log_config)?;
+    Ok(())
+}
 
-    // 2. Load config
-    let cfg = config::load_config().unwrap_or_else(|e| {
-        warn!("Failed to load config: {}, using defaults", e);
-        Value::Object(serde_json::Map::new())
-    });
-
-    // 2b. Schema validation — fail fast on errors, log warnings
-    {
-        let schema_issues = config::schema::validate_schema(&cfg);
-        let mut has_errors = false;
-        for issue in &schema_issues {
-            match issue.severity {
-                config::schema::Severity::Error => {
-                    error!("Config error at {}: {}", issue.path, issue.message);
-                    has_errors = true;
-                }
-                config::schema::Severity::Warning => {
-                    warn!("Config warning at {}: {}", issue.path, issue.message);
-                }
-            }
-        }
-        if has_errors {
-            return Err("Configuration contains errors — aborting startup".into());
-        }
-    }
-
-    // 3. Ensure state directories exist
-    let state_dir = server::ws::resolve_state_dir();
-    std::fs::create_dir_all(&state_dir)?;
-    std::fs::create_dir_all(state_dir.join("sessions"))?;
-
-    // 4. Resolve bind address
+/// Parse the bind address and port from the gateway configuration section.
+fn resolve_bind_config(
+    cfg: &Value,
+) -> Result<server::bind::ResolvedBind, Box<dyn std::error::Error>> {
     let gateway = cfg.get("gateway").and_then(|v| v.as_object());
     let bind_str = gateway
         .and_then(|g| g.get("bind"))
@@ -144,64 +158,131 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(server::bind::DEFAULT_PORT);
 
     let bind_mode = server::bind::parse_bind_mode(bind_str);
-    let resolved = server::bind::resolve_bind_with_metadata(&bind_mode, port)?;
+    Ok(server::bind::resolve_bind_with_metadata(&bind_mode, port)?)
+}
 
-    // 5. Build WsServerState (persistent, with device/node registries)
-    let ws_state = server::ws::build_ws_state_from_config().await?;
-
-    // 6. Configure LLM providers via factory
-    let ws_state = match agent::factory::build_providers(&cfg)? {
+/// Configure LLM providers on the WsServerState via the provider factory.
+fn configure_ws_with_llm(
+    ws_state: Arc<server::ws::WsServerState>,
+    cfg: &Value,
+) -> Result<Arc<server::ws::WsServerState>, Box<dyn std::error::Error>> {
+    match agent::factory::build_providers(cfg)? {
         Some(multi_provider) => {
             let inner = Arc::try_unwrap(ws_state)
                 .map_err(|_| "WsServerState Arc should have single owner at startup")?;
-            Arc::new(inner.with_llm_provider(Arc::new(multi_provider)))
+            Ok(Arc::new(inner.with_llm_provider(Arc::new(multi_provider))))
         }
         None => {
             info!("No LLM provider configured (set ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, and/or configure Ollama to enable)");
-            ws_state
+            Ok(ws_state)
         }
-    };
+    }
+}
 
-    // 6f. Register built-in console channel (for testing/demo)
-    let ws_state = {
-        let plugin_reg = Arc::new(plugins::PluginRegistry::new());
-        plugin_reg.register_channel(
-            "console".to_string(),
-            Arc::new(channels::console::ConsoleChannel::new()),
-        );
-        ws_state.channel_registry().register(
-            channels::ChannelInfo::new("console", "Console")
-                .with_status(channels::ChannelStatus::Connected),
-        );
-        let inner = Arc::try_unwrap(ws_state)
-            .map_err(|_| "WsServerState Arc should have single owner at startup")?;
-        Arc::new(inner.with_plugin_registry(plugin_reg))
-    };
+/// Register the built-in console channel (for testing/demo) on the WsServerState.
+fn register_console_channel(
+    ws_state: Arc<server::ws::WsServerState>,
+) -> Result<Arc<server::ws::WsServerState>, Box<dyn std::error::Error>> {
+    let plugin_reg = Arc::new(plugins::PluginRegistry::new());
+    plugin_reg.register_channel(
+        "console".to_string(),
+        Arc::new(channels::console::ConsoleChannel::new()),
+    );
+    ws_state.channel_registry().register(
+        channels::ChannelInfo::new("console", "Console")
+            .with_status(channels::ChannelStatus::Connected),
+    );
+    let inner = Arc::try_unwrap(ws_state)
+        .map_err(|_| "WsServerState Arc should have single owner at startup")?;
     info!("Console channel registered");
+    Ok(Arc::new(inner.with_plugin_registry(plugin_reg)))
+}
 
-    // 7. Build HTTP config
-    let http_config = server::http::build_http_config(&cfg);
-
-    // 8. Parse TLS configuration
-    let tls_config = tls::parse_tls_config(&cfg);
-    let tls_setup = if tls_config.enabled {
-        match tls::setup_tls(&tls_config) {
-            Ok(result) => {
-                info!("TLS enabled");
-                info!("TLS certificate: {}", result.cert_path.display());
-                info!("TLS fingerprint (SHA-256): {}", result.fingerprint);
-                Some(result)
-            }
-            Err(e) => {
-                error!("Failed to set up TLS: {}", e);
-                return Err(e.into());
-            }
+/// Parse TLS configuration and set up certificates if enabled.
+#[allow(clippy::cognitive_complexity)]
+fn setup_optional_tls(
+    cfg: &Value,
+) -> Result<Option<tls::TlsSetupResult>, Box<dyn std::error::Error>> {
+    let tls_config = tls::parse_tls_config(cfg);
+    if !tls_config.enabled {
+        return Ok(None);
+    }
+    match tls::setup_tls(&tls_config) {
+        Ok(result) => {
+            info!("TLS enabled");
+            info!("TLS certificate: {}", result.cert_path.display());
+            info!("TLS fingerprint (SHA-256): {}", result.fingerprint);
+            Ok(Some(result))
         }
-    } else {
-        None
+        Err(e) => {
+            error!("Failed to set up TLS: {}", e);
+            Err(e.into())
+        }
+    }
+}
+
+/// Launch the non-TLS server path via run_server_with_config.
+async fn launch_non_tls_server(
+    ws_state: Arc<server::ws::WsServerState>,
+    http_config: server::http::HttpConfig,
+    cfg: Value,
+    bind_address: SocketAddr,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let server_config = server::startup::ServerConfig {
+        ws_state: ws_state.clone(),
+        http_config,
+        middleware_config: server::http::MiddlewareConfig::default(),
+        hook_registry: Arc::new(hooks::registry::HookRegistry::new()),
+        tools_registry: Arc::new(plugins::tools::ToolsRegistry::new()),
+        bind_address,
+        raw_config: cfg,
+        spawn_background_tasks: true,
     };
 
-    // 9. Startup banner (printed before server starts listening)
+    let handle = server::startup::run_server_with_config(server_config).await?;
+
+    let reason = await_shutdown_trigger().await;
+    info!("Shutdown signal received ({})", reason);
+    handle.shutdown().await;
+    Ok(())
+}
+
+/// Load configuration from disk and validate it against the schema.
+/// Returns the config on success, or an error if schema validation finds errors.
+fn load_and_validate_config() -> Result<Value, Box<dyn std::error::Error>> {
+    let cfg = config::load_config().unwrap_or_else(|e| {
+        warn!("Failed to load config: {}, using defaults", e);
+        Value::Object(serde_json::Map::new())
+    });
+
+    let schema_issues = config::schema::validate_schema(&cfg);
+    let mut has_errors = false;
+    for issue in &schema_issues {
+        match issue.severity {
+            config::schema::Severity::Error => {
+                error!("Config error at {}: {}", issue.path, issue.message);
+                has_errors = true;
+            }
+            config::schema::Severity::Warning => {
+                warn!("Config warning at {}: {}", issue.path, issue.message);
+            }
+        }
+    }
+    if has_errors {
+        return Err("Configuration contains errors — aborting startup".into());
+    }
+
+    Ok(cfg)
+}
+
+/// Log the startup banner with version, bind info, state dir, and LLM/cron status.
+#[allow(clippy::cognitive_complexity)]
+fn log_startup_banner(
+    tls_setup: &Option<tls::TlsSetupResult>,
+    resolved: &server::bind::ResolvedBind,
+    state_dir: &std::path::Path,
+    ws_state: &Arc<server::ws::WsServerState>,
+) {
     info!("Carapace gateway v{}", env!("CARGO_PKG_VERSION"));
     let protocol = if tls_setup.is_some() { "https" } else { "http" };
     info!(
@@ -220,11 +301,16 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     if cron_count > 0 {
         info!("Cron jobs loaded: {}", cron_count);
     }
+}
 
-    // 10. Start mDNS discovery (need a shutdown_rx for all paths)
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-
-    let discovery_config = discovery::build_discovery_config(&cfg);
+/// Spawn mDNS discovery and Tailscale serve/funnel background tasks.
+fn spawn_network_services(
+    cfg: &Value,
+    tls_setup: &Option<tls::TlsSetupResult>,
+    port: u16,
+    shutdown_rx: &tokio::sync::watch::Receiver<bool>,
+) {
+    let discovery_config = discovery::build_discovery_config(cfg);
     if discovery_config.mode.is_enabled() {
         let tls_fingerprint = tls_setup.as_ref().map(|t| t.fingerprint.clone());
         let device_name = discovery::resolve_service_name(&discovery_config);
@@ -242,8 +328,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         ));
     }
 
-    // 10b. Start Tailscale serve/funnel (if configured)
-    let tailscale_config = tailscale::build_tailscale_config(&cfg, port);
+    let tailscale_config = tailscale::build_tailscale_config(cfg, port);
     if tailscale_config.mode != tailscale::TailscaleMode::Off {
         let ts_shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
@@ -253,71 +338,53 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+}
 
-    // 11. Start server (TLS vs non-TLS)
-    if let Some(tls_result) = tls_setup {
-        // TLS-enabled server using axum-server with rustls.
-        // This path stays inline because axum_server doesn't expose
-        // local_addr before serving, so it can't return a ServerHandle.
-        let http_router = server::http::create_router_with_state(
-            http_config,
-            server::http::MiddlewareConfig::default(),
-            Arc::new(hooks::registry::HookRegistry::new()),
-            Arc::new(plugins::tools::ToolsRegistry::new()),
-            ws_state.channel_registry().clone(),
-            Some(ws_state.clone()),
-        );
+/// Assemble and serve the TLS-enabled server path.
+async fn launch_tls_server(
+    tls_result: tls::TlsSetupResult,
+    http_config: server::http::HttpConfig,
+    ws_state: &Arc<server::ws::WsServerState>,
+    cfg: &Value,
+    shutdown_rx: &tokio::sync::watch::Receiver<bool>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    addr: SocketAddr,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let http_router = server::http::create_router_with_state(
+        http_config,
+        server::http::MiddlewareConfig::default(),
+        Arc::new(hooks::registry::HookRegistry::new()),
+        Arc::new(plugins::tools::ToolsRegistry::new()),
+        ws_state.channel_registry().clone(),
+        Some(ws_state.clone()),
+    );
 
-        let ws_router = Router::new()
-            .route("/ws", get(server::ws::ws_handler))
-            .with_state(ws_state.clone());
+    let ws_router = Router::new()
+        .route("/ws", get(server::ws::ws_handler))
+        .with_state(ws_state.clone());
 
-        let app = http_router.merge(ws_router);
+    let app = http_router.merge(ws_router);
 
-        // Spawn background tasks
-        server::startup::spawn_background_tasks(&ws_state, &cfg, &shutdown_rx);
+    // Spawn background tasks
+    server::startup::spawn_background_tasks(ws_state, cfg, shutdown_rx);
 
-        let rustls_config =
-            axum_server::tls_rustls::RustlsConfig::from_config(tls_result.server_config);
-        let addr = resolved.address;
+    let rustls_config =
+        axum_server::tls_rustls::RustlsConfig::from_config(tls_result.server_config);
 
-        let handle = axum_server::Handle::new();
-        let shutdown_handle = handle.clone();
+    let handle = axum_server::Handle::new();
+    let shutdown_handle = handle.clone();
+    let ws_state_clone = ws_state.clone();
 
-        tokio::spawn(async move {
-            shutdown_signal(shutdown_tx, ws_state.clone()).await;
-            shutdown_handle.graceful_shutdown(Some(Duration::from_secs(30)));
-        });
+    tokio::spawn(async move {
+        shutdown_signal(shutdown_tx, ws_state_clone).await;
+        shutdown_handle.graceful_shutdown(Some(Duration::from_secs(30)));
+    });
 
-        axum_server::bind_rustls(addr, rustls_config)
-            .handle(handle)
-            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-            .await?;
-    } else {
-        // Non-TLS path: delegate to run_server_with_config for testability.
-        let server_config = server::startup::ServerConfig {
-            ws_state: ws_state.clone(),
-            http_config,
-            middleware_config: server::http::MiddlewareConfig::default(),
-            hook_registry: Arc::new(hooks::registry::HookRegistry::new()),
-            tools_registry: Arc::new(plugins::tools::ToolsRegistry::new()),
-            bind_address: resolved.address,
-            raw_config: cfg,
-            spawn_background_tasks: true,
-        };
+    axum_server::bind_rustls(addr, rustls_config)
+        .handle(handle)
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+        .await?;
 
-        let handle = server::startup::run_server_with_config(server_config).await?;
-
-        // Wait for OS shutdown signal, then trigger graceful shutdown
-        let reason = await_shutdown_trigger().await;
-        info!("Shutdown signal received ({})", reason);
-
-        // Notify background tasks via the handle's internal channel
-        // (the handle's shutdown method sends the watch signal)
-        handle.shutdown().await;
-    }
-
-    info!("Gateway shut down");
     Ok(())
 }
 

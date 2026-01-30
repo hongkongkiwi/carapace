@@ -130,57 +130,75 @@ pub(super) fn parse_presence(text: &str) -> ParsedPresence {
     }
 
     // Fallback parsing for non-Node formats (backwards compat)
-    // If we didn't find version with "app X.Y.Z", try "vX.Y.Z" format
-    if parsed.version.is_none() {
-        for word in text.split_whitespace() {
-            if word.starts_with('v')
-                && word.len() > 1
-                && word.chars().nth(1).is_some_and(|c| c.is_ascii_digit())
-            {
-                parsed.version = Some(word[1..].to_string());
-                break;
-            }
-        }
-    }
-
-    // Fallback: platform in brackets [darwin]
-    if parsed.platform.is_none() {
-        if let Some(start) = text.find('[') {
-            if let Some(end) = text[start..].find(']') {
-                let platform = &text[start + 1..start + end];
-                if matches!(
-                    platform.to_lowercase().as_str(),
-                    "darwin" | "linux" | "win32" | "windows" | "macos" | "ios" | "android"
-                ) {
-                    parsed.platform = Some(platform.to_string());
-                }
-            }
-        }
-    }
-
-    // Fallback: "idle:300" or "idle 5m" format
-    if parsed.last_input_seconds.is_none() {
-        for word in text.split_whitespace() {
-            if let Some(seconds) = word.strip_prefix("idle:") {
-                if let Ok(secs) = seconds.parse::<u64>() {
-                    parsed.last_input_seconds = Some(secs);
-                    break;
-                }
-            }
-        }
-    }
-
-    // Fallback: "mode:gateway" format
-    if parsed.mode.is_none() {
-        for word in text.split_whitespace() {
-            if let Some(mode) = word.strip_prefix("mode:") {
-                parsed.mode = Some(mode.to_string());
-                break;
-            }
-        }
-    }
+    apply_presence_fallbacks(&mut parsed, text);
 
     parsed
+}
+
+/// Apply fallback parsing rules for fields not found in the primary segment parse.
+fn apply_presence_fallbacks(parsed: &mut ParsedPresence, text: &str) {
+    if parsed.version.is_none() {
+        parsed.version = fallback_version(text);
+    }
+    if parsed.platform.is_none() {
+        parsed.platform = fallback_platform(text);
+    }
+    if parsed.last_input_seconds.is_none() {
+        parsed.last_input_seconds = fallback_idle_seconds(text);
+    }
+    if parsed.mode.is_none() {
+        parsed.mode = fallback_mode(text);
+    }
+}
+
+/// Try to extract a version from "vX.Y.Z" format words.
+fn fallback_version(text: &str) -> Option<String> {
+    for word in text.split_whitespace() {
+        if word.starts_with('v')
+            && word.len() > 1
+            && word.chars().nth(1).is_some_and(|c| c.is_ascii_digit())
+        {
+            return Some(word[1..].to_string());
+        }
+    }
+    None
+}
+
+/// Try to extract a platform from bracket notation like [darwin].
+fn fallback_platform(text: &str) -> Option<String> {
+    let start = text.find('[')?;
+    let end = text[start..].find(']')?;
+    let platform = &text[start + 1..start + end];
+    if matches!(
+        platform.to_lowercase().as_str(),
+        "darwin" | "linux" | "win32" | "windows" | "macos" | "ios" | "android"
+    ) {
+        Some(platform.to_string())
+    } else {
+        None
+    }
+}
+
+/// Try to extract idle seconds from "idle:300" format.
+fn fallback_idle_seconds(text: &str) -> Option<u64> {
+    for word in text.split_whitespace() {
+        if let Some(seconds) = word.strip_prefix("idle:") {
+            if let Ok(secs) = seconds.parse::<u64>() {
+                return Some(secs);
+            }
+        }
+    }
+    None
+}
+
+/// Try to extract mode from "mode:gateway" format.
+fn fallback_mode(text: &str) -> Option<String> {
+    for word in text.split_whitespace() {
+        if let Some(mode) = word.strip_prefix("mode:") {
+            return Some(mode.to_string());
+        }
+    }
+    None
 }
 
 /// Handle last-heartbeat - returns heartbeat info
@@ -346,29 +364,30 @@ fn derive_presence_key(
 ///
 /// Presence is keyed by deviceId > instanceId > host (not conn_id) for Node parity.
 /// Also enqueues the event to system event history.
-pub(super) fn handle_system_event(
+/// Resolved presence parameters extracted from explicit params and parsed text.
+struct PresenceParams {
+    instance_id: Option<String>,
+    host: Option<String>,
+    ip: Option<String>,
+    mode: Option<String>,
+    version: Option<String>,
+    platform: Option<String>,
+    device_id: Option<String>,
+    device_family: Option<String>,
+    model_identifier: Option<String>,
+    reason: Option<String>,
+    tags: Option<Vec<String>>,
+    roles: Option<Vec<String>>,
+    scopes: Option<Vec<String>>,
+    last_input_seconds: Option<u64>,
+}
+
+/// Parse presence event parameters from explicit params and parsed text, with fallbacks.
+fn extract_presence_params(
     params: Option<&Value>,
-    state: &WsServerState,
+    parsed: &ParsedPresence,
     conn: &ConnectionContext,
-) -> Result<Value, ErrorShape> {
-    let text = params
-        .and_then(|v| v.get("text"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "text is required", None))?;
-
-    // Reject whitespace-only text (Node trims and rejects empty)
-    if text.trim().is_empty() {
-        return Err(error_shape(
-            ERROR_INVALID_REQUEST,
-            "text cannot be empty or whitespace-only",
-            None,
-        ));
-    }
-
-    // Parse presence fields from text (Node's parsePresence)
-    let parsed = parse_presence(text);
-
-    // Extract explicit params, falling back to parsed values
+) -> PresenceParams {
     let instance_id = params
         .and_then(|v| v.get("instanceId"))
         .and_then(|v| v.as_str())
@@ -448,96 +467,149 @@ pub(super) fn handle_system_event(
         .and_then(|v| v.as_u64())
         .or(parsed.last_input_seconds);
 
+    PresenceParams {
+        instance_id,
+        host,
+        ip,
+        mode,
+        version,
+        platform,
+        device_id,
+        device_family,
+        model_identifier,
+        reason,
+        tags,
+        roles,
+        scopes,
+        last_input_seconds,
+    }
+}
+
+/// Update the presence registry with the given parameters.
+fn update_presence_registry(
+    state: &WsServerState,
+    conn: &ConnectionContext,
+    presence_key: &str,
+    text: &str,
+    ts: u64,
+    p: &PresenceParams,
+) {
+    use super::super::PresenceEntry;
+    let mut presence = state.presence.lock();
+    let entry = presence
+        .entry(presence_key.to_string())
+        .or_insert_with(|| PresenceEntry {
+            conn_id: conn.conn_id.clone(),
+            client_id: Some(conn.client.id.clone()),
+            ts,
+            host: None,
+            ip: None,
+            version: None,
+            platform: None,
+            device_family: None,
+            model_identifier: None,
+            mode: None,
+            reason: None,
+            tags: None,
+            device_id: None,
+            roles: None,
+            scopes: None,
+            instance_id: None,
+            text: None,
+            last_input_seconds: None,
+        });
+
+    // Update fields if provided (explicit params or parsed from text)
+    if p.instance_id.is_some() {
+        entry.instance_id = p.instance_id.clone();
+    }
+    if p.host.is_some() {
+        entry.host = p.host.clone();
+    }
+    if p.ip.is_some() {
+        entry.ip = p.ip.clone();
+    }
+    if p.mode.is_some() {
+        entry.mode = p.mode.clone();
+    }
+    if p.version.is_some() {
+        entry.version = p.version.clone();
+    }
+    if p.platform.is_some() {
+        entry.platform = p.platform.clone();
+    }
+    if p.device_id.is_some() {
+        entry.device_id = p.device_id.clone();
+    }
+    if p.device_family.is_some() {
+        entry.device_family = p.device_family.clone();
+    }
+    if p.model_identifier.is_some() {
+        entry.model_identifier = p.model_identifier.clone();
+    }
+    if p.reason.is_some() {
+        entry.reason = p.reason.clone();
+    }
+    if p.tags.is_some() {
+        entry.tags = p.tags.clone();
+    }
+    if p.roles.is_some() {
+        entry.roles = p.roles.clone();
+    }
+    if p.scopes.is_some() {
+        entry.scopes = p.scopes.clone();
+    }
+    // Always update text (required param)
+    entry.text = Some(text.to_string());
+    if p.last_input_seconds.is_some() {
+        entry.last_input_seconds = p.last_input_seconds;
+    }
+    entry.ts = ts;
+
+    // Enforce MAX_PRESENCE_ENTRIES limit (Node uses 200)
+    // Remove oldest entries when over limit
+    if presence.len() > MAX_PRESENCE_ENTRIES {
+        let mut entries: Vec<_> = presence.iter().map(|(k, v)| (k.clone(), v.ts)).collect();
+        entries.sort_by(|a, b| a.1.cmp(&b.1)); // Sort by ts ascending (oldest first)
+        let to_remove = presence.len() - MAX_PRESENCE_ENTRIES;
+        for (key, _) in entries.into_iter().take(to_remove) {
+            presence.remove(&key);
+        }
+    }
+}
+
+pub(super) fn handle_system_event(
+    params: Option<&Value>,
+    state: &WsServerState,
+    conn: &ConnectionContext,
+) -> Result<Value, ErrorShape> {
+    let text = params
+        .and_then(|v| v.get("text"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "text is required", None))?;
+
+    // Reject whitespace-only text (Node trims and rejects empty)
+    if text.trim().is_empty() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "text cannot be empty or whitespace-only",
+            None,
+        ));
+    }
+
+    // Parse presence fields from text (Node's parsePresence)
+    let parsed = parse_presence(text);
+
+    // Extract explicit params, falling back to parsed values
+    let p = extract_presence_params(params, &parsed, conn);
+
     let ts = now_ms();
 
     // Derive presence key per Node semantics: deviceId > instanceId > parsed.instanceId > parsed.host > parsed.ip > text_slice > conn_id
-    let presence_key = derive_presence_key(&device_id, &instance_id, &parsed, &conn.conn_id);
+    let presence_key = derive_presence_key(&p.device_id, &p.instance_id, &parsed, &conn.conn_id);
 
     // Update presence keyed by device/instance/host (not conn_id)
-    {
-        use super::super::PresenceEntry;
-        let mut presence = state.presence.lock();
-        let entry = presence
-            .entry(presence_key.clone())
-            .or_insert_with(|| PresenceEntry {
-                conn_id: conn.conn_id.clone(),
-                client_id: Some(conn.client.id.clone()),
-                ts,
-                host: None,
-                ip: None,
-                version: None,
-                platform: None,
-                device_family: None,
-                model_identifier: None,
-                mode: None,
-                reason: None,
-                tags: None,
-                device_id: None,
-                roles: None,
-                scopes: None,
-                instance_id: None,
-                text: None,
-                last_input_seconds: None,
-            });
-
-        // Update fields if provided (explicit params or parsed from text)
-        if instance_id.is_some() {
-            entry.instance_id = instance_id.clone();
-        }
-        if host.is_some() {
-            entry.host = host.clone();
-        }
-        if ip.is_some() {
-            entry.ip = ip.clone();
-        }
-        if mode.is_some() {
-            entry.mode = mode.clone();
-        }
-        if version.is_some() {
-            entry.version = version.clone();
-        }
-        if platform.is_some() {
-            entry.platform = platform.clone();
-        }
-        if device_id.is_some() {
-            entry.device_id = device_id.clone();
-        }
-        if device_family.is_some() {
-            entry.device_family = device_family.clone();
-        }
-        if model_identifier.is_some() {
-            entry.model_identifier = model_identifier.clone();
-        }
-        if reason.is_some() {
-            entry.reason = reason.clone();
-        }
-        if tags.is_some() {
-            entry.tags = tags.clone();
-        }
-        if roles.is_some() {
-            entry.roles = roles.clone();
-        }
-        if scopes.is_some() {
-            entry.scopes = scopes.clone();
-        }
-        // Always update text (required param)
-        entry.text = Some(text.to_string());
-        if last_input_seconds.is_some() {
-            entry.last_input_seconds = last_input_seconds;
-        }
-        entry.ts = ts;
-
-        // Enforce MAX_PRESENCE_ENTRIES limit (Node uses 200)
-        // Remove oldest entries when over limit
-        if presence.len() > MAX_PRESENCE_ENTRIES {
-            let mut entries: Vec<_> = presence.iter().map(|(k, v)| (k.clone(), v.ts)).collect();
-            entries.sort_by(|a, b| a.1.cmp(&b.1)); // Sort by ts ascending (oldest first)
-            let to_remove = presence.len() - MAX_PRESENCE_ENTRIES;
-            for (key, _) in entries.into_iter().take(to_remove) {
-                presence.remove(&key);
-            }
-        }
-    }
+    update_presence_registry(state, conn, &presence_key, text, ts, &p);
 
     // Enqueue system event to history (per Node's enqueueSystemEvent)
     {
@@ -545,11 +617,11 @@ pub(super) fn handle_system_event(
         state.enqueue_system_event(SystemEvent {
             ts,
             text: text.to_string(),
-            host: host.clone(),
-            ip: ip.clone(),
-            device_id: device_id.clone(),
-            instance_id: instance_id.clone(),
-            reason: reason.clone(),
+            host: p.host.clone(),
+            ip: p.ip.clone(),
+            device_id: p.device_id.clone(),
+            instance_id: p.instance_id.clone(),
+            reason: p.reason.clone(),
         });
     }
 

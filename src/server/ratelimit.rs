@@ -468,43 +468,35 @@ impl Default for RateLimitLayer {
     }
 }
 
-/// Rate limiting middleware
-pub async fn rate_limit_middleware(
-    limiter: axum::extract::State<RateLimiter>,
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+/// Resolve the client IP from the request, returning `None` when the
+/// address cannot be determined.
+fn resolve_client_ip(
+    remote_addr: Option<SocketAddr>,
+    headers: &axum::http::HeaderMap,
+    trust_proxy: bool,
+) -> Option<IpAddr> {
+    let ip = extract_client_ip(remote_addr, headers, trust_proxy);
+    if ip.is_none() {
+        warn!("Rate limit: Could not determine client IP");
+    }
+    ip
+}
+
+/// Apply rate-limit checking for a resolved client IP and path.  On
+/// success the inner response is returned (with rate-limit headers).  On
+/// limit exceeded a 429 response is returned directly.
+async fn apply_rate_limit(
+    limiter: &RateLimiter,
+    client_ip: IpAddr,
+    path: &str,
     request: Request<Body>,
     next: Next,
 ) -> Response<Body> {
-    let config = limiter.config();
-
-    // Skip if disabled
-    if !config.enabled {
-        return next.run(request).await;
-    }
-
-    let path = request.uri().path().to_string();
-    let headers = request.headers();
-    let remote_addr = connect_info.map(|ci| ci.0);
-
-    // Extract client IP
-    let client_ip = match extract_client_ip(remote_addr, headers, config.trust_proxy_headers) {
-        Some(ip) => ip,
-        None => {
-            // Can't determine client IP - allow request but log warning
-            warn!("Rate limit: Could not determine client IP");
-            return next.run(request).await;
-        }
-    };
-
-    // Check rate limit
-    match limiter.check(client_ip, &path) {
+    match limiter.check(client_ip, path) {
         Ok(()) => {
             let mut response = next.run(request).await;
-
-            // Add rate limit headers
-            let (rate, burst) = config.get_limit_for_path(&path);
+            let (rate, burst) = limiter.config().get_limit_for_path(path);
             add_rate_limit_headers(response.headers_mut(), rate, burst);
-
             response
         }
         Err(RateLimitError::LimitExceeded { retry_after_secs }) => {
@@ -516,6 +508,32 @@ pub async fn rate_limit_middleware(
             next.run(request).await
         }
     }
+}
+
+/// Rate limiting middleware
+pub async fn rate_limit_middleware(
+    limiter: axum::extract::State<RateLimiter>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response<Body> {
+    if !limiter.config().enabled {
+        return next.run(request).await;
+    }
+
+    let path = request.uri().path().to_string();
+    let remote_addr = connect_info.map(|ci| ci.0);
+
+    let client_ip = match resolve_client_ip(
+        remote_addr,
+        request.headers(),
+        limiter.config().trust_proxy_headers,
+    ) {
+        Some(ip) => ip,
+        None => return next.run(request).await,
+    };
+
+    apply_rate_limit(&limiter, client_ip, &path, request, next).await
 }
 
 /// Add rate limit headers to response

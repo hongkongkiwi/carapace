@@ -162,14 +162,24 @@ impl ConfigWatcher {
     }
 }
 
-/// Perform a config reload (parse, validate, update cache).
-///
-/// This is the core reload logic shared by the file watcher, SIGHUP handler,
-/// and the `config.reload` WS method.
-pub fn perform_reload(mode: &ReloadMode) -> ReloadResult {
-    info!("Config reload triggered (mode={:?})", mode);
+/// Convert a `ReloadMode` to its string label.
+fn mode_label(mode: &ReloadMode) -> &'static str {
+    match mode {
+        ReloadMode::Hot => "hot",
+        ReloadMode::Hybrid => "hybrid",
+        ReloadMode::Off => "off",
+    }
+}
 
-    match super::reload_config() {
+/// Validate the reloaded configuration, apply it, and build a `ReloadResult`.
+///
+/// Called by `perform_reload` after `super::reload_config()` returns.
+fn process_config_reload_event(
+    mode: &ReloadMode,
+    outcome: Result<(serde_json::Value, Vec<super::ValidationIssue>), super::ConfigError>,
+) -> ReloadResult {
+    let mode_str = mode_label(mode);
+    match outcome {
         Ok((_config, issues)) => {
             let warnings: Vec<String> = issues
                 .iter()
@@ -181,12 +191,6 @@ pub fn perform_reload(mode: &ReloadMode) -> ReloadResult {
                     warn!("Config validation warning: {}", w);
                 }
             }
-
-            let mode_str = match mode {
-                ReloadMode::Hot => "hot",
-                ReloadMode::Hybrid => "hybrid",
-                ReloadMode::Off => "off",
-            };
 
             info!(
                 "Config reloaded successfully (mode={}, warnings={})",
@@ -210,12 +214,7 @@ pub fn perform_reload(mode: &ReloadMode) -> ReloadResult {
 
             ReloadResult {
                 success: false,
-                mode: match mode {
-                    ReloadMode::Hot => "hot",
-                    ReloadMode::Hybrid => "hybrid",
-                    ReloadMode::Off => "off",
-                }
-                .to_string(),
+                mode: mode_str.to_string(),
                 warnings: Vec::new(),
                 error: Some(error_msg),
             }
@@ -223,33 +222,27 @@ pub fn perform_reload(mode: &ReloadMode) -> ReloadResult {
     }
 }
 
-/// Background task that watches the config file and triggers debounced reloads.
-async fn watcher_task(
-    config_path: PathBuf,
-    mode: ReloadMode,
-    debounce: Duration,
-    event_tx: tokio::sync::broadcast::Sender<ConfigEvent>,
-    mut shutdown_rx: watch::Receiver<bool>,
-) {
-    // Determine the directory to watch (notify watches directories)
-    let watch_dir = config_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
+/// Perform a config reload (parse, validate, update cache).
+///
+/// This is the core reload logic shared by the file watcher, SIGHUP handler,
+/// and the `config.reload` WS method.
+pub fn perform_reload(mode: &ReloadMode) -> ReloadResult {
+    info!("Config reload triggered (mode={:?})", mode);
+    let outcome = super::reload_config();
+    process_config_reload_event(mode, outcome)
+}
 
-    let file_name = config_path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-
-    // Channel for fs events from the notify watcher
-    let (fs_tx, mut fs_rx) = tokio::sync::mpsc::channel::<()>(32);
-
-    // Create the notify watcher
-    let fs_tx_clone = fs_tx.clone();
-    let file_name_clone = file_name.clone();
-    let mut watcher: RecommendedWatcher =
-        match notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+/// Create a filesystem watcher that forwards config-file events to `fs_tx`.
+///
+/// Returns the `RecommendedWatcher` and the directory being watched, or an
+/// error string if creation or watch-registration fails.
+fn create_file_watcher(
+    file_name: &str,
+    fs_tx: tokio::sync::mpsc::Sender<()>,
+) -> Result<RecommendedWatcher, String> {
+    let file_name_clone = file_name.to_string();
+    let watcher: RecommendedWatcher =
+        notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
             match res {
                 Ok(event) => {
                     // Only trigger on content-relevant events
@@ -267,40 +260,91 @@ async fn watcher_task(
                             .unwrap_or(false)
                     });
                     if is_config_file {
-                        let _ = fs_tx_clone.try_send(());
+                        let _ = fs_tx.try_send(());
                     }
                 }
                 Err(e) => {
                     warn!("File watcher error: {}", e);
                 }
             }
-        }) {
-            Ok(w) => w,
-            Err(e) => {
-                error!("Failed to create file watcher: {}", e);
-                return;
-            }
-        };
+        })
+        .map_err(|e| format!("Failed to create file watcher: {}", e))?;
 
-    if let Err(e) = watcher.watch(&watch_dir, RecursiveMode::NonRecursive) {
+    Ok(watcher)
+}
+
+/// Resolve the watch directory and file name from a config path.
+fn resolve_watch_targets(config_path: &std::path::Path) -> (PathBuf, String) {
+    let watch_dir = config_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let file_name = config_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    (watch_dir, file_name)
+}
+
+/// Initialize the filesystem watcher and begin watching the target directory.
+///
+/// Returns the watcher and an mpsc receiver for file-change notifications, or
+/// `None` if watcher creation or directory registration fails.
+fn init_fs_watcher(
+    watch_dir: &std::path::Path,
+    file_name: &str,
+) -> Option<(RecommendedWatcher, tokio::sync::mpsc::Receiver<()>)> {
+    let (fs_tx, fs_rx) = tokio::sync::mpsc::channel::<()>(32);
+
+    let mut watcher = match create_file_watcher(file_name, fs_tx) {
+        Ok(w) => w,
+        Err(e) => {
+            error!("{}", e);
+            return None;
+        }
+    };
+
+    if let Err(e) = watcher.watch(watch_dir, RecursiveMode::NonRecursive) {
         error!("Failed to watch directory {}: {}", watch_dir.display(), e);
-        return;
+        return None;
     }
 
-    info!(
-        "File watcher active on {} (file={})",
-        watch_dir.display(),
-        file_name
-    );
+    Some((watcher, fs_rx))
+}
 
-    // Debounce loop: we use a pin-projected sleep that gets reset on each fs event
+/// Perform a debounced reload and broadcast the resulting event.
+fn execute_reload_and_broadcast(
+    mode: &ReloadMode,
+    event_tx: &tokio::sync::broadcast::Sender<ConfigEvent>,
+) {
+    let result = perform_reload(mode);
+    let event = if result.success {
+        ConfigEvent::Reloaded(result)
+    } else {
+        ConfigEvent::ReloadFailed(result)
+    };
+    // Broadcast to subscribers (ignore send errors if no receivers)
+    let _ = event_tx.send(event);
+}
+
+/// Run the debounced select loop, waiting for fs events, shutdown signals, or
+/// debounce timer expiry.  Extracted from `watcher_task` to reduce cognitive
+/// complexity.
+async fn run_debounce_loop(
+    debounce: Duration,
+    mode: &ReloadMode,
+    event_tx: &tokio::sync::broadcast::Sender<ConfigEvent>,
+    fs_rx: &mut tokio::sync::mpsc::Receiver<()>,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) {
     let mut debounce_active = false;
     let debounce_sleep = tokio::time::sleep(debounce);
     tokio::pin!(debounce_sleep);
 
     loop {
         tokio::select! {
-            // Shutdown signal
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
                     info!("Config watcher shutting down");
@@ -308,31 +352,45 @@ async fn watcher_task(
                 }
             }
 
-            // File system event received
             Some(()) = fs_rx.recv() => {
                 debug!(
                     "Config file change detected, starting debounce timer ({}ms)",
                     debounce.as_millis()
                 );
-                // Reset the debounce timer
                 debounce_sleep.as_mut().reset(tokio::time::Instant::now() + debounce);
                 debounce_active = true;
             }
 
-            // Debounce timer expired -> perform reload
             _ = &mut debounce_sleep, if debounce_active => {
                 debounce_active = false;
-                let result = perform_reload(&mode);
-                let event = if result.success {
-                    ConfigEvent::Reloaded(result)
-                } else {
-                    ConfigEvent::ReloadFailed(result)
-                };
-                // Broadcast to subscribers (ignore send errors if no receivers)
-                let _ = event_tx.send(event);
+                execute_reload_and_broadcast(mode, event_tx);
             }
         }
     }
+}
+
+/// Background task that watches the config file and triggers debounced reloads.
+async fn watcher_task(
+    config_path: PathBuf,
+    mode: ReloadMode,
+    debounce: Duration,
+    event_tx: tokio::sync::broadcast::Sender<ConfigEvent>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let (watch_dir, file_name) = resolve_watch_targets(&config_path);
+
+    let (watcher, mut fs_rx) = match init_fs_watcher(&watch_dir, &file_name) {
+        Some(pair) => pair,
+        None => return,
+    };
+
+    info!(
+        "File watcher active on {} (file={})",
+        watch_dir.display(),
+        file_name
+    );
+
+    run_debounce_loop(debounce, &mode, &event_tx, &mut fs_rx, &mut shutdown_rx).await;
 
     // Drop the watcher to stop watching
     drop(watcher);

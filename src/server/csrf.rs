@@ -441,6 +441,78 @@ impl Default for CsrfLayer {
     }
 }
 
+/// Determine if CSRF validation is needed for this request.
+///
+/// Returns `true` when the HTTP method is state-changing (POST, PUT, DELETE,
+/// PATCH) **and** the path matches a protected prefix.
+fn should_validate_csrf(method: &Method, path: &str, config: &CsrfConfig) -> bool {
+    matches!(
+        *method,
+        Method::POST | Method::PUT | Method::DELETE | Method::PATCH
+    ) && config.requires_protection(path)
+}
+
+/// Verify the Origin header and extract the session ID and token from the
+/// request.  Returns `(session_id, token)` on success, or an HTTP error
+/// response when any pre-condition fails.
+#[allow(clippy::result_large_err)]
+fn extract_origin_session_and_token(
+    headers: &HeaderMap,
+    config: &CsrfConfig,
+) -> Result<(String, String), Response<Body>> {
+    // Get Host header for origin check
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(':').next().unwrap_or(s));
+
+    // Check Origin header
+    if let Err(e) = check_origin(headers, config, host) {
+        warn!("CSRF origin check failed: {}", e);
+        return Err(csrf_error_response(e));
+    }
+
+    // Extract session ID
+    let session_id = match extract_session_id(headers) {
+        Some(id) => id,
+        None => {
+            warn!("CSRF: No session ID found");
+            return Err(csrf_error_response(CsrfError::TokenMissing));
+        }
+    };
+
+    // Extract token
+    let provided_token = match extract_csrf_token(headers, config) {
+        Some(token) => token,
+        None => {
+            warn!("CSRF: No token provided");
+            return Err(csrf_error_response(CsrfError::TokenMissing));
+        }
+    };
+
+    Ok((session_id, provided_token))
+}
+
+/// Perform origin checking, token extraction, and token validation.
+///
+/// Returns `Ok(())` when the request passes all CSRF checks, or an error
+/// response that should be returned to the client.
+#[allow(clippy::result_large_err)]
+fn extract_and_validate_token(
+    headers: &HeaderMap,
+    config: &CsrfConfig,
+    store: &CsrfTokenStore,
+) -> Result<(), Response<Body>> {
+    let (session_id, provided_token) = extract_origin_session_and_token(headers, config)?;
+
+    if let Err(e) = store.validate_token(&session_id, &provided_token) {
+        warn!("CSRF validation failed: {}", e);
+        return Err(csrf_error_response(e));
+    }
+
+    Ok(())
+}
+
 /// CSRF protection middleware
 ///
 /// Validates CSRF tokens for state-changing requests to protected routes.
@@ -460,49 +532,12 @@ pub async fn csrf_middleware(
     let path = request.uri().path().to_string();
     let headers = request.headers().clone();
 
-    // Only check state-changing methods on protected routes
-    let needs_validation = matches!(
-        method,
-        Method::POST | Method::PUT | Method::DELETE | Method::PATCH
-    ) && config.requires_protection(&path);
-
-    if !needs_validation {
+    if !should_validate_csrf(&method, &path, config) {
         return next.run(request).await;
     }
 
-    // Get Host header for origin check
-    let host = headers
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(':').next().unwrap_or(s));
-
-    // Check Origin header
-    if let Err(e) = check_origin(&headers, config, host) {
-        warn!("CSRF origin check failed: {}", e);
-        return csrf_error_response(e);
-    }
-
-    // Extract session ID
-    let session_id = match extract_session_id(&headers) {
-        Some(id) => id,
-        None => {
-            warn!("CSRF: No session ID found");
-            return csrf_error_response(CsrfError::TokenMissing);
-        }
-    };
-
-    // Extract and validate token
-    let provided_token = match extract_csrf_token(&headers, config) {
-        Some(token) => token,
-        None => {
-            warn!("CSRF: No token provided");
-            return csrf_error_response(CsrfError::TokenMissing);
-        }
-    };
-
-    if let Err(e) = store.validate_token(&session_id, &provided_token) {
-        warn!("CSRF validation failed: {}", e);
-        return csrf_error_response(e);
+    if let Err(response) = extract_and_validate_token(&headers, config, &store) {
+        return response;
     }
 
     debug!("CSRF validation passed for {}", path);

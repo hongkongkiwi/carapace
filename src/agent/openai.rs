@@ -56,7 +56,6 @@ impl OpenAiProvider {
     fn build_body(&self, request: &CompletionRequest) -> Value {
         let mut messages: Vec<Value> = Vec::new();
 
-        // OpenAI supports a dedicated system message role
         if let Some(ref system) = request.system {
             messages.push(json!({
                 "role": "system",
@@ -64,120 +63,10 @@ impl OpenAiProvider {
             }));
         }
 
-        // Convert LlmMessages to OpenAI format
         for msg in &request.messages {
             match msg.role {
-                LlmRole::User => {
-                    // Check if this is a tool result message (ToolResult blocks)
-                    // OpenAI uses role: "tool" for tool results, not role: "user"
-                    let has_tool_result = msg
-                        .content
-                        .iter()
-                        .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
-
-                    if has_tool_result {
-                        // Each tool result becomes a separate message with role: "tool"
-                        for block in &msg.content {
-                            match block {
-                                ContentBlock::ToolResult {
-                                    tool_use_id,
-                                    content,
-                                    ..
-                                } => {
-                                    messages.push(json!({
-                                        "role": "tool",
-                                        "tool_call_id": tool_use_id,
-                                        "content": content,
-                                    }));
-                                }
-                                ContentBlock::Text { text } => {
-                                    messages.push(json!({
-                                        "role": "user",
-                                        "content": text,
-                                    }));
-                                }
-                                _ => {}
-                            }
-                        }
-                    } else {
-                        // Regular user message - concatenate text blocks
-                        let text = msg
-                            .content
-                            .iter()
-                            .filter_map(|b| match b {
-                                ContentBlock::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("");
-                        if !text.is_empty() {
-                            messages.push(json!({
-                                "role": "user",
-                                "content": text,
-                            }));
-                        }
-                    }
-                }
-                LlmRole::Assistant => {
-                    // Check if there are tool_use blocks
-                    let has_tool_use = msg
-                        .content
-                        .iter()
-                        .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
-
-                    if has_tool_use {
-                        // Build assistant message with tool_calls
-                        let text_content: String = msg
-                            .content
-                            .iter()
-                            .filter_map(|b| match b {
-                                ContentBlock::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("");
-
-                        let tool_calls: Vec<Value> = msg
-                            .content
-                            .iter()
-                            .filter_map(|b| match b {
-                                ContentBlock::ToolUse { id, name, input } => Some(json!({
-                                    "id": id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": name,
-                                        "arguments": input.to_string(),
-                                    }
-                                })),
-                                _ => None,
-                            })
-                            .collect();
-
-                        let mut msg_obj = json!({
-                            "role": "assistant",
-                            "tool_calls": tool_calls,
-                        });
-                        if !text_content.is_empty() {
-                            msg_obj["content"] = json!(text_content);
-                        }
-                        messages.push(msg_obj);
-                    } else {
-                        // Plain text assistant message
-                        let text = msg
-                            .content
-                            .iter()
-                            .filter_map(|b| match b {
-                                ContentBlock::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("");
-                        messages.push(json!({
-                            "role": "assistant",
-                            "content": text,
-                        }));
-                    }
-                }
+                LlmRole::User => convert_user_message_openai(msg, &mut messages),
+                LlmRole::Assistant => convert_assistant_message_openai(msg, &mut messages),
             }
         }
 
@@ -193,25 +82,125 @@ impl OpenAiProvider {
             body["temperature"] = json!(temp);
         }
 
-        if !request.tools.is_empty() {
-            let tools: Vec<Value> = request
-                .tools
-                .iter()
-                .map(|t| {
-                    json!({
-                        "type": "function",
-                        "function": {
-                            "name": t.name,
-                            "description": t.description,
-                            "parameters": t.input_schema,
-                        }
-                    })
-                })
-                .collect();
-            body["tools"] = json!(tools);
-        }
+        append_tools_openai(&request.tools, &mut body);
 
         body
+    }
+}
+
+/// Convert a user-role `LlmMessage` into one or more OpenAI-format messages.
+fn convert_user_message_openai(msg: &LlmMessage, messages: &mut Vec<Value>) {
+    let has_tool_result = msg
+        .content
+        .iter()
+        .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
+
+    if has_tool_result {
+        for block in &msg.content {
+            match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } => {
+                    messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": tool_use_id,
+                        "content": content,
+                    }));
+                }
+                ContentBlock::Text { text } => {
+                    messages.push(json!({
+                        "role": "user",
+                        "content": text,
+                    }));
+                }
+                _ => {}
+            }
+        }
+    } else {
+        let text = collect_text_blocks(&msg.content);
+        if !text.is_empty() {
+            messages.push(json!({
+                "role": "user",
+                "content": text,
+            }));
+        }
+    }
+}
+
+/// Convert an assistant-role `LlmMessage` into an OpenAI-format message.
+fn convert_assistant_message_openai(msg: &LlmMessage, messages: &mut Vec<Value>) {
+    let has_tool_use = msg
+        .content
+        .iter()
+        .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+
+    if has_tool_use {
+        let text_content = collect_text_blocks(&msg.content);
+
+        let tool_calls: Vec<Value> = msg
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse { id, name, input } => Some(json!({
+                    "id": id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": input.to_string(),
+                    }
+                })),
+                _ => None,
+            })
+            .collect();
+
+        let mut msg_obj = json!({
+            "role": "assistant",
+            "tool_calls": tool_calls,
+        });
+        if !text_content.is_empty() {
+            msg_obj["content"] = json!(text_content);
+        }
+        messages.push(msg_obj);
+    } else {
+        let text = collect_text_blocks(&msg.content);
+        messages.push(json!({
+            "role": "assistant",
+            "content": text,
+        }));
+    }
+}
+
+/// Concatenate all `Text` blocks in a content slice into a single string.
+fn collect_text_blocks(content: &[ContentBlock]) -> String {
+    content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// Append tool definitions to the body if any are present.
+fn append_tools_openai(tools: &[ToolDefinition], body: &mut Value) {
+    if !tools.is_empty() {
+        let tool_values: Vec<Value> = tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.input_schema,
+                    }
+                })
+            })
+            .collect();
+        body["tools"] = json!(tool_values);
     }
 }
 
