@@ -343,9 +343,15 @@ pub enum ActionType {
     #[serde(rename = "respond")]
     Respond { message: String },
     #[serde(rename = "broadcast")]
-    Broadcast { channels: Vec<String>, message: String },
+    Broadcast {
+        channels: Vec<String>,
+        message: String,
+    },
     #[serde(rename = "agent")]
-    Agent { agent: String, deliver_response: bool },
+    Agent {
+        agent: String,
+        deliver_response: bool,
+    },
     #[serde(rename = "transform")]
     Transform { template: String },
     #[serde(rename = "log")]
@@ -355,11 +361,19 @@ pub enum ActionType {
     #[serde(rename = "wait")]
     Wait { seconds: u64 },
     #[serde(rename = "branch")]
-    Branch { condition: Box<FlowConditionType>, then: Vec<ActionType>, else_: Vec<ActionType> },
+    Branch {
+        condition: Box<FlowConditionType>,
+        then: Vec<ActionType>,
+        else_: Vec<ActionType>,
+    },
     #[serde(rename = "stop")]
     Stop { error: bool },
     #[serde(rename = "webhook")]
-    Webhook { url: String, method: String, body: Option<String> },
+    Webhook {
+        url: String,
+        method: String,
+        body: Option<String>,
+    },
     #[serde(rename = "execute")]
     Execute { code: String },
     #[serde(rename = "react")]
@@ -367,7 +381,11 @@ pub enum ActionType {
     #[serde(rename = "parallel")]
     Parallel { actions: Vec<ActionType> },
     #[serde(rename = "subflow")]
-    Subflow { flow_id: String, wait: bool, input: HashMap<String, String> },
+    Subflow {
+        flow_id: String,
+        wait: bool,
+        input: HashMap<String, String>,
+    },
 }
 
 /// Legacy/simple condition struct.

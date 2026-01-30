@@ -81,11 +81,7 @@ impl HotReloadManager {
     }
 
     /// Start watching a plugin directory or file
-    pub fn watch_plugin(
-        &self,
-        plugin_id: &str,
-        path: PathBuf,
-    ) -> Result<(), HotReloadError> {
+    pub fn watch_plugin(&self, plugin_id: &str, path: PathBuf) -> Result<(), HotReloadError> {
         if self.watched_plugins.read().contains_key(plugin_id) {
             return Err(HotReloadError::AlreadyWatching(plugin_id.to_string()));
         }
@@ -128,7 +124,11 @@ impl HotReloadManager {
         let watched_plugins = self.watched_plugins.read();
         for (plugin_id, plugin) in watched_plugins.iter() {
             // Skip if recently triggered (debounce)
-            if plugin.last_event.elapsed().map_or(false, |d| d < self.debounce_duration) {
+            if plugin
+                .last_event
+                .elapsed()
+                .map_or(false, |d| d < self.debounce_duration)
+            {
                 continue;
             }
 
@@ -291,7 +291,9 @@ mod tests {
         fs::write(&plugin_path, "initial content").unwrap();
 
         let manager = HotReloadManager::new();
-        manager.watch_plugin("test-plugin", plugin_path.clone()).unwrap();
+        manager
+            .watch_plugin("test-plugin", plugin_path.clone())
+            .unwrap();
 
         // First check - no changes
         let events = manager.check_changes();

@@ -66,16 +66,27 @@ impl TelegramChannel {
             .build()
             .expect("Failed to build reqwest client");
 
-        Self { config, client, event_tx }
+        Self {
+            config,
+            client,
+            event_tx,
+        }
     }
 
     /// Get the API base URL
     fn api_url(&self, method: &str) -> String {
-        format!("https://api.telegram.org/bot{}/{}", self.config.bot_token, method)
+        format!(
+            "https://api.telegram.org/bot{}/{}",
+            self.config.bot_token, method
+        )
     }
 
     /// Send a request to the Telegram API
-    async fn api_request<T: for<'de> Deserialize<'de>>(&self, method: &str, body: serde_json::Value) -> Result<T, TelegramError> {
+    async fn api_request<T: for<'de> Deserialize<'de>>(
+        &self,
+        method: &str,
+        body: serde_json::Value,
+    ) -> Result<T, TelegramError> {
         let response = self
             .client
             .post(self.api_url(method))
@@ -90,7 +101,10 @@ impl TelegramChannel {
             .map_err(|e| TelegramError::Parse(e.to_string()))?;
 
         if json.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            let error_msg = json.get("description").and_then(|v| v.as_str()).unwrap_or("Unknown error");
+            let error_msg = json
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown error");
             return Err(TelegramError::Api(error_msg.to_string()));
         }
 
@@ -113,7 +127,12 @@ impl TelegramChannel {
     }
 
     /// Send a photo
-    pub async fn send_photo(&self, chat_id: &str, photo_url: &str, caption: Option<&str>) -> Result<String, TelegramError> {
+    pub async fn send_photo(
+        &self,
+        chat_id: &str,
+        photo_url: &str,
+        caption: Option<&str>,
+    ) -> Result<String, TelegramError> {
         let mut body = serde_json::json!({
             "chat_id": chat_id,
             "photo": photo_url,
@@ -130,7 +149,11 @@ impl TelegramChannel {
     }
 
     /// Answer callback query
-    pub async fn answer_callback(&self, callback_id: &str, text: Option<&str>) -> Result<(), TelegramError> {
+    pub async fn answer_callback(
+        &self,
+        callback_id: &str,
+        text: Option<&str>,
+    ) -> Result<(), TelegramError> {
         let body = serde_json::json!({
             "callback_query_id": callback_id,
             "text": text.unwrap_or(""),

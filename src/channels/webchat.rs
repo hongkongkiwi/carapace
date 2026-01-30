@@ -124,10 +124,14 @@ impl WebChatChannel {
         {
             let ip_count = state.ip_counts.get(ip).copied().unwrap_or(0);
             if ip_count >= self.config.max_connections_per_ip {
-                return Err(WebChatError::Connection("Too many connections from IP".to_string()));
+                return Err(WebChatError::Connection(
+                    "Too many connections from IP".to_string(),
+                ));
             }
             if state.total_connections >= self.config.max_total_connections {
-                return Err(WebChatError::Connection("Maximum connections reached".to_string()));
+                return Err(WebChatError::Connection(
+                    "Maximum connections reached".to_string(),
+                ));
             }
         }
 
@@ -199,11 +203,7 @@ impl WebChatChannel {
     }
 
     /// Send to default/recipient sessions matching a filter
-    pub async fn send_to_matching(
-        &self,
-        filter: impl Fn(&WebChatSession) -> bool,
-        message: &str,
-    ) {
+    pub async fn send_to_matching(&self, filter: impl Fn(&WebChatSession) -> bool, message: &str) {
         let state = self.state.lock().await;
         let msg = message.to_string();
 
@@ -322,7 +322,11 @@ pub enum WebChatMessage {
     UserLeft { room: String, user_id: String },
     /// Server indicating user is typing
     #[serde(rename = "user_typing")]
-    UserTyping { room: String, user_id: String, is_typing: bool },
+    UserTyping {
+        room: String,
+        user_id: String,
+        is_typing: bool,
+    },
     /// Server heartbeat response
     #[serde(rename = "pong")]
     Pong,
@@ -337,7 +341,10 @@ impl TryFrom<WebChatMessage> for MessageContent {
 
     fn try_from(msg: WebChatMessage) -> Result<Self, Self::Error> {
         match msg {
-            WebChatMessage::Message { content, reply_to: _ } => Ok(MessageContent::Text { text: content }),
+            WebChatMessage::Message {
+                content,
+                reply_to: _,
+            } => Ok(MessageContent::Text { text: content }),
             _ => Err("Cannot convert non-message type".to_string()),
         }
     }

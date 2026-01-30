@@ -16,18 +16,18 @@ pub mod slack;
 pub mod teams;
 pub mod telegram;
 pub mod voice;
-pub mod whatsapp;
-pub mod webhook;
 pub mod webchat;
+pub mod webhook;
+pub mod whatsapp;
 pub mod zalo;
 
 // Re-export key types from config module
 pub use config::ChannelConfig;
+pub use config::ChannelSchema;
 pub use config::ChannelType;
 pub use config::ConfigError;
-pub use config::ConfigValidator;
 pub use config::ConfigResult;
-pub use config::ChannelSchema;
+pub use config::ConfigValidator;
 
 // Re-export LineChannel (but not LineConfig to avoid conflict with config::LineConfig)
 pub use line::LineChannel;

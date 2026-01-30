@@ -6,8 +6,7 @@
 //! Security: API key is retrieved via credential_get() - never hardcoded.
 
 use crate::plugins::bindings::{
-    ToolDefinition, ToolPluginInstance, ToolContext, ToolResult,
-    BindingError,
+    BindingError, ToolContext, ToolDefinition, ToolPluginInstance, ToolResult,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -102,8 +101,9 @@ impl AnthropicClient {
 
     /// Get the authorization headers
     fn auth_headers(&self) -> Result<Vec<(String, String)>, BindingError> {
-        let api_key = self.config.api_key.as_ref()
-            .ok_or_else(|| BindingError::CallError("Anthropic API key not configured".to_string()))?;
+        let api_key = self.config.api_key.as_ref().ok_or_else(|| {
+            BindingError::CallError("Anthropic API key not configured".to_string())
+        })?;
 
         Ok(vec![
             ("x-api-key".to_string(), api_key.clone()),
@@ -126,11 +126,14 @@ impl AnthropicClient {
             request = request.header(key, value);
         }
 
-        let response = request.json(body).send()
+        let response = request
+            .json(body)
+            .send()
             .map_err(|e| BindingError::CallError(format!("Request failed: {}", e)))?;
 
         if !response.status().is_success() {
-            let error_text = response.text()
+            let error_text = response
+                .text()
                 .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(BindingError::CallError(format!(
                 "Anthropic API error: {}",
@@ -138,7 +141,8 @@ impl AnthropicClient {
             )));
         }
 
-        response.json()
+        response
+            .json()
             .map_err(|e| BindingError::CallError(format!("Parse error: {}", e)))
     }
 
@@ -164,7 +168,9 @@ impl AnthropicClient {
         });
 
         let response: serde_json::Value = self.api_request("/messages", &body)?;
-        response.try_into().map_err(|e| BindingError::CallError(format!("Parse error: {}", e)))
+        response
+            .try_into()
+            .map_err(|e| BindingError::CallError(format!("Parse error: {}", e)))
     }
 
     /// Create a chat completion (Legacy beta API)
@@ -187,7 +193,9 @@ impl AnthropicClient {
         });
 
         let response: serde_json::Value = self.api_request("/complete", &body)?;
-        response.try_into().map_err(|e| BindingError::CallError(format!("Parse error: {}", e)))
+        response
+            .try_into()
+            .map_err(|e| BindingError::CallError(format!("Parse error: {}", e)))
     }
 }
 
@@ -242,7 +250,9 @@ impl ToolPluginInstance for AnthropicTool {
         params: &str,
         _ctx: ToolContext,
     ) -> Result<ToolResult, BindingError> {
-        let client = self.client.as_ref()
+        let client = self
+            .client
+            .as_ref()
             .ok_or_else(|| BindingError::CallError("Anthropic tool not initialized".to_string()))?;
 
         match name {
@@ -250,18 +260,24 @@ impl ToolPluginInstance for AnthropicTool {
                 let input: ChatCompletionInput = serde_json::from_str(params)
                     .map_err(|e| BindingError::CallError(format!("Invalid params: {}", e)))?;
 
-                let messages: Vec<ClaudeMessage> = input.messages.iter().map(|m| m.clone().into()).collect();
+                let messages: Vec<ClaudeMessage> =
+                    input.messages.iter().map(|m| m.clone().into()).collect();
 
-                let response = client.chat_completions(
-                    &messages,
-                    input.model.as_deref(),
-                    input.temperature,
-                    input.max_tokens,
-                ).map_err(|e| BindingError::CallError(e.to_string()))?;
+                let response = client
+                    .chat_completions(
+                        &messages,
+                        input.model.as_deref(),
+                        input.temperature,
+                        input.max_tokens,
+                    )
+                    .map_err(|e| BindingError::CallError(e.to_string()))?;
 
                 Ok(ToolResult {
                     success: true,
-                    result: Some(serde_json::to_string(&response).map_err(|e| BindingError::CallError(e.to_string()))?),
+                    result: Some(
+                        serde_json::to_string(&response)
+                            .map_err(|e| BindingError::CallError(e.to_string()))?,
+                    ),
                     error: None,
                 })
             }
@@ -269,16 +285,21 @@ impl ToolPluginInstance for AnthropicTool {
                 let input: CompleteInput = serde_json::from_str(params)
                     .map_err(|e| BindingError::CallError(format!("Invalid params: {}", e)))?;
 
-                let response = client.complete(
-                    &input.prompt,
-                    input.model.as_deref(),
-                    input.temperature,
-                    input.max_tokens,
-                ).map_err(|e| BindingError::CallError(e.to_string()))?;
+                let response = client
+                    .complete(
+                        &input.prompt,
+                        input.model.as_deref(),
+                        input.temperature,
+                        input.max_tokens,
+                    )
+                    .map_err(|e| BindingError::CallError(e.to_string()))?;
 
                 Ok(ToolResult {
                     success: true,
-                    result: Some(serde_json::to_string(&response).map_err(|e| BindingError::CallError(e.to_string()))?),
+                    result: Some(
+                        serde_json::to_string(&response)
+                            .map_err(|e| BindingError::CallError(e.to_string()))?,
+                    ),
                     error: None,
                 })
             }

@@ -6,8 +6,7 @@
 //! Security: Connection credentials retrieved via credential_get() - never hardcoded.
 
 use crate::plugins::bindings::{
-    ToolDefinition, ToolPluginInstance, ToolContext, ToolResult,
-    BindingError,
+    BindingError, ToolContext, ToolDefinition, ToolPluginInstance, ToolResult,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -88,11 +87,7 @@ impl PostgreSQLClient {
     pub fn new(config: PostgreSQLConfig) -> Result<Self, BindingError> {
         let connection_string = format!(
             "host={} port={} dbname={} user={} connect_timeout={}",
-            config.host,
-            config.port,
-            config.database,
-            config.username,
-            config.connection_timeout
+            config.host, config.port, config.database, config.username, config.connection_timeout
         );
 
         let conn = postgres::Client::connect(&connection_string, postgres::NoTls)
@@ -106,22 +101,28 @@ impl PostgreSQLClient {
 
     /// Execute a query and return rows
     pub fn query(&self, query: &str) -> Result<QueryResult, BindingError> {
-        let mut guard = self.conn.lock()
+        let mut guard = self
+            .conn
+            .lock()
             .map_err(|e| BindingError::CallError(format!("Mutex lock failed: {}", e)))?;
         let conn = &mut *guard;
 
-        let rows = conn.query(query, &[])
+        let rows = conn
+            .query(query, &[])
             .map_err(|e| BindingError::CallError(format!("Query failed: {}", e)))?;
 
         let row_count = rows.len();
-        let results: Vec<serde_json::Value> = rows.iter().map(|row| {
-            let mut row_data = serde_json::Map::new();
-            for (i, column) in row.columns().iter().enumerate() {
-                let value = Self::parse_value(row, i);
-                row_data.insert(column.name().to_string(), value);
-            }
-            serde_json::Value::Object(row_data)
-        }).collect();
+        let results: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|row| {
+                let mut row_data = serde_json::Map::new();
+                for (i, column) in row.columns().iter().enumerate() {
+                    let value = Self::parse_value(row, i);
+                    row_data.insert(column.name().to_string(), value);
+                }
+                serde_json::Value::Object(row_data)
+            })
+            .collect();
 
         Ok(QueryResult {
             rows: results,
@@ -157,11 +158,14 @@ impl PostgreSQLClient {
 
     /// Execute a statement and return affected rows
     pub fn execute(&self, statement: &str) -> Result<ExecuteResult, BindingError> {
-        let mut guard = self.conn.lock()
+        let mut guard = self
+            .conn
+            .lock()
             .map_err(|e| BindingError::CallError(format!("Mutex lock failed: {}", e)))?;
         let conn = &mut *guard;
 
-        let result = conn.execute(statement, &[])
+        let result = conn
+            .execute(statement, &[])
             .map_err(|e| BindingError::CallError(format!("Execute failed: {}", e)))?;
 
         Ok(ExecuteResult {
@@ -171,7 +175,9 @@ impl PostgreSQLClient {
 
     /// Check connection health
     pub fn health_check(&self) -> Result<(), BindingError> {
-        let mut guard = self.conn.lock()
+        let mut guard = self
+            .conn
+            .lock()
             .map_err(|e| BindingError::CallError(format!("Mutex lock failed: {}", e)))?;
         let conn = &mut *guard;
 
@@ -215,12 +221,15 @@ impl ToolPluginInstance for PostgreSQLTool {
         Ok(vec![
             ToolDefinition {
                 name: "postgres_query".to_string(),
-                description: "Execute a SELECT query against PostgreSQL and return results.".to_string(),
+                description: "Execute a SELECT query against PostgreSQL and return results."
+                    .to_string(),
                 input_schema: QueryInput::schema().to_string(),
             },
             ToolDefinition {
                 name: "postgres_execute".to_string(),
-                description: "Execute an INSERT, UPDATE, DELETE or DDL statement against PostgreSQL.".to_string(),
+                description:
+                    "Execute an INSERT, UPDATE, DELETE or DDL statement against PostgreSQL."
+                        .to_string(),
                 input_schema: ExecuteInput::schema().to_string(),
             },
             ToolDefinition {
@@ -237,20 +246,25 @@ impl ToolPluginInstance for PostgreSQLTool {
         params: &str,
         _ctx: ToolContext,
     ) -> Result<ToolResult, BindingError> {
-        let client = self.client.as_ref()
-            .ok_or_else(|| BindingError::CallError("PostgreSQL tool not initialized".to_string()))?;
+        let client = self.client.as_ref().ok_or_else(|| {
+            BindingError::CallError("PostgreSQL tool not initialized".to_string())
+        })?;
 
         match name {
             "postgres_query" => {
                 let input: QueryInput = serde_json::from_str(params)
                     .map_err(|e| BindingError::CallError(format!("Invalid params: {}", e)))?;
 
-                let result = client.query(&input.query)
+                let result = client
+                    .query(&input.query)
                     .map_err(|e| BindingError::CallError(e.to_string()))?;
 
                 Ok(ToolResult {
                     success: true,
-                    result: Some(serde_json::to_string(&result).map_err(|e| BindingError::CallError(e.to_string()))?),
+                    result: Some(
+                        serde_json::to_string(&result)
+                            .map_err(|e| BindingError::CallError(e.to_string()))?,
+                    ),
                     error: None,
                 })
             }
@@ -258,17 +272,22 @@ impl ToolPluginInstance for PostgreSQLTool {
                 let input: ExecuteInput = serde_json::from_str(params)
                     .map_err(|e| BindingError::CallError(format!("Invalid params: {}", e)))?;
 
-                let result = client.execute(&input.statement)
+                let result = client
+                    .execute(&input.statement)
                     .map_err(|e| BindingError::CallError(e.to_string()))?;
 
                 Ok(ToolResult {
                     success: true,
-                    result: Some(serde_json::to_string(&result).map_err(|e| BindingError::CallError(e.to_string()))?),
+                    result: Some(
+                        serde_json::to_string(&result)
+                            .map_err(|e| BindingError::CallError(e.to_string()))?,
+                    ),
                     error: None,
                 })
             }
             "postgres_health" => {
-                client.health_check()
+                client
+                    .health_check()
                     .map_err(|e| BindingError::CallError(e.to_string()))?;
 
                 Ok(ToolResult {

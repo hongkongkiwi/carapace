@@ -104,12 +104,15 @@ impl FlowEngine {
 
         // Build context from webhook
         let mut ctx = FlowContext::default();
-        ctx.event_data.insert("webhook_path".to_string(), path.to_string());
-        ctx.event_data.insert("webhook_method".to_string(), method.to_string());
+        ctx.event_data
+            .insert("webhook_path".to_string(), path.to_string());
+        ctx.event_data
+            .insert("webhook_method".to_string(), method.to_string());
 
         // Add headers to context
         for (key, value) in headers {
-            ctx.event_data.insert(format!("header_{}", key), value.clone());
+            ctx.event_data
+                .insert(format!("header_{}", key), value.clone());
         }
 
         // Add body to context if present
@@ -117,7 +120,8 @@ impl FlowEngine {
             if let Some(obj) = b.as_object() {
                 for (key, value) in obj {
                     if let Some(s) = value.as_str() {
-                        ctx.event_data.insert(format!("body_{}", key), s.to_string());
+                        ctx.event_data
+                            .insert(format!("body_{}", key), s.to_string());
                     } else {
                         ctx.event_data.insert(
                             format!("body_{}", key),
@@ -129,7 +133,9 @@ impl FlowEngine {
         }
 
         // Collect matching flows
-        let matching_flows: Vec<Flow> = self.flows.iter()
+        let matching_flows: Vec<Flow> = self
+            .flows
+            .iter()
             .filter(|f| f.enabled && self.matches_webhook_trigger(&f.trigger, path))
             .cloned()
             .collect();
@@ -176,21 +182,25 @@ impl FlowEngine {
         let text = match &content {
             MessageContent::Text { text } => text.clone(),
             MessageContent::Media { caption, .. } => caption.clone().unwrap_or_default(),
-            MessageContent::Composite { parts } => {
-                parts.iter().map(|p| match p {
+            MessageContent::Composite { parts } => parts
+                .iter()
+                .map(|p| match p {
                     MessageContent::Text { text } => text.clone(),
                     MessageContent::Media { caption, .. } => caption.clone().unwrap_or_default(),
                     _ => String::new(),
-                }).collect()
-            }
+                })
+                .collect(),
         };
 
         ctx.event_data.insert("text".to_string(), text.clone());
-        ctx.event_data.insert("channel".to_string(), channel_id.to_string());
+        ctx.event_data
+            .insert("channel".to_string(), channel_id.to_string());
 
         // Collect matching flows first to avoid borrow conflicts
         // Clone the flows to avoid holding references to self
-        let matching_flows: Vec<Flow> = self.flows.iter()
+        let matching_flows: Vec<Flow> = self
+            .flows
+            .iter()
             .filter(|f| f.enabled && self.matches_trigger(&f.trigger, channel_id, &text))
             .cloned()
             .collect();
@@ -215,27 +225,25 @@ impl FlowEngine {
     /// Check if a trigger matches the message.
     fn matches_trigger(&self, trigger: &FlowTrigger, channel: &str, text: &str) -> bool {
         match trigger {
-            FlowTrigger::ChannelMessage { channel: trigger_channel } => {
-                channel == trigger_channel
-            }
-            FlowTrigger::Command { command } => {
-                text.starts_with(&format!("!{}", command))
-            }
+            FlowTrigger::ChannelMessage {
+                channel: trigger_channel,
+            } => channel == trigger_channel,
+            FlowTrigger::Command { command } => text.starts_with(&format!("!{}", command)),
             FlowTrigger::Webhook { path: _ } => false, // Handled separately
             FlowTrigger::Schedule { cron: _ } => false, // Handled by scheduler
             FlowTrigger::Event { event_type: _ } => false, // Handled separately
-            FlowTrigger::UserJoin { channel: trigger_channel } => channel == trigger_channel,
-            FlowTrigger::UserLeave { channel: trigger_channel } => channel == trigger_channel,
+            FlowTrigger::UserJoin {
+                channel: trigger_channel,
+            } => channel == trigger_channel,
+            FlowTrigger::UserLeave {
+                channel: trigger_channel,
+            } => channel == trigger_channel,
             FlowTrigger::Manual { flow_id: _ } => false, // Manual trigger only
         }
     }
 
     /// Check if all conditions match.
-    async fn matches_conditions(
-        &self,
-        conditions: &[FlowCondition],
-        ctx: &FlowContext,
-    ) -> bool {
+    async fn matches_conditions(&self, conditions: &[FlowCondition], ctx: &FlowContext) -> bool {
         for condition in conditions {
             if !self.matches_condition(condition, ctx).await {
                 return false;
@@ -245,11 +253,7 @@ impl FlowEngine {
     }
 
     /// Check if a single condition matches.
-    async fn matches_condition(
-        &self,
-        condition: &FlowCondition,
-        ctx: &FlowContext,
-    ) -> bool {
+    async fn matches_condition(&self, condition: &FlowCondition, ctx: &FlowContext) -> bool {
         match condition {
             FlowCondition::Text { operator, value } => {
                 let text = ctx.event_data.get("text").map(|s| s.as_str()).unwrap_or("");
@@ -271,7 +275,10 @@ impl FlowEngine {
                 // Would check message attachments
                 false
             }
-            FlowCondition::WordCount { operator: _, value: _ } => {
+            FlowCondition::WordCount {
+                operator: _,
+                value: _,
+            } => {
                 // Would count words and compare
                 false
             }
@@ -289,21 +296,25 @@ impl FlowEngine {
             ConditionOperator::Contains => text.contains(value),
             ConditionOperator::StartsWith => text.starts_with(value),
             ConditionOperator::EndsWith => text.ends_with(value),
-            ConditionOperator::Regex => {
-                regex::Regex::new(value).map(|r| r.is_match(text)).unwrap_or(false)
-            }
-            ConditionOperator::GreaterThan => {
-                text.parse::<i64>().map(|n| n > value.parse::<i64>().unwrap_or(0)).unwrap_or(false)
-            }
-            ConditionOperator::LessThan => {
-                text.parse::<i64>().map(|n| n < value.parse::<i64>().unwrap_or(0)).unwrap_or(false)
-            }
-            ConditionOperator::GreaterEqual => {
-                text.parse::<i64>().map(|n| n >= value.parse::<i64>().unwrap_or(0)).unwrap_or(false)
-            }
-            ConditionOperator::LessEqual => {
-                text.parse::<i64>().map(|n| n <= value.parse::<i64>().unwrap_or(0)).unwrap_or(false)
-            }
+            ConditionOperator::Regex => regex::Regex::new(value)
+                .map(|r| r.is_match(text))
+                .unwrap_or(false),
+            ConditionOperator::GreaterThan => text
+                .parse::<i64>()
+                .map(|n| n > value.parse::<i64>().unwrap_or(0))
+                .unwrap_or(false),
+            ConditionOperator::LessThan => text
+                .parse::<i64>()
+                .map(|n| n < value.parse::<i64>().unwrap_or(0))
+                .unwrap_or(false),
+            ConditionOperator::GreaterEqual => text
+                .parse::<i64>()
+                .map(|n| n >= value.parse::<i64>().unwrap_or(0))
+                .unwrap_or(false),
+            ConditionOperator::LessEqual => text
+                .parse::<i64>()
+                .map(|n| n <= value.parse::<i64>().unwrap_or(0))
+                .unwrap_or(false),
             ConditionOperator::NotEquals => text != value,
             ConditionOperator::In => value.split(',').any(|s| s.trim() == text),
             ConditionOperator::NotIn => !value.split(',').any(|s| s.trim() == text),
@@ -311,11 +322,7 @@ impl FlowEngine {
     }
 
     /// Execute a list of actions.
-    async fn execute_actions(
-        &mut self,
-        actions: &[Action],
-        ctx: &mut FlowContext,
-    ) -> FlowResult {
+    async fn execute_actions(&mut self, actions: &[Action], ctx: &mut FlowContext) -> FlowResult {
         // Flatten branches into a single action list to avoid recursion
         let flat_actions = self.flatten_actions(actions);
 
@@ -335,7 +342,11 @@ impl FlowEngine {
         let mut result = Vec::new();
         for action in actions {
             match action {
-                Action::Branch { condition: _, then, else_: _ } => {
+                Action::Branch {
+                    condition: _,
+                    then,
+                    else_: _,
+                } => {
                     // For simplicity, always use then branch (condition evaluation happens at runtime)
                     result.extend(self.flatten_actions(then));
                 }
@@ -381,13 +392,19 @@ impl FlowEngine {
     }
 
     /// Execute a single non-branch action.
-    async fn execute_single_action(&mut self, action: &Action, ctx: &mut FlowContext) -> FlowResult {
+    async fn execute_single_action(
+        &mut self,
+        action: &Action,
+        ctx: &mut FlowContext,
+    ) -> FlowResult {
         match action {
             Action::Forward { to_channel } => {
                 let content = if let Some(msg) = &ctx.message {
                     msg.clone()
                 } else {
-                    MessageContent::Text { text: String::new() }
+                    MessageContent::Text {
+                        text: String::new(),
+                    }
                 };
                 let outbound = OutboundMessage::new(to_channel, content);
                 if let Some(tx) = &self.outbound_tx {
@@ -423,7 +440,10 @@ impl FlowEngine {
                 }
                 FlowResult::Success
             }
-            Action::Agent { agent, deliver_response: _ } => {
+            Action::Agent {
+                agent,
+                deliver_response: _,
+            } => {
                 debug!("Would trigger agent '{}'", agent);
                 FlowResult::Success
             }
@@ -453,7 +473,11 @@ impl FlowEngine {
                 FlowResult::Success
             }
             Action::Stop { error: _ } => FlowResult::Cancelled,
-            Action::Webhook { url, method, body: _ } => {
+            Action::Webhook {
+                url,
+                method,
+                body: _,
+            } => {
                 debug!("Would call webhook {} {}", method, url);
                 FlowResult::Success
             }
@@ -465,10 +489,12 @@ impl FlowEngine {
                 debug!("Would add reaction {} to message", emoji);
                 FlowResult::Success
             }
-            Action::Parallel { actions } => {
-                self.execute_parallel(actions, ctx).await
-            }
-            Action::Subflow { flow_id, wait: _, input: _ } => {
+            Action::Parallel { actions } => self.execute_parallel(actions, ctx).await,
+            Action::Subflow {
+                flow_id,
+                wait: _,
+                input: _,
+            } => {
                 debug!("Would call subflow '{}'", flow_id);
                 // In a full implementation, this would:
                 // 1. Look up the flow by ID
@@ -488,16 +514,18 @@ impl FlowEngine {
 
         // Replace {{variable}} patterns
         let re = regex::Regex::new(r"\{\{(\w+)\}\}").unwrap();
-        result = re.replace_all(&result, |caps: &regex::Captures| {
-            let name = &caps[1];
-            if let Some(value) = ctx.variables.get(name) {
-                value.clone()
-            } else if let Some(value) = ctx.event_data.get(name) {
-                value.clone()
-            } else {
-                format!("{{{{{}}}}}", name)
-            }
-        }).to_string();
+        result = re
+            .replace_all(&result, |caps: &regex::Captures| {
+                let name = &caps[1];
+                if let Some(value) = ctx.variables.get(name) {
+                    value.clone()
+                } else if let Some(value) = ctx.event_data.get(name) {
+                    value.clone()
+                } else {
+                    format!("{{{{{}}}}}", name)
+                }
+            })
+            .to_string();
 
         result
     }
@@ -530,15 +558,9 @@ pub enum FlowEvent {
         timestamp: chrono::DateTime<chrono::Utc>,
     },
     /// User joined channel.
-    UserJoin {
-        channel: String,
-        user: String,
-    },
+    UserJoin { channel: String, user: String },
     /// User left channel.
-    UserLeave {
-        channel: String,
-        user: String,
-    },
+    UserLeave { channel: String, user: String },
     /// Custom event.
     Custom {
         event_type: String,

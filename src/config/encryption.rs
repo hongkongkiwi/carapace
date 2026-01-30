@@ -141,9 +141,9 @@ fn retrieve_master_key() -> Result<Option<Vec<u8>>, EncryptionError> {
 
     match entry.get_password() {
         Ok(key_b64) => {
-            let key = BASE64
-                .decode(key_b64)
-                .map_err(|e| EncryptionError::CredentialStore(format!("Invalid key format: {}", e)))?;
+            let key = BASE64.decode(key_b64).map_err(|e| {
+                EncryptionError::CredentialStore(format!("Invalid key format: {}", e))
+            })?;
             Ok(Some(key))
         }
         Err(keyring::Error::NoEntry) => Ok(None),
@@ -163,9 +163,9 @@ fn retrieve_master_key() -> Result<Option<Vec<u8>>, EncryptionError> {
 
     match entry.get_password() {
         Ok(key_b64) => {
-            let key = BASE64
-                .decode(key_b64)
-                .map_err(|e| EncryptionError::CredentialStore(format!("Invalid key format: {}", e)))?;
+            let key = BASE64.decode(key_b64).map_err(|e| {
+                EncryptionError::CredentialStore(format!("Invalid key format: {}", e))
+            })?;
             Ok(Some(key))
         }
         Err(keyring::Error::NoEntry) => Ok(None),
@@ -185,9 +185,9 @@ fn retrieve_master_key() -> Result<Option<Vec<u8>>, EncryptionError> {
 
     match entry.get_password() {
         Ok(key_b64) => {
-            let key = BASE64
-                .decode(key_b64)
-                .map_err(|e| EncryptionError::CredentialStore(format!("Invalid key format: {}", e)))?;
+            let key = BASE64.decode(key_b64).map_err(|e| {
+                EncryptionError::CredentialStore(format!("Invalid key format: {}", e))
+            })?;
             Ok(Some(key))
         }
         Err(keyring::Error::NoEntry) => Ok(None),

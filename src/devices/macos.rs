@@ -176,14 +176,21 @@ impl MacOSClient {
         due_date: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Reminder, MacOSError> {
         tracing::info!(title = title, ?due_date, "Creating Reminder");
-        let script = format!(r#"tell application "Reminders" to make new reminder with properties {{name: "{}"}}"#, title.replace('"', "\\\""));
+        let script = format!(
+            r#"tell application "Reminders" to make new reminder with properties {{name: "{}"}}"#,
+            title.replace('"', "\\\"")
+        );
         self.execute_script(&script)?;
         Ok(Reminder {
             title: title.to_string(),
             due_date,
             notes: None,
             is_complete: false,
-            list: self.config.default_reminders_list.clone().unwrap_or_default(),
+            list: self
+                .config
+                .default_reminders_list
+                .clone()
+                .unwrap_or_default(),
             id: uuid::Uuid::new_v4().to_string(),
         })
     }

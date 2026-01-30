@@ -250,24 +250,20 @@ macro_rules! traced {
 }
 
 /// Message processing span attributes
-pub fn message_attrs(
-    channel: &str,
-    message_id: &str,
-    direction: &str,
-) -> Vec<(String, String)> {
+pub fn message_attrs(channel: &str, message_id: &str, direction: &str) -> Vec<(String, String)> {
     vec![
         ("messaging.system".to_string(), "carapace".to_string()),
         ("messaging.destination".to_string(), channel.to_string()),
         ("messaging.message_id".to_string(), message_id.to_string()),
-        ("messaging.message.direction".to_string(), direction.to_string()),
+        (
+            "messaging.message.direction".to_string(),
+            direction.to_string(),
+        ),
     ]
 }
 
 /// Plugin execution span attributes
-pub fn plugin_attrs(
-    plugin_id: &str,
-    tool_name: &str,
-) -> Vec<(String, String)> {
+pub fn plugin_attrs(plugin_id: &str, tool_name: &str) -> Vec<(String, String)> {
     vec![
         ("plugin.id".to_string(), plugin_id.to_string()),
         ("plugin.tool".to_string(), tool_name.to_string()),
@@ -275,11 +271,7 @@ pub fn plugin_attrs(
 }
 
 /// HTTP server span attributes
-pub fn http_server_attrs(
-    method: &str,
-    path: &str,
-    status_code: u16,
-) -> Vec<(String, String)> {
+pub fn http_server_attrs(method: &str, path: &str, status_code: u16) -> Vec<(String, String)> {
     vec![
         ("http.method".to_string(), method.to_string()),
         ("http.url".to_string(), path.to_string()),
@@ -289,10 +281,7 @@ pub fn http_server_attrs(
 }
 
 /// Channel operation span attributes
-pub fn channel_attrs(
-    channel: &str,
-    operation: &str,
-) -> Vec<(String, String)> {
+pub fn channel_attrs(channel: &str, operation: &str) -> Vec<(String, String)> {
     vec![
         ("channel.type".to_string(), channel.to_string()),
         ("channel.operation".to_string(), operation.to_string()),
@@ -346,7 +335,11 @@ mod tests {
         span.add_event("test_event", None);
         span.add_event(
             "event_with_attrs",
-            Some(vec![("attr".to_string(), "value".to_string())].into_iter().collect()),
+            Some(
+                vec![("attr".to_string(), "value".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
         );
 
         assert_eq!(span.events.len(), 2);

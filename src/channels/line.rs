@@ -57,8 +57,7 @@ pub struct LineChannel {
 impl LineChannel {
     /// Create new channel
     pub fn new(config: LineConfig) -> Self {
-        let client = reqwest::ClientBuilder::new()
-            .build();
+        let client = reqwest::ClientBuilder::new().build();
 
         Self {
             config: Arc::new(config),
@@ -100,7 +99,9 @@ impl LineChannel {
 
         // Validate configuration
         if self.config.channel_access_token.is_empty() {
-            return Err(LineError::Config("channel_access_token is required".to_string()));
+            return Err(LineError::Config(
+                "channel_access_token is required".to_string(),
+            ));
         }
         if self.config.channel_secret.is_empty() {
             return Err(LineError::Config("channel_secret is required".to_string()));
@@ -124,13 +125,19 @@ impl LineChannel {
         let response = self
             .client
             .get(format!("{}/bot/info", LINE_API_BASE))
-            .header("Authorization", format!("Bearer {}", self.config.channel_access_token))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.config.channel_access_token),
+            )
             .send()
             .await?;
 
         if !response.status().is_success() {
             let error = response.text().await.unwrap_or_default();
-            return Err(LineError::Api(format!("Failed to verify credentials: {}", error)));
+            return Err(LineError::Api(format!(
+                "Failed to verify credentials: {}",
+                error
+            )));
         }
 
         Ok(())
@@ -204,7 +211,10 @@ impl LineChannel {
             .client
             .post(format!("{}{}", LINE_API_BASE, LINE_SEND_MESSAGE_ENDPOINT))
             .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", self.config.channel_access_token))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.config.channel_access_token),
+            )
             .json(payload)
             .send()
             .await?;
@@ -228,8 +238,12 @@ impl LineChannel {
             .expect("Invalid channel secret length");
 
         mac.update(body);
-        mac.verify_slice(&STANDARD.decode(signature).expect("Invalid signature format"))
-            .is_ok()
+        mac.verify_slice(
+            &STANDARD
+                .decode(signature)
+                .expect("Invalid signature format"),
+        )
+        .is_ok()
     }
 
     /// Parse and validate incoming webhook event
@@ -245,8 +259,8 @@ impl LineChannel {
         }
 
         // Parse event
-        let event: LineWebhookEvent = serde_json::from_slice(body)
-            .map_err(|e| LineError::Parse(e.to_string()))?;
+        let event: LineWebhookEvent =
+            serde_json::from_slice(body).map_err(|e| LineError::Parse(e.to_string()))?;
 
         // Check if user is allowed
         for line_event in &event.events {
@@ -257,8 +271,7 @@ impl LineChannel {
             };
 
             if let Some(id) = user_id {
-                if !self.config.allowed_users.is_empty()
-                    && !self.config.allowed_users.contains(id)
+                if !self.config.allowed_users.is_empty() && !self.config.allowed_users.contains(id)
                 {
                     tracing::warn!(user_id = %id, "User not in allowed list");
                     return Err(LineError::Unauthorized(id.clone()));
@@ -274,13 +287,19 @@ impl LineChannel {
         let response = self
             .client
             .get(format!("{}/bot/profile/{}", LINE_API_BASE, user_id))
-            .header("Authorization", format!("Bearer {}", self.config.channel_access_token))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.config.channel_access_token),
+            )
             .send()
             .await?;
 
         if !response.status().is_success() {
             let error = response.text().await.unwrap_or_default();
-            return Err(LineError::Api(format!("Failed to get user profile: {}", error)));
+            return Err(LineError::Api(format!(
+                "Failed to get user profile: {}",
+                error
+            )));
         }
 
         let profile: UserProfile = response.json().await?;
@@ -298,13 +317,19 @@ impl LineChannel {
         let response = self
             .client
             .post(format!("{}{}", LINE_API_BASE, endpoint))
-            .header("Authorization", format!("Bearer {}", self.config.channel_access_token))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.config.channel_access_token),
+            )
             .send()
             .await?;
 
         if !response.status().is_success() {
             let error = response.text().await.unwrap_or_default();
-            return Err(LineError::Api(format!("Failed to leave {}: {}", target_type, error)));
+            return Err(LineError::Api(format!(
+                "Failed to leave {}: {}",
+                target_type, error
+            )));
         }
 
         Ok(())
@@ -408,10 +433,16 @@ pub enum LineSource {
     User { user_id: String },
     /// Group source
     #[serde(rename = "group")]
-    Group { group_id: String, user_id: Option<String> },
+    Group {
+        group_id: String,
+        user_id: Option<String>,
+    },
     /// Room source
     #[serde(rename = "room")]
-    Room { room_id: String, user_id: Option<String> },
+    Room {
+        room_id: String,
+        user_id: Option<String>,
+    },
 }
 
 /// LINE message

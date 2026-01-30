@@ -41,9 +41,9 @@ pub mod host;
 pub mod hotreload;
 pub mod loader;
 pub mod runtime;
+pub mod tools;
 #[cfg(feature = "typescript")]
 pub mod typescript;
-pub mod tools;
 
 pub mod caps;
 

@@ -165,18 +165,16 @@ pub(crate) fn persist_config_file(path: &PathBuf, config_value: &Value) -> Resul
 
     // Encrypt sensitive fields before saving
     let encrypted_config = match encryption::get_or_create_master_key() {
-        Ok(master_key) => {
-            match encryption::encrypt_config(config_value, &master_key) {
-                Ok(encrypted) => {
-                    tracing::debug!("Config encrypted successfully");
-                    encrypted
-                }
-                Err(e) => {
-                    tracing::error!("Failed to encrypt config: {}", e);
-                    return Err(format!("failed to encrypt config: {}", e));
-                }
+        Ok(master_key) => match encryption::encrypt_config(config_value, &master_key) {
+            Ok(encrypted) => {
+                tracing::debug!("Config encrypted successfully");
+                encrypted
             }
-        }
+            Err(e) => {
+                tracing::error!("Failed to encrypt config: {}", e);
+                return Err(format!("failed to encrypt config: {}", e));
+            }
+        },
         Err(e) => {
             tracing::error!("Failed to get master key: {}", e);
             return Err(format!("failed to get master key: {}", e));

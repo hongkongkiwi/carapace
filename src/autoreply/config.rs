@@ -113,7 +113,12 @@ fn default_true() -> bool {
 
 impl AutoReplyRule {
     /// Create a new auto-reply rule
-    pub fn new(id: impl Into<String>, name: impl Into<String>, trigger: TriggerType, response: ResponseType) -> Self {
+    pub fn new(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        trigger: TriggerType,
+        response: ResponseType,
+    ) -> Self {
         Self {
             id: id.into(),
             name: name.into(),
@@ -296,10 +301,7 @@ impl AutoReplyConfig {
 
     /// Get enabled rules sorted by priority
     pub fn enabled_rules(&self) -> Vec<&AutoReplyRule> {
-        self.rules
-            .iter()
-            .filter(|r| r.enabled)
-            .collect()
+        self.rules.iter().filter(|r| r.enabled).collect()
     }
 
     /// Validate the configuration
@@ -329,7 +331,10 @@ impl AutoReplyConfig {
             // Validate random responses aren't empty
             if let ResponseType::Random(options) = &rule.response {
                 if options.is_empty() {
-                    return Err(format!("Random response in rule {} has no options", rule.id));
+                    return Err(format!(
+                        "Random response in rule {} has no options",
+                        rule.id
+                    ));
                 }
             }
         }
@@ -428,26 +433,35 @@ mod tests {
     fn test_config_rules_sorted_by_priority() {
         let mut config = AutoReplyConfig::new();
 
-        config.add_rule(AutoReplyRule::new(
-            "low",
-            "Low Priority",
-            TriggerType::Any,
-            ResponseType::Text("Low".to_string()),
-        ).with_priority(1));
+        config.add_rule(
+            AutoReplyRule::new(
+                "low",
+                "Low Priority",
+                TriggerType::Any,
+                ResponseType::Text("Low".to_string()),
+            )
+            .with_priority(1),
+        );
 
-        config.add_rule(AutoReplyRule::new(
-            "high",
-            "High Priority",
-            TriggerType::Any,
-            ResponseType::Text("High".to_string()),
-        ).with_priority(10));
+        config.add_rule(
+            AutoReplyRule::new(
+                "high",
+                "High Priority",
+                TriggerType::Any,
+                ResponseType::Text("High".to_string()),
+            )
+            .with_priority(10),
+        );
 
-        config.add_rule(AutoReplyRule::new(
-            "medium",
-            "Medium Priority",
-            TriggerType::Any,
-            ResponseType::Text("Medium".to_string()),
-        ).with_priority(5));
+        config.add_rule(
+            AutoReplyRule::new(
+                "medium",
+                "Medium Priority",
+                TriggerType::Any,
+                ResponseType::Text("Medium".to_string()),
+            )
+            .with_priority(5),
+        );
 
         let enabled = config.enabled_rules();
         assert_eq!(enabled[0].id, "high");

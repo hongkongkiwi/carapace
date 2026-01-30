@@ -100,20 +100,48 @@ pub enum DiscordError {
 
 fn intents_to_bits(intents: &DiscordIntents) -> u32 {
     let mut bits = 0u32;
-    if intents.guilds { bits |= 1 << 0; }
-    if intents.guild_members { bits |= 1 << 1; }
-    if intents.guild_bans { bits |= 1 << 2; }
-    if intents.guild_emojis { bits |= 1 << 3; }
-    if intents.guild_integrations { bits |= 1 << 4; }
-    if intents.guild_webhooks { bits |= 1 << 5; }
-    if intents.guild_messages { bits |= 1 << 9; }
-    if intents.guild_message_reactions { bits |= 1 << 10; }
-    if intents.guild_message_typing { bits |= 1 << 11; }
-    if intents.direct_messages { bits |= 1 << 12; }
-    if intents.direct_message_reactions { bits |= 1 << 13; }
-    if intents.direct_message_typing { bits |= 1 << 14; }
-    if intents.message_content { bits |= 1 << 15; }
-    if intents.guild_scheduled_events { bits |= 1 << 16; }
+    if intents.guilds {
+        bits |= 1 << 0;
+    }
+    if intents.guild_members {
+        bits |= 1 << 1;
+    }
+    if intents.guild_bans {
+        bits |= 1 << 2;
+    }
+    if intents.guild_emojis {
+        bits |= 1 << 3;
+    }
+    if intents.guild_integrations {
+        bits |= 1 << 4;
+    }
+    if intents.guild_webhooks {
+        bits |= 1 << 5;
+    }
+    if intents.guild_messages {
+        bits |= 1 << 9;
+    }
+    if intents.guild_message_reactions {
+        bits |= 1 << 10;
+    }
+    if intents.guild_message_typing {
+        bits |= 1 << 11;
+    }
+    if intents.direct_messages {
+        bits |= 1 << 12;
+    }
+    if intents.direct_message_reactions {
+        bits |= 1 << 13;
+    }
+    if intents.direct_message_typing {
+        bits |= 1 << 14;
+    }
+    if intents.message_content {
+        bits |= 1 << 15;
+    }
+    if intents.guild_scheduled_events {
+        bits |= 1 << 16;
+    }
     bits
 }
 
@@ -135,14 +163,25 @@ impl DiscordChannel {
             .build()
             .expect("Failed to build reqwest client");
 
-        let http_url = format!("https://discord.com/api/v10");
-        let ws_url = format!("wss://gateway.discord.gg");
+        let http_url = "https://discord.com/api/v10".to_string();
+        let ws_url = "wss://gateway.discord.gg".to_string();
 
-        Self { config, client, event_tx, http_url, ws_url }
+        Self {
+            config,
+            client,
+            event_tx,
+            http_url,
+            ws_url,
+        }
     }
 
     /// Send a request to the Discord API
-    async fn api_request<T: for<'de> Deserialize<'de>>(&self, method: reqwest::Method, endpoint: &str, body: Option<serde_json::Value>) -> Result<T, DiscordError> {
+    async fn api_request<T: for<'de> Deserialize<'de>>(
+        &self,
+        method: reqwest::Method,
+        endpoint: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<T, DiscordError> {
         let mut request = self
             .client
             .request(method, format!("{}/{}", self.http_url, endpoint))
@@ -158,7 +197,10 @@ impl DiscordChannel {
             .map_err(|e| DiscordError::Network(e.to_string()))?;
 
         if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(DiscordError::Api(error_text));
         }
 
@@ -169,7 +211,12 @@ impl DiscordChannel {
     }
 
     /// Send a text message
-    pub async fn send_message(&self, channel_id: &str, content: &str, embeds: Option<Vec<DiscordEmbed>>) -> Result<String, DiscordError> {
+    pub async fn send_message(
+        &self,
+        channel_id: &str,
+        content: &str,
+        embeds: Option<Vec<DiscordEmbed>>,
+    ) -> Result<String, DiscordError> {
         let mut body = serde_json::json!({
             "content": content,
         });
@@ -178,21 +225,34 @@ impl DiscordChannel {
             body["embeds"] = serde_json::json!(embeds);
         }
 
-        self.api_request::<DiscordMessageResponse>(reqwest::Method::POST, &format!("channels/{}/messages", channel_id), Some(body))
-            .await
-            .map(|r| r.id)
+        self.api_request::<DiscordMessageResponse>(
+            reqwest::Method::POST,
+            &format!("channels/{}/messages", channel_id),
+            Some(body),
+        )
+        .await
+        .map(|r| r.id)
     }
 
     /// Create a message with components (buttons, select menus)
-    pub async fn send_with_components(&self, channel_id: &str, content: &str, components: Vec<DiscordComponent>) -> Result<String, DiscordError> {
+    pub async fn send_with_components(
+        &self,
+        channel_id: &str,
+        content: &str,
+        components: Vec<DiscordComponent>,
+    ) -> Result<String, DiscordError> {
         let body = serde_json::json!({
             "content": content,
             "components": components.iter().map(|c| c.to_json()).collect::<Vec<_>>(),
         });
 
-        self.api_request::<DiscordMessageResponse>(reqwest::Method::POST, &format!("channels/{}/messages", channel_id), Some(body))
-            .await
-            .map(|r| r.id)
+        self.api_request::<DiscordMessageResponse>(
+            reqwest::Method::POST,
+            &format!("channels/{}/messages", channel_id),
+            Some(body),
+        )
+        .await
+        .map(|r| r.id)
     }
 
     /// Connect to Discord
@@ -200,7 +260,9 @@ impl DiscordChannel {
         info!("Connecting to Discord...");
 
         // Verify the bot token
-        let _: DiscordUserResponse = self.api_request(reqwest::Method::GET, "users/@me", None).await?;
+        let _: DiscordUserResponse = self
+            .api_request(reqwest::Method::GET, "users/@me", None)
+            .await?;
 
         info!("Discord connected successfully");
         Ok(())

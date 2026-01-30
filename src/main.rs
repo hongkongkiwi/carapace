@@ -28,8 +28,8 @@ mod flows;
 mod hooks;
 mod logging;
 mod media;
-mod migrations;
 mod messages;
+mod migrations;
 mod nodes;
 mod plugins;
 mod security;
@@ -266,8 +266,10 @@ async fn main() {
 
             // Fall back to environment variables for secrets (not exposed in process list)
             let hooks_token = hooks_token.or_else(|| std::env::var("CARAPACE_HOOKS_TOKEN").ok());
-            let gateway_token = gateway_token.or_else(|| std::env::var("CARAPACE_GATEWAY_TOKEN").ok());
-            let gateway_password = gateway_password.or_else(|| std::env::var("CARAPACE_GATEWAY_PASSWORD").ok());
+            let gateway_token =
+                gateway_token.or_else(|| std::env::var("CARAPACE_GATEWAY_TOKEN").ok());
+            let gateway_password =
+                gateway_password.or_else(|| std::env::var("CARAPACE_GATEWAY_PASSWORD").ok());
 
             // Set up logging
             if let Some(log_level) = log {
@@ -323,17 +325,25 @@ async fn main() {
             info!("TLS Mode: {}", tls_config.mode_description());
 
             // Extract configuration from config file
-            let hooks_enabled = hooks || dev || crate::config::get_bool(&config_values, "hooks.enabled").unwrap_or(false);
-            let hooks_path = crate::config::get_string(&config_values, "hooks.path").unwrap_or_else(|| "/hooks".to_string());
-            let gateway_password = gateway_password.or_else(|| crate::config::get_string(&config_values, "gateway.password"));
-            let control_ui_enabled = ui || crate::config::get_bool(&config_values, "ui.enabled").unwrap_or(false);
+            let hooks_enabled = hooks
+                || dev
+                || crate::config::get_bool(&config_values, "hooks.enabled").unwrap_or(false);
+            let hooks_path = crate::config::get_string(&config_values, "hooks.path")
+                .unwrap_or_else(|| "/hooks".to_string());
+            let gateway_password = gateway_password
+                .or_else(|| crate::config::get_string(&config_values, "gateway.password"));
+            let control_ui_enabled =
+                ui || crate::config::get_bool(&config_values, "ui.enabled").unwrap_or(false);
             let control_ui_base_path = if ui_base_path.is_empty() {
                 crate::config::get_string(&config_values, "ui.base_path").unwrap_or_default()
             } else {
                 ui_base_path
             };
-            let openai_enabled = openai || crate::config::get_bool(&config_values, "openai.enabled").unwrap_or(false);
-            let control_enabled = control || dev || crate::config::get_bool(&config_values, "control.enabled").unwrap_or(false);
+            let openai_enabled = openai
+                || crate::config::get_bool(&config_values, "openai.enabled").unwrap_or(false);
+            let control_enabled = control
+                || dev
+                || crate::config::get_bool(&config_values, "control.enabled").unwrap_or(false);
 
             // Build configuration
             let http_config = HttpConfig {
@@ -362,14 +372,8 @@ async fn main() {
             };
 
             // Start server
-            if let Err(e) = start_server(
-                bind,
-                http_config,
-                middleware_config,
-                pid_file,
-                tls_config,
-            )
-            .await
+            if let Err(e) =
+                start_server(bind, http_config, middleware_config, pid_file, tls_config).await
             {
                 error!("Server failed: {}", e);
                 process::exit(1);
@@ -426,7 +430,9 @@ async fn main() {
                             let _ = fs::remove_file(&pid_file);
                             println!("Gateway killed.");
                         } else {
-                            eprintln!("Error: Gateway did not stop gracefully. Use --force to kill.");
+                            eprintln!(
+                                "Error: Gateway did not stop gracefully. Use --force to kill."
+                            );
                             process::exit(1);
                         }
                     }
@@ -479,7 +485,9 @@ async fn main() {
                     .build()
                     .unwrap();
                 let health_url = format!("{}/control/status", url);
-                match tokio::time::timeout(Duration::from_secs(5), client.get(&health_url).send()).await {
+                match tokio::time::timeout(Duration::from_secs(5), client.get(&health_url).send())
+                    .await
+                {
                     Ok(Ok(resp)) => {
                         if resp.status().is_success() {
                             match resp.json::<serde_json::Value>().await {
@@ -559,7 +567,10 @@ async fn main() {
                                                     }
                                                 }
                                             }
-                                            println!("{}", serde_json::to_string_pretty(current).unwrap());
+                                            println!(
+                                                "{}",
+                                                serde_json::to_string_pretty(current).unwrap()
+                                            );
                                         }
                                         Err(e) => {
                                             eprintln!("Error: Invalid JSON5: {}", e);
@@ -580,14 +591,20 @@ async fn main() {
                     }
                 }
 
-                ConfigCommands::Set { key, value, config: _ } => {
+                ConfigCommands::Set {
+                    key,
+                    value,
+                    config: _,
+                } => {
                     println!("Setting {} = {} (not yet implemented)", key, value);
                     // TODO: Implement config setting
                 }
 
                 ConfigCommands::Schema => {
                     println!("// JSON Schema for carapace configuration");
-                    println!("// This is a placeholder - full schema generation not yet implemented");
+                    println!(
+                        "// This is a placeholder - full schema generation not yet implemented"
+                    );
                     println!("{{");
                     println!("  \"$schema\": \"http://json-schema.org/draft-07/schema#\",");
                     println!("  \"title\": \"Carapace Configuration\",");
@@ -603,11 +620,11 @@ async fn main() {
             info!("Running database migrations...");
 
             // Use DATABASE_URL env var or build from components
-            let connection_url = database_url.or_else(|| std::env::var("DATABASE_URL").ok())
+            let connection_url = database_url
+                .or_else(|| std::env::var("DATABASE_URL").ok())
                 .unwrap_or_else(|| {
                     // Default to SQLite for local development
-                    let data_dir = dirs::data_dir()
-                        .unwrap_or_else(|| PathBuf::from("."));
+                    let data_dir = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
                     std::fs::create_dir_all(&data_dir).ok();
                     format!("sqlite:{}", data_dir.join("carapace.db").display())
                 });

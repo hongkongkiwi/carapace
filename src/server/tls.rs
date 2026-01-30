@@ -121,8 +121,7 @@ fn default_key_path() -> PathBuf {
 
 /// Load certificates from a PEM file
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsError> {
-    let file = fs::File::open(path)
-        .map_err(|e| TlsError::CertificateReadError(e))?;
+    let file = fs::File::open(path).map_err(|e| TlsError::CertificateReadError(e))?;
     let mut reader = BufReader::new(file);
 
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
@@ -146,8 +145,9 @@ fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsError> {
         .filter_map(|key| key.ok())
         .next()
     {
-        return Ok(PrivateKeyDer::try_from(key)
-            .map_err(|e| TlsError::InvalidPrivateKey(e.to_string()))?);
+        return Ok(
+            PrivateKeyDer::try_from(key).map_err(|e| TlsError::InvalidPrivateKey(e.to_string()))?
+        );
     }
 
     // Reset reader and try RSA
@@ -157,8 +157,9 @@ fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsError> {
         .filter_map(|key| key.ok())
         .next()
     {
-        return Ok(PrivateKeyDer::try_from(key)
-            .map_err(|e| TlsError::InvalidPrivateKey(e.to_string()))?);
+        return Ok(
+            PrivateKeyDer::try_from(key).map_err(|e| TlsError::InvalidPrivateKey(e.to_string()))?
+        );
     }
 
     Err(TlsError::NoPrivateKeyFound(path.to_path_buf()))
@@ -238,19 +239,27 @@ pub fn generate_self_signed_cert(cert_path: &Path, key_path: &Path) -> Result<()
 
     // Create directory if needed
     if let Some(parent) = cert_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| TlsError::CertificateReadError(e))?;
+        fs::create_dir_all(parent).map_err(|e| TlsError::CertificateReadError(e))?;
     }
 
     // Use openssl command to generate self-signed certificate
     let output = Command::new("openssl")
         .args([
-            "req", "-x509", "-nodes", "-days", "365",
-            "-newkey", "rsa:2048",
-            "-keyout", key_path.to_str().unwrap(),
-            "-out", cert_path.to_str().unwrap(),
-            "-subj", "/CN=localhost/O=Carapace Development",
-            "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
+            "req",
+            "-x509",
+            "-nodes",
+            "-days",
+            "365",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            key_path.to_str().unwrap(),
+            "-out",
+            cert_path.to_str().unwrap(),
+            "-subj",
+            "/CN=localhost/O=Carapace Development",
+            "-addext",
+            "subjectAltName=DNS:localhost,IP:127.0.0.1",
         ])
         .output()
         .map_err(|e| TlsError::ConfigCreationError(format!("Failed to run openssl: {}", e)))?;
@@ -267,12 +276,10 @@ pub fn generate_self_signed_cert(cert_path: &Path, key_path: &Path) -> Result<()
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let metadata = fs::metadata(key_path)
-            .map_err(|e| TlsError::KeyReadError(e))?;
+        let metadata = fs::metadata(key_path).map_err(|e| TlsError::KeyReadError(e))?;
         let mut permissions = metadata.permissions();
         permissions.set_mode(0o600); // Owner read/write only
-        fs::set_permissions(key_path, permissions)
-            .map_err(|e| TlsError::KeyReadError(e))?;
+        fs::set_permissions(key_path, permissions).map_err(|e| TlsError::KeyReadError(e))?;
     }
 
     info!("✓ Self-signed certificate generated:");

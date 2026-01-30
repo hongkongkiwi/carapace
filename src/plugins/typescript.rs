@@ -142,7 +142,9 @@ impl TsPlugin {
         let runtime = unsafe {
             let rt = quickjs_wasm_sys::JS_NewRuntime();
             if rt.is_null() {
-                return Err(TsPluginError::QuickJsError("Failed to create runtime".to_string()));
+                return Err(TsPluginError::QuickJsError(
+                    "Failed to create runtime".to_string(),
+                ));
             }
             JsRuntime { runtime: rt }
         };
@@ -156,7 +158,9 @@ impl TsPlugin {
         let context = unsafe {
             let ctx = quickjs_wasm_sys::JS_NewContext(runtime.runtime);
             if ctx.is_null() {
-                return Err(TsPluginError::QuickJsError("Failed to create context".to_string()));
+                return Err(TsPluginError::QuickJsError(
+                    "Failed to create context".to_string(),
+                ));
             }
             JsContextWrapper {
                 context: ctx,
@@ -214,8 +218,8 @@ impl TsPlugin {
     /// Call plugin init function
     fn call_init(&self, context: &JsContextWrapper) -> Result<(), TsPluginError> {
         unsafe {
-            let init_fn_name = CString::new("init")
-                .map_err(|e| TsPluginError::ExecutionError(e.to_string()))?;
+            let init_fn_name =
+                CString::new("init").map_err(|e| TsPluginError::ExecutionError(e.to_string()))?;
 
             let init_val = quickjs_wasm_sys::JS_GetPropertyStr(
                 context.context,
@@ -294,16 +298,14 @@ impl TsPlugin {
     }
 
     /// Execute a tool function
-    pub fn call_tool(
-        &self,
-        tool_name: &str,
-        args: &str,
-    ) -> Result<String, TsPluginError> {
+    pub fn call_tool(&self, tool_name: &str, args: &str) -> Result<String, TsPluginError> {
         if !self.initialized {
             return Err(TsPluginError::NotInitialized);
         }
 
-        let context = self.context.as_ref()
+        let context = self
+            .context
+            .as_ref()
             .ok_or_else(|| TsPluginError::NotInitialized)?;
 
         unsafe {
@@ -323,10 +325,11 @@ impl TsPlugin {
 
             let tool_name_cstring = CString::new(tool_name)
                 .map_err(|e| TsPluginError::ExecutionError(e.to_string()))?;
-            let args_cstring = CString::new(args)
-                .map_err(|e| TsPluginError::ExecutionError(e.to_string()))?;
+            let args_cstring =
+                CString::new(args).map_err(|e| TsPluginError::ExecutionError(e.to_string()))?;
 
-            let tool_name_val = quickjs_wasm_sys::JS_NewString(context.context, tool_name_cstring.as_ptr());
+            let tool_name_val =
+                quickjs_wasm_sys::JS_NewString(context.context, tool_name_cstring.as_ptr());
             let args_val = quickjs_wasm_sys::JS_NewString(context.context, args_cstring.as_ptr());
 
             let mut argv = [tool_name_val, args_val];
@@ -358,9 +361,7 @@ impl TsPlugin {
 
     /// Check if a value is an error
     fn is_error(&self, context: &JsContextWrapper, value: JSValue) -> bool {
-        unsafe {
-            quickjs_wasm_sys::JS_IsError(context.context, value) == 1
-        }
+        unsafe { quickjs_wasm_sys::JS_IsError(context.context, value) == 1 }
     }
 
     /// Free a JS value
@@ -374,7 +375,8 @@ impl TsPlugin {
     fn get_error_message(&self, context: &JsContextWrapper) -> String {
         unsafe {
             let exception = quickjs_wasm_sys::JS_GetException(context.context);
-            let message = self.value_to_string(context, exception)
+            let message = self
+                .value_to_string(context, exception)
                 .unwrap_or_else(|_| "Unknown error".to_string());
             self.free_value(context, exception);
             message
@@ -382,17 +384,28 @@ impl TsPlugin {
     }
 
     /// Convert JS value to string
-    fn value_to_string(&self, context: &JsContextWrapper, value: JSValue) -> Result<String, TsPluginError> {
+    fn value_to_string(
+        &self,
+        context: &JsContextWrapper,
+        value: JSValue,
+    ) -> Result<String, TsPluginError> {
         unsafe {
             let str_val = quickjs_wasm_sys::JS_ToString(context.context, value);
             // JS_ToString returns 0 on error
             if str_val == 0 {
-                return Err(TsPluginError::ExecutionError("Failed to convert to string".to_string()));
+                return Err(TsPluginError::ExecutionError(
+                    "Failed to convert to string".to_string(),
+                ));
             }
-            let ptr = quickjs_wasm_sys::JS_AtomToCString(context.context, quickjs_wasm_sys::JS_ValueToAtom(context.context, str_val));
+            let ptr = quickjs_wasm_sys::JS_AtomToCString(
+                context.context,
+                quickjs_wasm_sys::JS_ValueToAtom(context.context, str_val),
+            );
             if ptr.is_null() {
                 self.free_value(context, str_val);
-                return Err(TsPluginError::ExecutionError("Failed to get C string".to_string()));
+                return Err(TsPluginError::ExecutionError(
+                    "Failed to get C string".to_string(),
+                ));
             }
             let result = CStr::from_ptr(ptr).to_string_lossy().into_owned();
             quickjs_wasm_sys::JS_FreeCString(context.context, ptr);
@@ -427,8 +440,8 @@ impl Drop for TsPlugin {
         if self.initialized {
             if let Some(ref context) = self.context {
                 unsafe {
-                    let shutdown_name = CString::new("shutdown")
-                        .expect("Failed to create shutdown string");
+                    let shutdown_name =
+                        CString::new("shutdown").expect("Failed to create shutdown string");
 
                     let shutdown_val = quickjs_wasm_sys::JS_GetPropertyStr(
                         context.context,
@@ -478,7 +491,9 @@ impl TsPluginRegistry {
         tool_name: &str,
         args: &str,
     ) -> Result<String, TsPluginError> {
-        let plugin = self.plugins.get(plugin_id)
+        let plugin = self
+            .plugins
+            .get(plugin_id)
             .ok_or_else(|| TsPluginError::PluginNotFound(plugin_id.to_string()))?;
 
         let result = plugin.borrow().call_tool(tool_name, args)?;
@@ -523,8 +538,7 @@ pub fn load_ts_plugin_sync(
 ) -> Result<TsPlugin, TsPluginError> {
     use std::fs;
 
-    let code = fs::read_to_string(&path)
-        .map_err(|e| TsPluginError::IoError(e.to_string()))?;
+    let code = fs::read_to_string(&path).map_err(|e| TsPluginError::IoError(e.to_string()))?;
 
     let name = path
         .file_stem()

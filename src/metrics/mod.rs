@@ -81,10 +81,7 @@ impl Histogram {
 
     /// Create a histogram with custom bucket bounds (in milliseconds)
     pub fn with_buckets(bounds: &[u64]) -> Self {
-        let buckets = bounds
-            .iter()
-            .map(|&b| (b, AtomicU64::new(0)))
-            .collect();
+        let buckets = bounds.iter().map(|&b| (b, AtomicU64::new(0))).collect();
 
         Self {
             buckets,
@@ -290,9 +287,7 @@ impl MetricsRegistry {
         let histograms = self.histograms.read().unwrap();
         histograms
             .iter()
-            .map(|(name, hist)| {
-                (name.clone(), (hist.count(), hist.sum(), hist.mean()))
-            })
+            .map(|(name, hist)| (name.clone(), (hist.count(), hist.sum(), hist.mean())))
             .collect()
     }
 }
@@ -394,9 +389,16 @@ pub fn prometheus_exposition(registry: &MetricsRegistry) -> String {
         output.push_str(&format!("{}_count {}\n", metric_name, hist.count()));
 
         for (bound, count) in hist.buckets() {
-            output.push_str(&format!("{}_bucket{{le={}}} {}\n", metric_name, bound, count));
+            output.push_str(&format!(
+                "{}_bucket{{le={}}} {}\n",
+                metric_name, bound, count
+            ));
         }
-        output.push_str(&format!("{}_bucket{{le=+Inf}} {}\n\n", metric_name, hist.count()));
+        output.push_str(&format!(
+            "{}_bucket{{le=+Inf}} {}\n\n",
+            metric_name,
+            hist.count()
+        ));
     }
 
     output

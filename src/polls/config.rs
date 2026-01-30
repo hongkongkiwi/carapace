@@ -305,9 +305,7 @@ impl PollConfig {
                 }
 
                 // For quiz, at least one option should be correct
-                if self.poll_type == PollType::Quiz
-                    && !self.options.iter().any(|o| o.is_correct)
-                {
+                if self.poll_type == PollType::Quiz && !self.options.iter().any(|o| o.is_correct) {
                     return Err("Quiz poll must have at least one correct answer".to_string());
                 }
             }
@@ -670,7 +668,8 @@ mod tests {
 
     #[test]
     fn test_vote_anonymous() {
-        let vote = PollVote::new_choice("vote1", "poll1", "user1", vec!["opt1".to_string()]).anonymous();
+        let vote =
+            PollVote::new_choice("vote1", "poll1", "user1", vec!["opt1".to_string()]).anonymous();
         assert!(vote.is_anonymous);
     }
 

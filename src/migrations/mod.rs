@@ -94,9 +94,7 @@ impl MigrationRunner {
             self.table_name
         );
 
-        let versions: Vec<i64> = sqlx::query_scalar(&query)
-            .fetch_all(pool)
-            .await?;
+        let versions: Vec<i64> = sqlx::query_scalar(&query).fetch_all(pool).await?;
 
         Ok(versions)
     }
@@ -109,7 +107,13 @@ impl MigrationRunner {
 
         let mut files: Vec<PathBuf> = std::fs::read_dir(&self.migrations_dir)?
             .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.path().extension().map(|e| e == "sql").unwrap_or(false))
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .map(|e| e == "sql")
+                    .unwrap_or(false)
+            })
             .map(|entry| entry.path())
             .collect();
 
@@ -136,9 +140,9 @@ impl MigrationRunner {
             )));
         }
 
-        let version: i64 = parts[0]
-            .parse()
-            .map_err(|_| MigrationError::InvalidName(format!("Invalid version in: {}", filename.display())))?;
+        let version: i64 = parts[0].parse().map_err(|_| {
+            MigrationError::InvalidName(format!("Invalid version in: {}", filename.display()))
+        })?;
 
         let name = parts[1].to_string();
 
@@ -184,11 +188,12 @@ impl MigrationRunner {
             for statement in sql.split(';').filter(|s| !s.trim().is_empty()) {
                 let trimmed = statement.trim();
                 if !trimmed.is_empty() {
-                    sqlx::query(trimmed).execute(&mut *tx).await
-                        .map_err(|e| MigrationError::Failed {
+                    sqlx::query(trimmed).execute(&mut *tx).await.map_err(|e| {
+                        MigrationError::Failed {
                             name: name.clone(),
                             message: e.to_string(),
-                        })?;
+                        }
+                    })?;
                 }
             }
 
@@ -234,19 +239,15 @@ impl MigrationRunner {
             self.table_name
         );
 
-        let last_migration: Option<(i64, String)> = sqlx::query_as(&query)
-            .fetch_optional(&pool)
-            .await?;
+        let last_migration: Option<(i64, String)> =
+            sqlx::query_as(&query).fetch_optional(&pool).await?;
 
         if let Some((version, name)) = last_migration {
             tracing::info!("Rolling back migration: {}", name);
 
             // Note: In a real implementation, you would need to read the
             // corresponding rollback SQL from a .down.sql file
-            let delete_query = format!(
-                "DELETE FROM {} WHERE version = $1",
-                self.table_name
-            );
+            let delete_query = format!("DELETE FROM {} WHERE version = $1", self.table_name);
 
             sqlx::query(&delete_query)
                 .bind(version)
@@ -329,16 +330,16 @@ mod tests {
             table_name: "test_migrations".to_string(),
         };
 
-        let (version, name) = runner.parse_migration_filename(
-            Path::new("20240101120000_create_users.sql")
-        ).unwrap();
+        let (version, name) = runner
+            .parse_migration_filename(Path::new("20240101120000_create_users.sql"))
+            .unwrap();
 
         assert_eq!(version, 20240101120000);
         assert_eq!(name, "create_users");
 
-        let (version, name) = runner.parse_migration_filename(
-            Path::new("20240101120001_add_email_to_users.sql")
-        ).unwrap();
+        let (version, name) = runner
+            .parse_migration_filename(Path::new("20240101120001_add_email_to_users.sql"))
+            .unwrap();
 
         assert_eq!(version, 20240101120001);
         assert_eq!(name, "add_email_to_users");
@@ -352,8 +353,12 @@ mod tests {
             table_name: "test_migrations".to_string(),
         };
 
-        assert!(runner.parse_migration_filename(Path::new("invalid.sql")).is_err());
-        assert!(runner.parse_migration_filename(Path::new("123_no_underscore.sql")).is_err());
+        assert!(runner
+            .parse_migration_filename(Path::new("invalid.sql"))
+            .is_err());
+        assert!(runner
+            .parse_migration_filename(Path::new("123_no_underscore.sql"))
+            .is_err());
     }
 
     #[test]

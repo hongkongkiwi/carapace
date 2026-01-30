@@ -15,7 +15,7 @@ use serde_json::json;
 use std::collections::HashMap;
 
 /// Channel type identifier
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ChannelType {
     Console,
@@ -28,6 +28,7 @@ pub enum ChannelType {
     Skype,
     Slack,
     Teams,
+    #[default]
     Telegram,
     Voice,
     WhatsApp,
@@ -59,12 +60,6 @@ impl std::fmt::Display for ChannelType {
     }
 }
 
-impl Default for ChannelType {
-    fn default() -> Self {
-        ChannelType::Telegram
-    }
-}
-
 /// Unified channel configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -88,7 +83,7 @@ pub enum ChannelConfig {
 }
 
 /// Console channel configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ConsoleChannelConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -104,17 +99,8 @@ fn default_prompt() -> String {
     "> ".to_string()
 }
 
-impl Default for ConsoleChannelConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            prompt: "> ".to_string(),
-        }
-    }
-}
-
 /// Google Chat channel configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GoogleChatConfig {
     pub bot_token: String,
     #[serde(default)]
@@ -127,18 +113,8 @@ fn default_thread_key() -> Option<String> {
     None
 }
 
-impl Default for GoogleChatConfig {
-    fn default() -> Self {
-        Self {
-            bot_token: String::new(),
-            space: String::new(),
-            thread_key: None,
-        }
-    }
-}
-
 /// iMessage channel configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct IMessageConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -148,18 +124,8 @@ pub struct IMessageConfig {
     pub handle_prefix: String,
 }
 
-impl Default for IMessageConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            auto_reply: false,
-            handle_prefix: String::new(),
-        }
-    }
-}
-
 /// Line channel configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LineConfig {
     pub channel_access_token: String,
     pub channel_secret: String,
@@ -167,18 +133,8 @@ pub struct LineConfig {
     pub enabled: bool,
 }
 
-impl Default for LineConfig {
-    fn default() -> Self {
-        Self {
-            channel_access_token: String::new(),
-            channel_secret: String::new(),
-            enabled: true,
-        }
-    }
-}
-
 /// Matrix channel configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MatrixConfig {
     pub homeserver: String,
     pub username: String,
@@ -191,19 +147,8 @@ fn default_room_id() -> Option<String> {
     None
 }
 
-impl Default for MatrixConfig {
-    fn default() -> Self {
-        Self {
-            homeserver: String::new(),
-            username: String::new(),
-            password: String::new(),
-            room_id: None,
-        }
-    }
-}
-
 /// Signal channel configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SignalConfig {
     pub phone_number: String,
     #[serde(default)]
@@ -212,18 +157,8 @@ pub struct SignalConfig {
     pub device_name: String,
 }
 
-impl Default for SignalConfig {
-    fn default() -> Self {
-        Self {
-            phone_number: String::new(),
-            captcha: None,
-            device_name: "carapace".to_string(),
-        }
-    }
-}
-
 /// Skype channel configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SkypeConfig {
     pub app_id: String,
     pub app_secret: String,
@@ -231,18 +166,8 @@ pub struct SkypeConfig {
     pub redirect_uri: String,
 }
 
-impl Default for SkypeConfig {
-    fn default() -> Self {
-        Self {
-            app_id: String::new(),
-            app_secret: String::new(),
-            redirect_uri: String::new(),
-        }
-    }
-}
-
 /// Teams channel configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TeamsConfig {
     pub app_id: String,
     pub tenant_id: String,
@@ -252,20 +177,8 @@ pub struct TeamsConfig {
     pub webhook_url: Option<String>,
 }
 
-impl Default for TeamsConfig {
-    fn default() -> Self {
-        Self {
-            app_id: String::new(),
-            tenant_id: String::new(),
-            client_id: String::new(),
-            client_secret: String::new(),
-            webhook_url: None,
-        }
-    }
-}
-
 /// Voice channel configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VoiceConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -275,18 +188,8 @@ pub struct VoiceConfig {
     pub vad_filter: bool,
 }
 
-impl Default for VoiceConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            transcription: false,
-            vad_filter: true,
-        }
-    }
-}
-
 /// Webhook channel configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WebhookConfig {
     pub inbound_url: String,
     pub outbound_url: Option<String>,
@@ -298,18 +201,8 @@ fn default_secret() -> Option<String> {
     None
 }
 
-impl Default for WebhookConfig {
-    fn default() -> Self {
-        Self {
-            inbound_url: String::new(),
-            outbound_url: None,
-            secret: None,
-        }
-    }
-}
-
 /// WebChat channel configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WebChatConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -319,33 +212,13 @@ pub struct WebChatConfig {
     pub web_socket: bool,
 }
 
-impl Default for WebChatConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            direct_line_token: String::new(),
-            web_socket: false,
-        }
-    }
-}
-
 /// Zalo channel configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ZaloConfig {
     pub app_id: String,
     pub app_secret: String,
     #[serde(default)]
     pub access_token: Option<String>,
-}
-
-impl Default for ZaloConfig {
-    fn default() -> Self {
-        Self {
-            app_id: String::new(),
-            app_secret: String::new(),
-            access_token: None,
-        }
-    }
 }
 
 /// Configuration error types
@@ -649,13 +522,22 @@ pub fn migrate_config(
                 .to_string();
             Ok(ChannelConfig::Telegram(TelegramConfig {
                 bot_token,
-                webhook_url: legacy.get("webhook_url").and_then(|v| v.as_str()).map(String::from),
-                secret_token: legacy.get("secret_token").and_then(|v| v.as_str()).map(String::from),
+                webhook_url: legacy
+                    .get("webhook_url")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                secret_token: legacy
+                    .get("secret_token")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
                 max_message_length: legacy
                     .get("max_message_length")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(4096) as usize,
-                enable_media: legacy.get("enable_media").and_then(|v| v.as_bool()).unwrap_or(true),
+                enable_media: legacy
+                    .get("enable_media")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true),
                 enable_callbacks: legacy
                     .get("enable_callbacks")
                     .and_then(|v| v.as_bool())
@@ -673,8 +555,14 @@ pub fn migrate_config(
                 .and_then(|v| v.as_str())
                 .ok_or("Missing application_id")?
                 .to_string(),
-            guild_id: legacy.get("guild_id").and_then(|v| v.as_str()).map(String::from),
-            enable_commands: legacy.get("enable_commands").and_then(|v| v.as_bool()).unwrap_or(true),
+            guild_id: legacy
+                .get("guild_id")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            enable_commands: legacy
+                .get("enable_commands")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
             enable_components: legacy
                 .get("enable_components")
                 .and_then(|v| v.as_bool())

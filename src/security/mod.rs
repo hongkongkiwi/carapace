@@ -67,13 +67,17 @@ const REDACTED_PLACEHOLDER: &str = "***REDACTED***";
 /// Check if a field name indicates sensitive content
 fn is_sensitive_field_name(name: &str) -> bool {
     let name_lower = name.to_lowercase();
-    SENSITIVE_FIELD_NAMES.iter().any(|&s| name_lower == s.to_lowercase())
+    SENSITIVE_FIELD_NAMES
+        .iter()
+        .any(|&s| name_lower == s.to_lowercase())
 }
 
 /// Check if we're in a context that likely contains secrets
 fn is_likely_secret_context(path: &str) -> bool {
     let path_lower = path.to_lowercase();
-    SENSITIVE_CONTEXT_PATHS.iter().any(|&ctx| path_lower.contains(&ctx.to_lowercase()))
+    SENSITIVE_CONTEXT_PATHS
+        .iter()
+        .any(|&ctx| path_lower.contains(&ctx.to_lowercase()))
 }
 
 /// Recursively redact sensitive fields from a JSON value
@@ -171,10 +175,7 @@ fn should_redact_field(key: &str, path: &str, value: &Value) -> bool {
 /// Check if a string looks like a URL containing credentials
 fn looks_like_url_with_credentials(s: &str) -> bool {
     // Patterns like: https://user:pass@host, postgresql://user:pass@host, etc.
-    let patterns = [
-        "://",
-        "@",
-    ];
+    let patterns = ["://", "@"];
 
     if !patterns.iter().all(|&p| s.contains(p)) {
         return false;
@@ -284,10 +285,7 @@ mod tests {
         });
 
         let redacted = redact_config_for_response(&config);
-        assert_eq!(
-            redacted["gateway"]["auth"]["token"],
-            REDACTED_PLACEHOLDER
-        );
+        assert_eq!(redacted["gateway"]["auth"]["token"], REDACTED_PLACEHOLDER);
     }
 
     #[test]
@@ -351,10 +349,7 @@ mod tests {
         });
 
         let redacted = redact_config_for_response(&config);
-        assert_eq!(
-            redacted["database"]["url"],
-            REDACTED_PLACEHOLDER
-        );
+        assert_eq!(redacted["database"]["url"], REDACTED_PLACEHOLDER);
     }
 
     #[test]
@@ -401,10 +396,7 @@ mod tests {
             redacted["channels"]["list"][1]["token"],
             REDACTED_PLACEHOLDER
         );
-        assert_eq!(
-            redacted["channels"]["list"][0]["name"],
-            "telegram"
-        );
+        assert_eq!(redacted["channels"]["list"][0]["name"], "telegram");
     }
 
     #[test]
