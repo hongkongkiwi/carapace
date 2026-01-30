@@ -324,7 +324,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
     let ws_state = if multi_provider.has_any_provider() {
         let inner = Arc::try_unwrap(ws_state)
-            .expect("WsServerState Arc should have single owner at startup");
+            .map_err(|_| "WsServerState Arc should have single owner at startup")?;
         Arc::new(inner.with_llm_provider(Arc::new(multi_provider)))
     } else {
         info!("No LLM provider configured (set ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, and/or configure Ollama to enable)");
@@ -343,7 +343,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .with_status(channels::ChannelStatus::Connected),
         );
         let inner = Arc::try_unwrap(ws_state)
-            .expect("WsServerState Arc should have single owner at startup");
+            .map_err(|_| "WsServerState Arc should have single owner at startup")?;
         Arc::new(inner.with_plugin_registry(plugin_reg))
     };
     info!("Console channel registered");
@@ -443,8 +443,13 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         let mut sighup_shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             use tokio::signal::unix::{signal, SignalKind};
-            let mut sighup =
-                signal(SignalKind::hangup()).expect("failed to install SIGHUP handler");
+            let mut sighup = match signal(SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("Failed to install SIGHUP handler: {}", e);
+                    return;
+                }
+            };
             loop {
                 tokio::select! {
                     _ = sighup.recv() => {
@@ -624,19 +629,35 @@ async fn shutdown_signal(
 async fn await_shutdown_trigger() -> &'static str {
     use tokio::signal::unix::{signal, SignalKind};
 
-    let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
-
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => "ctrl-c",
-        _ = sigterm.recv() => "SIGTERM",
+    match signal(SignalKind::terminate()) {
+        Ok(mut sigterm) => {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => "ctrl-c",
+                _ = sigterm.recv() => "SIGTERM",
+            }
+        }
+        Err(e) => {
+            warn!(
+                "Failed to install SIGTERM handler: {}; falling back to Ctrl+C only",
+                e
+            );
+            match tokio::signal::ctrl_c().await {
+                Ok(()) => "ctrl-c",
+                Err(e) => {
+                    panic!("Failed to install Ctrl+C handler: {}", e);
+                }
+            }
+        }
     }
 }
 
 /// On non-Unix platforms, only Ctrl+C is available.
 #[cfg(not(unix))]
 async fn await_shutdown_trigger() -> &'static str {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to install Ctrl+C handler");
-    "ctrl-c"
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => "ctrl-c",
+        Err(e) => {
+            panic!("Failed to install Ctrl+C handler: {}", e);
+        }
+    }
 }

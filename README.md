@@ -1,14 +1,31 @@
 # carapace
 
+> **This project is under active development and is not yet production-ready.**
+> Core functionality works and 1,900+ tests pass, but hardening work remains
+> before this should be used outside of development/testing.
+
 A secure, stable Rust alternative to moltbot - for when your molt needs a hard shell.
 
-## Status
+## What Works Today
 
-Work in progress. See [docs/refactor/implementation-plan.md](docs/refactor/implementation-plan.md) for current status.
+- **Multi-provider LLM engine** — Anthropic, OpenAI, Ollama, Google Gemini, AWS Bedrock with streaming, tool dispatch, and cancellation
+- **25 agent tools** — 10 built-in (web fetch, memory, sessions, math, etc.) + 15 channel-specific (Telegram, Discord, Slack)
+- **WASM plugin runtime** — wasmtime-based with capability enforcement and sandboxing
+- **Security hardening** — encrypted config secrets, SSRF protection with DNS rebinding defense, exfiltration-sensitive tool policy, audit logging, secret masking, backup encryption
+- **Infrastructure** — TLS, mDNS discovery, config hot-reload, Tailscale integration, Prometheus metrics
+- **Full CI pipeline** — clippy, fmt, nextest (cross-platform), cargo-deny, gitleaks, trivy, hadolint, cargo-geiger
+
+## What's Still Needed for Production
+
+- **Resource safety** — Connection limits, WASM CPU budgets, JSON depth limits (in progress)
+- **Operational tooling** — Deep health checks, config schema validation, per-user rate limiting
+- **Data integrity** — File locking for concurrent access, atomic writes audit
+- **Gateway transport** — Real WebSocket client for remote gateway connections (currently stubbed)
+- **Prompt injection defense** — Multi-layer prompt guard system
 
 ## Requirements
 
-- Rust 1.75+ (2021 edition)
+- Rust 1.87+ (2021 edition, MSRV enforced in CI)
 - For WASM plugins: wasmtime 18+
 
 ### Recommended Tools

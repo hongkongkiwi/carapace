@@ -69,7 +69,7 @@ pub use host::{
 pub use loader::{LoadedPlugin, LoaderError, PluginKind, PluginLoader, PluginManifest};
 pub use runtime::{
     HostState, PluginInstanceHandle, PluginRuntime, RuntimeError, DEFAULT_EXECUTION_TIMEOUT,
-    MAX_PLUGIN_MEMORY_BYTES,
+    DEFAULT_FUEL_BUDGET, MAX_PLUGIN_MEMORY_BYTES,
 };
 pub use tools::{
     create_registry as create_tools_registry, BuiltinTool, ToolInvokeContext, ToolInvokeError,

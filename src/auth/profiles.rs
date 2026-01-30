@@ -593,15 +593,16 @@ impl ProfileStore {
     /// The `password` is retained so that values encrypted with a different
     /// salt (e.g. from a previous run) can still be decrypted via key
     /// re-derivation.
-    pub fn with_encryption(state_dir: PathBuf, password: &[u8]) -> Self {
+    pub fn with_encryption(state_dir: PathBuf, password: &[u8]) -> Result<Self, AuthProfileError> {
         let state_path = state_dir.join("auth_profiles.json");
-        let secret_store = SecretStore::new(password);
-        Self {
+        let secret_store = SecretStore::new(password)
+            .map_err(|e| AuthProfileError::IoError(format!("encryption init failed: {e}")))?;
+        Ok(Self {
             profiles: RwLock::new(Vec::new()),
             state_path,
             secret_store: Some(secret_store),
             encryption_password: Some(password.to_vec()),
-        }
+        })
     }
 
     /// Load profiles from disk. Replaces any in-memory data.
@@ -682,11 +683,15 @@ impl ProfileStore {
     /// (prefixed with `enc:v1:`) are skipped to avoid double-encryption.
     fn encrypt_tokens(tokens: &mut OAuthTokens, store: &SecretStore) {
         if !is_encrypted(&tokens.access_token) {
-            tokens.access_token = store.encrypt(&tokens.access_token);
+            if let Ok(encrypted) = store.encrypt(&tokens.access_token) {
+                tokens.access_token = encrypted;
+            }
         }
         if let Some(ref rt) = tokens.refresh_token {
             if !is_encrypted(rt) {
-                tokens.refresh_token = Some(store.encrypt(rt));
+                if let Ok(encrypted) = store.encrypt(rt) {
+                    tokens.refresh_token = Some(encrypted);
+                }
             }
         }
     }
@@ -1511,7 +1516,7 @@ mod tests {
 
         // Create an encrypted store, add a profile, and save
         {
-            let store = ProfileStore::with_encryption(dir.path().to_path_buf(), password);
+            let store = ProfileStore::with_encryption(dir.path().to_path_buf(), password).unwrap();
 
             store.add(sample_profile("enc-1")).unwrap();
         }
@@ -1532,7 +1537,7 @@ mod tests {
         );
 
         // Load the profiles back with a new store derived from the same password
-        let store2 = ProfileStore::with_encryption(dir.path().to_path_buf(), password);
+        let store2 = ProfileStore::with_encryption(dir.path().to_path_buf(), password).unwrap();
         store2.load().unwrap();
 
         let profile = store2.get("enc-1").unwrap();
@@ -1565,7 +1570,8 @@ mod tests {
         );
 
         // Now load with an encrypted store -- plaintext values should be read fine
-        let store2 = ProfileStore::with_encryption(dir.path().to_path_buf(), b"encryption-pw");
+        let store2 =
+            ProfileStore::with_encryption(dir.path().to_path_buf(), b"encryption-pw").unwrap();
         store2.load().unwrap();
 
         let profile = store2.get("plain-1").unwrap();
@@ -1622,12 +1628,12 @@ mod tests {
 
         // Save a profile (tokens get encrypted on disk)
         {
-            let store = ProfileStore::with_encryption(dir.path().to_path_buf(), password);
+            let store = ProfileStore::with_encryption(dir.path().to_path_buf(), password).unwrap();
             store.add(sample_profile("de-1")).unwrap();
         }
 
         // Load and save again -- should not double-encrypt
-        let store2 = ProfileStore::with_encryption(dir.path().to_path_buf(), password);
+        let store2 = ProfileStore::with_encryption(dir.path().to_path_buf(), password).unwrap();
         store2.load().unwrap();
 
         // In-memory tokens should be plaintext
@@ -1638,7 +1644,7 @@ mod tests {
         store2.update_last_used("de-1");
 
         // Load yet again to verify
-        let store3 = ProfileStore::with_encryption(dir.path().to_path_buf(), password);
+        let store3 = ProfileStore::with_encryption(dir.path().to_path_buf(), password).unwrap();
         store3.load().unwrap();
 
         let profile2 = store3.get("de-1").unwrap();
@@ -1661,11 +1667,11 @@ mod tests {
         let mut profile = sample_profile("nrt-1");
         profile.tokens.refresh_token = None;
 
-        let store = ProfileStore::with_encryption(dir.path().to_path_buf(), password);
+        let store = ProfileStore::with_encryption(dir.path().to_path_buf(), password).unwrap();
         store.add(profile).unwrap();
 
         // Reload and verify
-        let store2 = ProfileStore::with_encryption(dir.path().to_path_buf(), password);
+        let store2 = ProfileStore::with_encryption(dir.path().to_path_buf(), password).unwrap();
         store2.load().unwrap();
 
         let loaded = store2.get("nrt-1").unwrap();

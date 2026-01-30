@@ -46,6 +46,13 @@ pub const MAX_PLUGIN_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
 /// Default execution timeout per function call (30s)
 pub const DEFAULT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Default fuel budget per WASM function call (1 billion instructions).
+///
+/// Fuel provides a deterministic CPU budget that complements the epoch-based
+/// wall-clock timeout. A tight infinite loop will exhaust fuel before the
+/// epoch deadline fires, giving a clearer error message.
+pub const DEFAULT_FUEL_BUDGET: u64 = 1_000_000_000;
+
 // ============== WIT Component Model Types ==============
 //
 // These types mirror the WIT record definitions in wit/plugin.wit and are used
@@ -499,6 +506,9 @@ pub enum RuntimeError {
 
     #[error("Plugin returned error: [{code}] {message}")]
     PluginError { code: String, message: String },
+
+    #[error("WASM fuel exhausted (budget: {budget} instructions)")]
+    FuelExhausted { budget: u64 },
 }
 
 /// State held in each plugin's wasmtime store
@@ -563,6 +573,14 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
         let mut store = self.store.write();
         let instance = self.instance;
 
+        // Set fuel budget for this call
+        if let Err(e) = store.set_fuel(DEFAULT_FUEL_BUDGET) {
+            return Err(BindingError::CallError(format!(
+                "failed to set fuel budget: {}",
+                e
+            )));
+        }
+
         // Get the exported interface, then get the typed function
         let func = {
             let mut exports = instance.exports(&mut *store);
@@ -584,10 +602,18 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
                 .block_on(async { func.call_async(&mut *store, ()).await })
         })
         .map_err(|e| {
-            BindingError::CallError(format!(
-                "call to '{}.{}' failed: {}",
-                iface_name, func_name, e
-            ))
+            let msg = e.to_string();
+            if msg.contains("fuel") {
+                BindingError::CallError(format!(
+                    "WASM fuel exhausted during '{}.{}' (budget: {} instructions)",
+                    iface_name, func_name, DEFAULT_FUEL_BUDGET
+                ))
+            } else {
+                BindingError::CallError(format!(
+                    "call to '{}.{}' failed: {}",
+                    iface_name, func_name, e
+                ))
+            }
         })?;
 
         // Post-return cleanup
@@ -621,6 +647,14 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
         let mut store = self.store.write();
         let instance = self.instance;
 
+        // Set fuel budget for this call
+        if let Err(e) = store.set_fuel(DEFAULT_FUEL_BUDGET) {
+            return Err(BindingError::CallError(format!(
+                "failed to set fuel budget: {}",
+                e
+            )));
+        }
+
         let func = {
             let mut exports = instance.exports(&mut *store);
             let mut iface = exports.instance(iface_name).ok_or_else(|| {
@@ -639,10 +673,18 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
                 .block_on(async { func.call_async(&mut *store, param).await })
         })
         .map_err(|e| {
-            BindingError::CallError(format!(
-                "call to '{}.{}' failed: {}",
-                iface_name, func_name, e
-            ))
+            let msg = e.to_string();
+            if msg.contains("fuel") {
+                BindingError::CallError(format!(
+                    "WASM fuel exhausted during '{}.{}' (budget: {} instructions)",
+                    iface_name, func_name, DEFAULT_FUEL_BUDGET
+                ))
+            } else {
+                BindingError::CallError(format!(
+                    "call to '{}.{}' failed: {}",
+                    iface_name, func_name, e
+                ))
+            }
         })?;
 
         tokio::task::block_in_place(|| {
@@ -685,6 +727,7 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
         let mut config = Config::new();
         config.wasm_component_model(true);
         config.async_support(true);
+        config.consume_fuel(true);
         // Memory limits are enforced per-instance via resource limiter
 
         let engine =
@@ -751,8 +794,16 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
         // Create the store with host state
         let mut store = Store::new(&self.engine, host_state);
 
-        // Set fuel for execution limits (optional, for timeout enforcement)
+        // Set epoch deadline for wall-clock timeout enforcement
         store.set_epoch_deadline(1);
+
+        // Set initial fuel budget (replenished before each call)
+        if let Err(e) = store.set_fuel(DEFAULT_FUEL_BUDGET) {
+            return Err(RuntimeError::WasmtimeError(format!(
+                "Failed to set initial fuel budget: {}",
+                e
+            )));
+        }
 
         // Create a linker and add host functions
         let mut linker: Linker<HostState<B>> = Linker::new(&self.engine);
@@ -1669,5 +1720,69 @@ mod tests {
         assert_eq!(pe.code, "RATE_LIMITED");
         assert_eq!(pe.message, "Too many requests");
         assert!(pe.retryable);
+    }
+
+    // ============== Fuel Budget Tests ==============
+
+    #[test]
+    fn test_default_fuel_budget_is_reasonable() {
+        // 1 billion instructions — enough for real work, bounded enough to catch infinite loops
+        assert_eq!(DEFAULT_FUEL_BUDGET, 1_000_000_000);
+        // Compile-time checks that the budget is in a sane range
+        const _: () = assert!(DEFAULT_FUEL_BUDGET > 1_000_000); // not too small
+        const _: () = assert!(DEFAULT_FUEL_BUDGET <= 10_000_000_000); // not unbounded
+    }
+
+    #[tokio::test]
+    async fn test_engine_has_fuel_enabled() {
+        let runtime = create_test_runtime().await;
+        // Verify the engine was created with fuel consumption enabled
+        // by checking that we can create a store and set fuel on it
+        let store = Store::new(
+            &runtime.engine,
+            HostState {
+                plugin_id: "test".to_string(),
+                host_ctx: Arc::new(PluginHostContext::new(
+                    "test".to_string(),
+                    runtime.credential_store.clone(),
+                    runtime.rate_limiters.clone(),
+                )),
+            },
+        );
+        // If fuel is not enabled on the engine, set_fuel would return an error
+        let mut store = store;
+        assert!(
+            store.set_fuel(100).is_ok(),
+            "Engine should have fuel consumption enabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_zero_fuel_store() {
+        let runtime = create_test_runtime().await;
+        let mut store = Store::new(
+            &runtime.engine,
+            HostState {
+                plugin_id: "test".to_string(),
+                host_ctx: Arc::new(PluginHostContext::new(
+                    "test".to_string(),
+                    runtime.credential_store.clone(),
+                    runtime.rate_limiters.clone(),
+                )),
+            },
+        );
+        // Setting zero fuel should succeed (but any execution would trap immediately)
+        assert!(store.set_fuel(0).is_ok());
+        assert_eq!(store.get_fuel().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_fuel_exhausted_error_variant() {
+        let err = RuntimeError::FuelExhausted {
+            budget: DEFAULT_FUEL_BUDGET,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("fuel exhausted"), "got: {msg}");
+        assert!(msg.contains(&DEFAULT_FUEL_BUDGET.to_string()), "got: {msg}");
     }
 }

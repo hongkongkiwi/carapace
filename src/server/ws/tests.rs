@@ -2462,3 +2462,109 @@ fn test_every_gateway_method_has_explicit_role_assignment() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// JSON depth validation tests
+// ---------------------------------------------------------------------------
+
+/// Helper: build a JSON value nested to exactly `depth` levels using objects.
+fn nested_object(depth: usize) -> Value {
+    let mut value = json!("leaf");
+    for _ in 0..depth.saturating_sub(1) {
+        value = json!({ "nested": value });
+    }
+    value
+}
+
+/// Helper: build a JSON value nested to exactly `depth` levels using arrays.
+fn nested_array(depth: usize) -> Value {
+    let mut value = json!("leaf");
+    for _ in 0..depth.saturating_sub(1) {
+        value = json!([value]);
+    }
+    value
+}
+
+/// Helper: build mixed nesting (alternating objects and arrays) to `depth`.
+fn mixed_nesting(depth: usize) -> Value {
+    let mut value = json!("leaf");
+    for i in 0..depth.saturating_sub(1) {
+        if i % 2 == 0 {
+            value = json!({ "nested": value });
+        } else {
+            value = json!([value]);
+        }
+    }
+    value
+}
+
+#[test]
+fn test_shallow_json_passes() {
+    // Depth 1: simple scalar values
+    assert!(validate_json_depth(&json!("hello"), MAX_JSON_DEPTH).is_ok());
+    assert!(validate_json_depth(&json!(42), MAX_JSON_DEPTH).is_ok());
+
+    // Depth 2: one level of nesting
+    assert!(validate_json_depth(&json!({"a": 1}), MAX_JSON_DEPTH).is_ok());
+
+    // Depth 3-5: a few levels
+    assert!(validate_json_depth(&nested_object(3), MAX_JSON_DEPTH).is_ok());
+    assert!(validate_json_depth(&nested_object(5), MAX_JSON_DEPTH).is_ok());
+}
+
+#[test]
+fn test_exact_limit_passes() {
+    let value = nested_object(MAX_JSON_DEPTH);
+    assert!(validate_json_depth(&value, MAX_JSON_DEPTH).is_ok());
+}
+
+#[test]
+fn test_exceeds_limit_fails() {
+    let value = nested_object(MAX_JSON_DEPTH + 1);
+    let result = validate_json_depth(&value, MAX_JSON_DEPTH);
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .contains("JSON nesting depth exceeds maximum"));
+}
+
+#[test]
+fn test_deeply_nested_array_fails() {
+    let value = nested_array(MAX_JSON_DEPTH + 1);
+    let result = validate_json_depth(&value, MAX_JSON_DEPTH);
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .contains("JSON nesting depth exceeds maximum"));
+}
+
+#[test]
+fn test_mixed_nesting_fails() {
+    let value = mixed_nesting(MAX_JSON_DEPTH + 1);
+    let result = validate_json_depth(&value, MAX_JSON_DEPTH);
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .contains("JSON nesting depth exceeds maximum"));
+}
+
+#[test]
+fn test_flat_large_object_passes() {
+    // 1000 keys at depth 1 -- size != depth
+    let mut map = serde_json::Map::new();
+    for i in 0..1000 {
+        map.insert(format!("key_{i}"), json!(i));
+    }
+    let value = Value::Object(map);
+    assert!(validate_json_depth(&value, MAX_JSON_DEPTH).is_ok());
+}
+
+#[test]
+fn test_empty_value_passes() {
+    assert!(validate_json_depth(&json!(null), MAX_JSON_DEPTH).is_ok());
+    assert!(validate_json_depth(&json!(true), MAX_JSON_DEPTH).is_ok());
+    assert!(validate_json_depth(&json!(false), MAX_JSON_DEPTH).is_ok());
+    assert!(validate_json_depth(&json!(0), MAX_JSON_DEPTH).is_ok());
+    assert!(validate_json_depth(&json!(3.15), MAX_JSON_DEPTH).is_ok());
+    assert!(validate_json_depth(&json!(""), MAX_JSON_DEPTH).is_ok());
+}

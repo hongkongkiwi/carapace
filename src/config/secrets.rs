@@ -48,6 +48,12 @@ pub enum SecretError {
 
     #[error("JSON pointer path not found: {0}")]
     PathNotFound(String),
+
+    #[error("Random number generation failed: {0}")]
+    RandomFailure(String),
+
+    #[error("Encryption failed: {0}")]
+    EncryptionFailed(String),
 }
 
 /// Holds a derived AES-256 encryption key for encrypting/decrypting secrets.
@@ -62,11 +68,11 @@ pub struct SecretStore {
 
 impl SecretStore {
     /// Create a new `SecretStore` by deriving a key from a password and a random salt.
-    pub fn new(password: &[u8]) -> Self {
+    pub fn new(password: &[u8]) -> Result<Self, SecretError> {
         let mut salt = [0u8; SALT_LEN];
-        getrandom::getrandom(&mut salt).expect("Failed to generate random salt");
+        getrandom::getrandom(&mut salt).map_err(|e| SecretError::RandomFailure(e.to_string()))?;
         let key = Zeroizing::new(derive_key(password, &salt));
-        Self { key, salt }
+        Ok(Self { key, salt })
     }
 
     /// Create a `SecretStore` from an existing password and salt.
@@ -76,21 +82,25 @@ impl SecretStore {
     }
 
     /// Encrypt a plaintext string, returning the `enc:v1:...` formatted string.
-    pub fn encrypt(&self, plaintext: &str) -> String {
+    pub fn encrypt(&self, plaintext: &str) -> Result<String, SecretError> {
         let mut nonce_bytes = [0u8; NONCE_LEN];
-        getrandom::getrandom(&mut nonce_bytes).expect("Failed to generate random nonce");
+        getrandom::getrandom(&mut nonce_bytes)
+            .map_err(|e| SecretError::RandomFailure(e.to_string()))?;
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         let cipher = Aes256Gcm::new(self.key.as_ref().into());
         let ciphertext = cipher
             .encrypt(nonce, plaintext.as_bytes())
-            .expect("AES-GCM encryption should not fail with valid key and nonce");
+            .map_err(|e| SecretError::EncryptionFailed(e.to_string()))?;
 
         let nonce_b64 = BASE64.encode(nonce_bytes);
         let ct_b64 = BASE64.encode(&ciphertext);
         let salt_b64 = BASE64.encode(self.salt);
 
-        format!("{}{}:{}:{}", ENC_PREFIX, nonce_b64, ct_b64, salt_b64)
+        Ok(format!(
+            "{}{}:{}:{}",
+            ENC_PREFIX, nonce_b64, ct_b64, salt_b64
+        ))
     }
 
     /// Decrypt an `enc:v1:...` formatted string back to plaintext.
@@ -122,6 +132,7 @@ pub struct EncryptedParts {
     /// The PBKDF2 salt
     pub salt: [u8; SALT_LEN],
 }
+
 /// Parse an `enc:v1:NONCE:CIPHERTEXT:SALT` string into its components.
 pub fn parse_encrypted(encrypted: &str) -> Result<EncryptedParts, SecretError> {
     let rest = encrypted.strip_prefix(ENC_PREFIX).ok_or_else(|| {
@@ -286,12 +297,16 @@ pub fn resolve_secrets(config: &mut Value, store: &SecretStore, password: &[u8])
 /// Each path should be a JSON pointer (e.g., "/auth/apiKey").
 /// Only string values are encrypted; non-string or missing paths are skipped
 /// with a warning.
-pub fn seal_secrets(config: &mut Value, store: &SecretStore, keys: &[&str]) {
+pub fn seal_secrets(
+    config: &mut Value,
+    store: &SecretStore,
+    keys: &[&str],
+) -> Result<(), SecretError> {
     for &path in keys {
         if let Some(val) = config.pointer_mut(path) {
             if let Value::String(s) = val {
                 if !is_encrypted(s) {
-                    *s = store.encrypt(s);
+                    *s = store.encrypt(s)?;
                 }
             } else {
                 tracing::warn!("seal_secrets: path '{}' is not a string, skipping", path);
@@ -300,7 +315,9 @@ pub fn seal_secrets(config: &mut Value, store: &SecretStore, keys: &[&str]) {
             tracing::warn!("seal_secrets: path '{}' not found, skipping", path);
         }
     }
+    Ok(())
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,45 +356,45 @@ mod tests {
 
     #[test]
     fn test_encrypt_decrypt_round_trip() {
-        let store = SecretStore::new(b"my-secret-password");
+        let store = SecretStore::new(b"my-secret-password").unwrap();
         let plaintext = "sk-live-abc123xyz";
-        let encrypted = store.encrypt(plaintext);
+        let encrypted = store.encrypt(plaintext).unwrap();
         let decrypted = store.decrypt(&encrypted).unwrap();
         assert_eq!(decrypted, plaintext);
     }
 
     #[test]
     fn test_encrypt_decrypt_empty_string() {
-        let store = SecretStore::new(b"password");
-        let encrypted = store.encrypt("");
+        let store = SecretStore::new(b"password").unwrap();
+        let encrypted = store.encrypt("").unwrap();
         let decrypted = store.decrypt(&encrypted).unwrap();
         assert_eq!(decrypted, "");
     }
 
     #[test]
     fn test_encrypt_decrypt_unicode() {
-        let store = SecretStore::new(b"password");
+        let store = SecretStore::new(b"password").unwrap();
         let plaintext = "hello world with accents";
-        let encrypted = store.encrypt(plaintext);
+        let encrypted = store.encrypt(plaintext).unwrap();
         let decrypted = store.decrypt(&encrypted).unwrap();
         assert_eq!(decrypted, plaintext);
     }
 
     #[test]
     fn test_encrypt_decrypt_long_value() {
-        let store = SecretStore::new(b"password");
+        let store = SecretStore::new(b"password").unwrap();
         let plaintext: String = "A".repeat(10_000);
-        let encrypted = store.encrypt(&plaintext);
+        let encrypted = store.encrypt(&plaintext).unwrap();
         let decrypted = store.decrypt(&encrypted).unwrap();
         assert_eq!(decrypted, plaintext);
     }
 
     #[test]
     fn test_encrypt_produces_different_ciphertext() {
-        let store = SecretStore::new(b"password");
+        let store = SecretStore::new(b"password").unwrap();
         let plaintext = "same-value";
-        let e1 = store.encrypt(plaintext);
-        let e2 = store.encrypt(plaintext);
+        let e1 = store.encrypt(plaintext).unwrap();
+        let e2 = store.encrypt(plaintext).unwrap();
         assert_ne!(e1, e2, "each encryption should use a unique nonce");
         assert_eq!(store.decrypt(&e1).unwrap(), plaintext);
         assert_eq!(store.decrypt(&e2).unwrap(), plaintext);
@@ -385,8 +402,8 @@ mod tests {
 
     #[test]
     fn test_encrypted_format() {
-        let store = SecretStore::new(b"password");
-        let encrypted = store.encrypt("test");
+        let store = SecretStore::new(b"password").unwrap();
+        let encrypted = store.encrypt("test").unwrap();
         assert!(
             encrypted.starts_with("enc:v1:"),
             "must start with enc:v1: prefix"
@@ -408,8 +425,8 @@ mod tests {
 
     #[test]
     fn test_wrong_password_fails() {
-        let store1 = SecretStore::new(b"correct-password");
-        let encrypted = store1.encrypt("secret-data");
+        let store1 = SecretStore::new(b"correct-password").unwrap();
+        let encrypted = store1.encrypt("secret-data").unwrap();
 
         let parts = parse_encrypted(&encrypted).unwrap();
         let wrong_key = Zeroizing::new(derive_key(b"wrong-password", &parts.salt));
@@ -419,24 +436,24 @@ mod tests {
 
     #[test]
     fn test_decrypt_rekey_wrong_password() {
-        let store = SecretStore::new(b"correct-password");
-        let encrypted = store.encrypt("secret-data");
+        let store = SecretStore::new(b"correct-password").unwrap();
+        let encrypted = store.encrypt("secret-data").unwrap();
         let result = store.decrypt_rekey(&encrypted, b"wrong-password");
         assert_eq!(result, Err(SecretError::DecryptionFailed));
     }
 
     #[test]
     fn test_decrypt_rekey_correct_password() {
-        let store = SecretStore::new(b"my-password");
-        let encrypted = store.encrypt("hello");
+        let store = SecretStore::new(b"my-password").unwrap();
+        let encrypted = store.encrypt("hello").unwrap();
         let decrypted = store.decrypt_rekey(&encrypted, b"my-password").unwrap();
         assert_eq!(decrypted, "hello");
     }
 
     #[test]
     fn test_corrupted_ciphertext() {
-        let store = SecretStore::new(b"password");
-        let encrypted = store.encrypt("test");
+        let store = SecretStore::new(b"password").unwrap();
+        let encrypted = store.encrypt("test").unwrap();
 
         let parts: Vec<&str> = encrypted.splitn(5, ':').collect();
         let mut ct_bytes = BASE64.decode(parts[3]).unwrap();
@@ -456,8 +473,8 @@ mod tests {
 
     #[test]
     fn test_corrupted_nonce() {
-        let store = SecretStore::new(b"password");
-        let encrypted = store.encrypt("test");
+        let store = SecretStore::new(b"password").unwrap();
+        let encrypted = store.encrypt("test").unwrap();
 
         let parts: Vec<&str> = encrypted.splitn(5, ':').collect();
         let mut nonce_bytes = BASE64.decode(parts[2]).unwrap();
@@ -475,27 +492,28 @@ mod tests {
 
     #[test]
     fn test_bad_format_no_prefix() {
-        let store = SecretStore::new(b"password");
+        let store = SecretStore::new(b"password").unwrap();
         let result = store.decrypt("not-encrypted-at-all");
         assert!(matches!(result, Err(SecretError::BadFormat(_))));
     }
 
     #[test]
     fn test_bad_format_wrong_prefix() {
-        let store = SecretStore::new(b"password");
+        let store = SecretStore::new(b"password").unwrap();
         let result = store.decrypt("enc:v2:aaa:bbb:ccc");
         assert!(matches!(result, Err(SecretError::BadFormat(_))));
     }
 
     #[test]
     fn test_bad_format_missing_segments() {
-        let store = SecretStore::new(b"password");
+        let store = SecretStore::new(b"password").unwrap();
         let result = store.decrypt("enc:v1:onlyone");
         assert!(matches!(result, Err(SecretError::BadFormat(_))));
     }
+
     #[test]
     fn test_bad_format_invalid_base64_nonce() {
-        let store = SecretStore::new(b"password");
+        let store = SecretStore::new(b"password").unwrap();
         let salt_b64 = BASE64.encode([0u8; SALT_LEN]);
         let ct_b64 = BASE64.encode(b"ciphertext");
         let bad = format!("enc:v1:not+valid+b64!:{}:{}", ct_b64, salt_b64);
@@ -505,7 +523,7 @@ mod tests {
 
     #[test]
     fn test_bad_format_invalid_base64_ciphertext() {
-        let store = SecretStore::new(b"password");
+        let store = SecretStore::new(b"password").unwrap();
         let nonce_b64 = BASE64.encode([0u8; NONCE_LEN]);
         let salt_b64 = BASE64.encode([0u8; SALT_LEN]);
         let bad = format!("enc:v1:{}:not+valid+b64!:{}", nonce_b64, salt_b64);
@@ -515,7 +533,7 @@ mod tests {
 
     #[test]
     fn test_bad_format_wrong_nonce_length() {
-        let store = SecretStore::new(b"password");
+        let store = SecretStore::new(b"password").unwrap();
         let nonce_b64 = BASE64.encode([0u8; 8]);
         let ct_b64 = BASE64.encode(b"ciphertext");
         let salt_b64 = BASE64.encode([0u8; SALT_LEN]);
@@ -532,7 +550,7 @@ mod tests {
 
     #[test]
     fn test_bad_format_wrong_salt_length() {
-        let store = SecretStore::new(b"password");
+        let store = SecretStore::new(b"password").unwrap();
         let nonce_b64 = BASE64.encode([0u8; NONCE_LEN]);
         let ct_b64 = BASE64.encode(b"ciphertext");
         let salt_b64 = BASE64.encode([0u8; 8]);
@@ -563,8 +581,8 @@ mod tests {
     #[test]
     fn test_resolve_secrets_flat_config() {
         let password = b"test-password";
-        let store = SecretStore::new(password);
-        let encrypted = store.encrypt("my-api-key");
+        let store = SecretStore::new(password).unwrap();
+        let encrypted = store.encrypt("my-api-key").unwrap();
 
         let mut config = json!({
             "name": "bot",
@@ -582,9 +600,9 @@ mod tests {
     #[test]
     fn test_resolve_secrets_nested_config() {
         let password = b"test-password";
-        let store = SecretStore::new(password);
-        let enc_key = store.encrypt("sk-secret");
-        let enc_token = store.encrypt("tok-12345");
+        let store = SecretStore::new(password).unwrap();
+        let enc_key = store.encrypt("sk-secret").unwrap();
+        let enc_token = store.encrypt("tok-12345").unwrap();
 
         let mut config = json!({
             "auth": {
@@ -608,9 +626,9 @@ mod tests {
     #[test]
     fn test_resolve_secrets_in_arrays() {
         let password = b"password";
-        let store = SecretStore::new(password);
-        let enc1 = store.encrypt("secret1");
-        let enc2 = store.encrypt("secret2");
+        let store = SecretStore::new(password).unwrap();
+        let enc1 = store.encrypt("secret1").unwrap();
+        let enc2 = store.encrypt("secret2").unwrap();
 
         let mut config = json!({
             "keys": [enc1, "plain", enc2]
@@ -626,7 +644,7 @@ mod tests {
     #[test]
     fn test_resolve_secrets_skips_non_encrypted() {
         let password = b"password";
-        let store = SecretStore::new(password);
+        let store = SecretStore::new(password).unwrap();
 
         let mut config = json!({
             "name": "bot",
@@ -640,16 +658,17 @@ mod tests {
 
         assert_eq!(config, original, "non-encrypted values should be untouched");
     }
+
     #[test]
     fn test_seal_secrets_single_path() {
-        let store = SecretStore::new(b"password");
+        let store = SecretStore::new(b"password").unwrap();
         let mut config = json!({
             "auth": {
                 "apiKey": "sk-live-abc123"
             }
         });
 
-        seal_secrets(&mut config, &store, &["/auth/apiKey"]);
+        seal_secrets(&mut config, &store, &["/auth/apiKey"]).unwrap();
 
         let sealed = config["auth"]["apiKey"].as_str().unwrap();
         assert!(is_encrypted(sealed), "value should be encrypted");
@@ -658,13 +677,13 @@ mod tests {
 
     #[test]
     fn test_seal_secrets_multiple_paths() {
-        let store = SecretStore::new(b"password");
+        let store = SecretStore::new(b"password").unwrap();
         let mut config = json!({
             "auth": { "apiKey": "key1" },
             "db": { "password": "dbpass" }
         });
 
-        seal_secrets(&mut config, &store, &["/auth/apiKey", "/db/password"]);
+        seal_secrets(&mut config, &store, &["/auth/apiKey", "/db/password"]).unwrap();
 
         assert!(is_encrypted(config["auth"]["apiKey"].as_str().unwrap()));
         assert!(is_encrypted(config["db"]["password"].as_str().unwrap()));
@@ -672,14 +691,14 @@ mod tests {
 
     #[test]
     fn test_seal_secrets_skips_already_encrypted() {
-        let store = SecretStore::new(b"password");
-        let already_encrypted = store.encrypt("secret");
+        let store = SecretStore::new(b"password").unwrap();
+        let already_encrypted = store.encrypt("secret").unwrap();
 
         let mut config = json!({
             "key": already_encrypted.clone()
         });
 
-        seal_secrets(&mut config, &store, &["/key"]);
+        seal_secrets(&mut config, &store, &["/key"]).unwrap();
 
         assert_eq!(
             config["key"].as_str().unwrap(),
@@ -690,22 +709,22 @@ mod tests {
 
     #[test]
     fn test_seal_secrets_missing_path_is_noop() {
-        let store = SecretStore::new(b"password");
+        let store = SecretStore::new(b"password").unwrap();
         let mut config = json!({ "a": 1 });
         let original = config.clone();
 
-        seal_secrets(&mut config, &store, &["/nonexistent/path"]);
+        seal_secrets(&mut config, &store, &["/nonexistent/path"]).unwrap();
 
         assert_eq!(config, original, "missing path should be a no-op");
     }
 
     #[test]
     fn test_seal_secrets_non_string_is_noop() {
-        let store = SecretStore::new(b"password");
+        let store = SecretStore::new(b"password").unwrap();
         let mut config = json!({ "port": 8080 });
         let original = config.clone();
 
-        seal_secrets(&mut config, &store, &["/port"]);
+        seal_secrets(&mut config, &store, &["/port"]).unwrap();
 
         assert_eq!(config, original, "non-string path should be a no-op");
     }
@@ -713,7 +732,7 @@ mod tests {
     #[test]
     fn test_seal_then_resolve_round_trip() {
         let password = b"integration-test-pw";
-        let store = SecretStore::new(password);
+        let store = SecretStore::new(password).unwrap();
 
         let mut config = json!({
             "auth": {
@@ -735,7 +754,7 @@ mod tests {
             "/db/connectionString",
         ];
 
-        seal_secrets(&mut config, &store, paths);
+        seal_secrets(&mut config, &store, paths).unwrap();
 
         assert!(is_encrypted(config["auth"]["apiKey"].as_str().unwrap()));
         assert!(is_encrypted(
@@ -764,43 +783,41 @@ mod tests {
         let password = b"my-password";
         let salt = [0xABu8; SALT_LEN];
         let store = SecretStore::from_password_and_salt(password, &salt);
-        let encrypted = store.encrypt("hello");
+        let encrypted = store.encrypt("hello").unwrap();
         let decrypted = store.decrypt(&encrypted).unwrap();
         assert_eq!(decrypted, "hello");
     }
 
     #[test]
     fn test_store_new_generates_random_salt() {
-        let s1 = SecretStore::new(b"password");
-        let s2 = SecretStore::new(b"password");
+        let s1 = SecretStore::new(b"password").unwrap();
+        let s2 = SecretStore::new(b"password").unwrap();
         assert_ne!(s1.salt, s2.salt, "each store should have a unique salt");
     }
 
     #[test]
     fn test_encrypt_decrypt_special_characters() {
-        let store = SecretStore::new(b"password");
+        let store = SecretStore::new(b"password").unwrap();
         let plaintext = "p@w0rd!#%^&*()_+-=[]{}|;':,./<>?~";
-        let encrypted = store.encrypt(plaintext);
+        let encrypted = store.encrypt(plaintext).unwrap();
         let decrypted = store.decrypt(&encrypted).unwrap();
         assert_eq!(decrypted, plaintext);
     }
 
     #[test]
     fn test_encrypt_decrypt_newlines() {
-        let store = SecretStore::new(b"password");
-        let plaintext = "line1
-line2
-line3	tab";
-        let encrypted = store.encrypt(plaintext);
+        let store = SecretStore::new(b"password").unwrap();
+        let plaintext = "line1\nline2\nline3\ttab";
+        let encrypted = store.encrypt(plaintext).unwrap();
         let decrypted = store.decrypt(&encrypted).unwrap();
         assert_eq!(decrypted, plaintext);
     }
 
     #[test]
     fn test_encrypt_decrypt_json_string() {
-        let store = SecretStore::new(b"password");
+        let store = SecretStore::new(b"password").unwrap();
         let plaintext = r#"{"key": "value", "nested": {"a": 1}}"#;
-        let encrypted = store.encrypt(plaintext);
+        let encrypted = store.encrypt(plaintext).unwrap();
         let decrypted = store.decrypt(&encrypted).unwrap();
         assert_eq!(decrypted, plaintext);
     }

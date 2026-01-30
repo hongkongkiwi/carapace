@@ -4,8 +4,8 @@
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
-use axum::http::HeaderMap;
-use axum::response::IntoResponse;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
 use ed25519_dalek::{Signature, VerifyingKey};
 use futures_util::{SinkExt, StreamExt};
@@ -35,6 +35,7 @@ use crate::{
 #[cfg(test)]
 mod golden_tests;
 mod handlers;
+pub(crate) mod limits;
 #[cfg(test)]
 mod tests;
 
@@ -67,6 +68,7 @@ const LOGS_DEFAULT_LIMIT: usize = 500;
 const LOGS_DEFAULT_MAX_BYTES: usize = 250_000;
 const LOGS_MAX_LIMIT: usize = 5_000;
 const LOGS_MAX_BYTES: usize = 1_000_000;
+const MAX_JSON_DEPTH: usize = 32;
 
 const ERROR_INVALID_REQUEST: &str = "INVALID_REQUEST";
 const ERROR_NOT_PAIRED: &str = "NOT_PAIRED";
@@ -436,6 +438,8 @@ pub struct WsServerState {
     tools_registry: Option<Arc<plugins::ToolsRegistry>>,
     /// Plugin registry for channel/tool/webhook plugins
     plugin_registry: Option<Arc<plugins::PluginRegistry>>,
+    /// WebSocket connection limiter
+    pub(crate) connection_tracker: limits::ConnectionTracker,
 }
 
 impl std::fmt::Debug for WsServerState {
@@ -486,6 +490,7 @@ impl WsServerState {
             llm_provider: None,
             tools_registry: None,
             plugin_registry: None,
+            connection_tracker: limits::ConnectionTracker::new(),
         }
     }
 
@@ -523,6 +528,7 @@ impl WsServerState {
             llm_provider: None,
             tools_registry: None,
             plugin_registry: None,
+            connection_tracker: limits::ConnectionTracker::new(),
         })
     }
 
@@ -1310,8 +1316,34 @@ pub async fn ws_handler(
     State(state): State<Arc<WsServerState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state, addr, headers))
+) -> Response {
+    let ip = addr.ip();
+    let guard = match state.connection_tracker.try_acquire(ip) {
+        Ok(guard) => guard,
+        Err(_) => {
+            return Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"error":"connection limit reached"}"#,
+                ))
+                .unwrap()
+                .into_response();
+        }
+    };
+    ws.on_upgrade(move |socket| handle_socket_with_guard(socket, state, addr, headers, guard))
+        .into_response()
+}
+
+async fn handle_socket_with_guard(
+    socket: WebSocket,
+    state: Arc<WsServerState>,
+    remote_addr: SocketAddr,
+    headers: HeaderMap,
+    _guard: limits::ConnectionGuard,
+) {
+    handle_socket(socket, state, remote_addr, headers).await;
+    // _guard is dropped here, decrementing the connection count
 }
 
 async fn handle_socket(
@@ -1366,6 +1398,11 @@ async fn handle_socket(
             return;
         }
     };
+
+    if let Err(depth_err) = validate_json_depth(&parsed, MAX_JSON_DEPTH) {
+        let _ = send_close(&tx, 1008, &depth_err);
+        return;
+    }
 
     let ParsedRequest {
         id: req_id,
@@ -1703,6 +1740,10 @@ async fn handle_socket(
                 break;
             }
         };
+        if let Err(depth_err) = validate_json_depth(&parsed, MAX_JSON_DEPTH) {
+            let _ = send_close(&tx, 1008, &depth_err);
+            break;
+        }
         let ParsedRequest {
             id: req_id,
             method,
@@ -1718,6 +1759,13 @@ async fn handle_socket(
                 continue;
             }
         };
+        if let Some(ref p) = params {
+            if let Err(depth_err) = validate_json_depth(p, MAX_JSON_DEPTH) {
+                let err = error_shape(ERROR_INVALID_REQUEST, &depth_err, None);
+                let _ = send_response(&tx, &req_id, false, None, Some(err));
+                continue;
+            }
+        }
         if method == "connect" {
             let err = error_shape(ERROR_INVALID_REQUEST, "connect already completed", None);
             let _ = send_response(&tx, &req_id, false, None, Some(err));
@@ -1820,6 +1868,34 @@ fn parse_request_frame(value: &Value) -> Result<ParsedRequest, FrameError> {
     }
     let params = obj.get("params").cloned();
     Ok(ParsedRequest { id, method, params })
+}
+
+/// Validates that a JSON value doesn't exceed the maximum nesting depth.
+/// Returns Err with a message if the depth limit is exceeded.
+fn validate_json_depth(value: &Value, max_depth: usize) -> Result<(), String> {
+    check_json_depth(value, 1, max_depth)
+}
+
+fn check_json_depth(value: &Value, current_depth: usize, max_depth: usize) -> Result<(), String> {
+    if current_depth > max_depth {
+        return Err(format!(
+            "JSON nesting depth exceeds maximum allowed depth of {max_depth}"
+        ));
+    }
+    match value {
+        Value::Array(arr) => {
+            for item in arr {
+                check_json_depth(item, current_depth + 1, max_depth)?;
+            }
+        }
+        Value::Object(map) => {
+            for val in map.values() {
+                check_json_depth(val, current_depth + 1, max_depth)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn get_value_at_path(root: &Value, path: &str) -> Option<Value> {
