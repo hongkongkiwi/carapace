@@ -272,10 +272,15 @@ pub fn sanitize_html(input: &str) -> String {
     // 1. Strip HTML comments
     result = RE_HTML_COMMENT.replace_all(&result, "").into_owned();
 
-    // 2. Strip <style> tags containing @import
+    // 2. Strip dangerous tags AND their content as complete blocks first.
+    //    This must happen before individual tag processing, otherwise the
+    //    tags get stripped but the inner content (e.g. "alert(1)") remains.
+    result = strip_dangerous_tag_content(&result);
+
+    // 3. Strip <style> tags containing @import
     result = RE_STYLE_TAG_IMPORT.replace_all(&result, "").into_owned();
 
-    // 3. Process HTML tags — strip dangerous ones, clean allowed ones
+    // 4. Process remaining HTML tags — strip unknown, clean allowed
     result = RE_HTML_TAG
         .replace_all(&result, |caps: &regex::Captures| {
             let slash = &caps[1]; // "/" for closing tags
@@ -283,7 +288,7 @@ pub fn sanitize_html(input: &str) -> String {
             let attrs = &caps[3];
             let self_close = &caps[4];
 
-            // Strip dangerous tags entirely
+            // Any remaining dangerous tags (self-closing or orphaned)
             if DANGEROUS_TAGS.contains(&tag_name.as_str()) {
                 return String::new();
             }
@@ -314,10 +319,6 @@ pub fn sanitize_html(input: &str) -> String {
             }
         })
         .into_owned();
-
-    // 4. Strip any remaining dangerous content between stripped tags
-    //    (e.g. content that was between <script>...</script>)
-    result = strip_dangerous_tag_content(&result);
 
     result
 }
