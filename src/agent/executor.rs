@@ -14,6 +14,8 @@ use crate::agent::prompt_guard::{postflight, preflight};
 use crate::agent::provider::*;
 use crate::agent::tools::{self, ToolCallResult};
 use crate::agent::{AgentConfig, AgentError};
+use crate::plugins::hook_utils;
+use crate::plugins::HookDispatchResult;
 use crate::server::ws::{broadcast_agent_event, broadcast_chat_event, WsServerState};
 
 /// Maximum wall-clock time for a single LLM turn (call + stream processing).
@@ -35,6 +37,84 @@ struct StreamResult {
     pending_tool_calls: Vec<(String, String, Value)>,
     stop_reason: StopReason,
     turn_usage: TokenUsage,
+}
+
+fn dispatch_plugin_hook(
+    state: &Arc<WsServerState>,
+    hook_name: &str,
+    payload: &Value,
+) -> Option<HookDispatchResult> {
+    let plugin_registry = state.plugin_registry()?.clone();
+    hook_utils::dispatch_hook(plugin_registry, hook_name, payload)
+}
+
+fn parse_hook_payload(result: &HookDispatchResult, hook_name: &str) -> Option<Value> {
+    hook_utils::parse_hook_payload(result, hook_name)
+}
+
+fn apply_agent_hook_overrides(config: &mut AgentConfig, payload: &Value) {
+    let Some(obj) = payload.as_object() else {
+        return;
+    };
+
+    if let Some(system) = obj.get("system") {
+        match system {
+            Value::String(value) => config.system = Some(value.clone()),
+            Value::Null => config.system = None,
+            _ => {}
+        }
+    }
+
+    if let Some(model) = obj.get("model").and_then(|value| value.as_str()) {
+        config.model = model.to_string();
+    }
+
+    if let Some(max_tokens) = obj.get("maxTokens").and_then(|value| value.as_u64()) {
+        config.max_tokens = max_tokens.min(u32::MAX as u64) as u32;
+    }
+
+    if let Some(temperature) = obj.get("temperature").and_then(|value| value.as_f64()) {
+        config.temperature = Some(temperature);
+    }
+
+    if let Some(extra) = obj.get("extra") {
+        if extra.is_null() {
+            config.extra = None;
+        } else {
+            config.extra = Some(extra.clone());
+        }
+    }
+}
+
+fn apply_tool_input_override(tool_input: &mut Value, payload: &Value) {
+    let Some(obj) = payload.as_object() else {
+        return;
+    };
+    if let Some(input) = obj.get("input") {
+        *tool_input = input.clone();
+    }
+}
+
+fn apply_tool_result_override(result_content: &mut String, is_error: &mut bool, payload: &Value) {
+    let Some(obj) = payload.as_object() else {
+        return;
+    };
+
+    if let Some(result) = obj.get("result") {
+        match result {
+            Value::String(value) => *result_content = value.clone(),
+            Value::Null => {}
+            _ => {
+                if let Ok(serialized) = serde_json::to_string(result) {
+                    *result_content = serialized;
+                }
+            }
+        }
+    }
+
+    if let Some(flag) = obj.get("isError").and_then(|value| value.as_bool()) {
+        *is_error = flag;
+    }
 }
 
 /// Dispatch a single stream event, updating turn accumulators.
@@ -237,6 +317,9 @@ fn execute_tools_with_guards(
     let mut tool_msgs = Vec::with_capacity(pending_tool_calls.len());
 
     for (tool_id, tool_name, tool_input) in pending_tool_calls {
+        let mut tool_input = tool_input.clone();
+        let original_tool_input = tool_input.clone();
+
         // Check exfiltration guard before tool policy (defence-in-depth)
         let tool_result = if config.exfiltration_guard
             && crate::agent::exfiltration::is_exfiltration_sensitive(tool_name)
@@ -252,6 +335,56 @@ fn execute_tools_with_guards(
         } else if !config.tool_policy.is_allowed(tool_name) {
             ToolCallResult::Error {
                 message: format!("Tool \"{}\" is not available for this agent", tool_name),
+            }
+        } else if let Some(result) = dispatch_plugin_hook(
+            state,
+            "before_tool_call",
+            &json!({
+                "runId": run_id,
+                "sessionKey": session_key,
+                "toolUseId": tool_id,
+                "name": tool_name,
+                "input": &tool_input,
+                "messageChannel": message_channel,
+            }),
+        ) {
+            if result.cancelled {
+                ToolCallResult::Error {
+                    message: format!("Tool \"{}\" cancelled by hook", tool_name),
+                }
+            } else {
+                if let Some(payload) = parse_hook_payload(&result, "before_tool_call") {
+                    apply_tool_input_override(&mut tool_input, &payload);
+                    if tool_input != original_tool_input {
+                        tracing::info!(
+                            run_id = %run_id,
+                            tool = %tool_name,
+                            tool_use_id = %tool_id,
+                            "tool input modified by hook"
+                        );
+                    }
+                }
+
+                if let Some(tools_registry) = state.tools_registry() {
+                    let sandbox = if config.process_sandbox.enabled {
+                        Some(&config.process_sandbox)
+                    } else {
+                        None
+                    };
+                    tools::execute_tool_call_with_sandbox(
+                        tool_name,
+                        tool_input.clone(),
+                        tools_registry,
+                        session_key,
+                        None,
+                        message_channel,
+                        sandbox,
+                    )
+                } else {
+                    ToolCallResult::Error {
+                        message: "no tools registry available".to_string(),
+                    }
+                }
             }
         } else if let Some(tools_registry) = state.tools_registry() {
             let sandbox = if config.process_sandbox.enabled {
@@ -274,10 +407,49 @@ fn execute_tools_with_guards(
             }
         };
 
-        let (result_content, is_error) = match &tool_result {
+        let (mut result_content, mut is_error) = match &tool_result {
             ToolCallResult::Ok { output } => (output.clone(), false),
             ToolCallResult::Error { message } => (message.clone(), true),
         };
+
+        let _ = dispatch_plugin_hook(
+            state,
+            "after_tool_call",
+            &json!({
+                "runId": run_id,
+                "sessionKey": session_key,
+                "toolUseId": tool_id,
+                "name": tool_name,
+                "originalInput": &original_tool_input,
+                "input": &tool_input,
+                "result": &result_content,
+                "isError": is_error,
+                "messageChannel": message_channel,
+            }),
+        );
+
+        if let Some(result) = dispatch_plugin_hook(
+            state,
+            "tool_result_persist",
+            &json!({
+                "runId": run_id,
+                "sessionKey": session_key,
+                "toolUseId": tool_id,
+                "name": tool_name,
+                "originalInput": &original_tool_input,
+                "input": &tool_input,
+                "result": &result_content,
+                "isError": is_error,
+                "messageChannel": message_channel,
+            }),
+        ) {
+            if result.cancelled {
+                result_content = format!("Tool \"{}\" result suppressed by hook", tool_name);
+                is_error = true;
+            } else if let Some(payload) = parse_hook_payload(&result, "tool_result_persist") {
+                apply_tool_result_override(&mut result_content, &mut is_error, &payload);
+            }
+        }
 
         // Broadcast tool_result event
         broadcast_agent_event(
@@ -576,7 +748,7 @@ async fn execute_single_turn(
 pub async fn execute_run(
     run_id: String,
     session_key: String,
-    config: AgentConfig,
+    mut config: AgentConfig,
     state: Arc<WsServerState>,
     provider: Arc<dyn LlmProvider>,
     cancel_token: CancellationToken,
@@ -605,6 +777,29 @@ pub async fn execute_run(
         .get_session_by_key(&session_key)
         .map_err(|e| AgentError::SessionNotFound(format!("{session_key}: {e}")))?;
     let message_channel = session.metadata.channel.clone();
+
+    if let Some(result) = dispatch_plugin_hook(
+        &state,
+        "before_agent_start",
+        &json!({
+            "runId": run_id,
+            "sessionKey": session_key,
+            "model": &config.model,
+            "system": &config.system,
+            "maxTokens": config.max_tokens,
+            "temperature": config.temperature,
+            "deliver": config.deliver,
+            "messageChannel": &message_channel,
+            "extra": &config.extra,
+        }),
+    ) {
+        if result.cancelled {
+            return Err(AgentError::Cancelled);
+        }
+        if let Some(payload) = parse_hook_payload(&result, "before_agent_start") {
+            apply_agent_hook_overrides(&mut config, &payload);
+        }
+    }
 
     // 2b. Pre-flight system prompt check
     if config.prompt_guard.enabled && config.prompt_guard.preflight.enabled {

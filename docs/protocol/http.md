@@ -260,6 +260,7 @@ The following handlers are available but require additional documentation:
 - `POST /plugins/{pluginId}/{path}` - Plugin webhook routes
 - Registered via `registerHttpRoute()` in plugin API
 - Each plugin's routes are namespaced under `/plugins/{pluginId}/`
+- Authentication: uses the hooks token (same as `/hooks/*`)
 
 **BREAKING CHANGE from Node gateway:**
 The Node gateway allowed plugins to register arbitrary paths (e.g., `/my-webhook`).

@@ -37,6 +37,7 @@
 pub mod bindings;
 pub mod capabilities;
 pub mod dispatch;
+pub mod hook_utils;
 pub mod host;
 pub mod loader;
 pub mod permissions;

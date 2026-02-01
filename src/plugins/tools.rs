@@ -8,8 +8,10 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use super::bindings::{ToolContext, ToolDefinition, ToolPluginInstance};
+use super::{DispatchError, PluginRegistry, ToolDispatcher};
 
 /// Tool invocation context
 #[derive(Debug, Clone)]
@@ -100,6 +102,12 @@ pub struct ToolsRegistry {
     builtin_tools: RwLock<HashMap<String, BuiltinTool>>,
     /// Plugin tools by plugin ID
     plugin_tools: RwLock<HashMap<String, Arc<dyn ToolPluginInstance>>>,
+    /// Shared plugin registry for dispatch (preferred over plugin_tools)
+    plugin_registry: RwLock<Option<Arc<PluginRegistry>>>,
+    /// Cached plugin tool dispatcher
+    plugin_dispatcher: RwLock<Option<Arc<ToolDispatcher>>>,
+    /// Last time we refreshed the tool map
+    plugin_dispatcher_last_refresh: RwLock<Option<Instant>>,
     /// Tool allowlist (empty = all allowed)
     allowlist: RwLock<Vec<String>>,
 }
@@ -116,6 +124,9 @@ impl ToolsRegistry {
         let registry = Self {
             builtin_tools: RwLock::new(HashMap::new()),
             plugin_tools: RwLock::new(HashMap::new()),
+            plugin_registry: RwLock::new(None),
+            plugin_dispatcher: RwLock::new(None),
+            plugin_dispatcher_last_refresh: RwLock::new(None),
             allowlist: RwLock::new(Vec::new()),
         };
 
@@ -170,6 +181,54 @@ impl ToolsRegistry {
         *allowlist = list;
     }
 
+    /// Set the shared plugin registry for tool dispatch.
+    pub fn set_plugin_registry(&self, registry: Arc<PluginRegistry>) {
+        let dispatcher = Arc::new(ToolDispatcher::new(registry.clone()));
+        let mut guard = self.plugin_registry.write();
+        *guard = Some(registry);
+        let mut dispatcher_guard = self.plugin_dispatcher.write();
+        *dispatcher_guard = Some(dispatcher.clone());
+        let mut last_refresh = self.plugin_dispatcher_last_refresh.write();
+        *last_refresh = None;
+        self.refresh_plugin_dispatcher(&dispatcher);
+    }
+
+    fn plugin_dispatcher(&self) -> Option<Arc<ToolDispatcher>> {
+        let registry = self.plugin_registry.read().clone()?;
+        let dispatcher = self.plugin_dispatcher.read().clone().unwrap_or_else(|| {
+            let dispatcher = Arc::new(ToolDispatcher::new(registry));
+            let mut guard = self.plugin_dispatcher.write();
+            *guard = Some(dispatcher.clone());
+            dispatcher
+        });
+        self.refresh_plugin_dispatcher(&dispatcher);
+        Some(dispatcher)
+    }
+
+    fn refresh_plugin_dispatcher(&self, dispatcher: &ToolDispatcher) {
+        const TOOL_MAP_TTL: Duration = Duration::from_secs(5);
+
+        let should_refresh = {
+            let last_refresh = self.plugin_dispatcher_last_refresh.read();
+            match *last_refresh {
+                Some(ts) => ts.elapsed() >= TOOL_MAP_TTL,
+                None => true,
+            }
+        };
+
+        if !should_refresh {
+            return;
+        }
+
+        if let Err(err) = dispatcher.refresh_tool_map() {
+            tracing::warn!(error = %err, "failed to refresh plugin tool map");
+            return;
+        }
+
+        let mut last_refresh = self.plugin_dispatcher_last_refresh.write();
+        *last_refresh = Some(Instant::now());
+    }
+
     /// Check if a tool is allowed
     fn is_allowed(&self, tool_name: &str) -> bool {
         let allowlist = self.allowlist.read();
@@ -201,7 +260,20 @@ impl ToolsRegistry {
         }
 
         // Plugin tools
-        {
+        if let Some(dispatcher) = self.plugin_dispatcher() {
+            match dispatcher.list_tools() {
+                Ok(tool_defs) => {
+                    for def in tool_defs {
+                        if self.is_allowed(&def.name) {
+                            definitions.push(def);
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "plugin tool definitions unavailable");
+                }
+            }
+        } else {
             let plugins = self.plugin_tools.read();
             for (plugin_id, instance) in plugins.iter() {
                 match instance.get_definitions() {
@@ -304,7 +376,34 @@ impl ToolsRegistry {
         }
 
         // Check plugin tools
-        {
+        if let Some(dispatcher) = self.plugin_dispatcher() {
+            let tool_ctx = ToolContext {
+                agent_id: ctx.agent_id.clone(),
+                session_key: Some(ctx.session_key.clone()),
+                message_channel: ctx.message_channel.clone(),
+                sandboxed: ctx.sandboxed,
+            };
+            let params = serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
+            match dispatcher.invoke(tool_name, &params, tool_ctx) {
+                Ok(result) => {
+                    if result.success {
+                        let result_value = result
+                            .result
+                            .as_ref()
+                            .and_then(|s| serde_json::from_str(s).ok())
+                            .unwrap_or(Value::Null);
+                        return ToolInvokeResult::success(result_value);
+                    }
+                    return ToolInvokeResult::tool_error(
+                        result.error.unwrap_or_else(|| "Unknown error".to_string()),
+                    );
+                }
+                Err(DispatchError::ToolNotFound(_)) => {}
+                Err(e) => {
+                    return ToolInvokeResult::tool_error(e.to_string());
+                }
+            }
+        } else {
             let plugins = self.plugin_tools.read();
             for (plugin_id, instance) in plugins.iter() {
                 match instance.get_definitions() {
@@ -384,7 +483,13 @@ impl ToolsRegistry {
         }
 
         // Check plugin tools
-        {
+        if let Some(dispatcher) = self.plugin_dispatcher() {
+            if let Ok(defs) = dispatcher.list_tools() {
+                if defs.iter().any(|d| d.name.eq_ignore_ascii_case(tool_name)) {
+                    return true;
+                }
+            }
+        } else {
             let plugins = self.plugin_tools.read();
             for (plugin_id, instance) in plugins.iter() {
                 match instance.get_definitions() {
@@ -430,13 +535,16 @@ impl ToolsRegistry {
     /// Get the count of registered tools
     pub fn len(&self) -> usize {
         let builtin_count = self.builtin_tools.read().len();
-        let plugin_count: usize = self
-            .plugin_tools
-            .read()
-            .values()
-            .filter_map(|instance| instance.get_definitions().ok())
-            .map(|defs| defs.len())
-            .sum();
+        let plugin_count: usize = if let Some(dispatcher) = self.plugin_dispatcher() {
+            dispatcher.list_tools().map(|defs| defs.len()).unwrap_or(0)
+        } else {
+            self.plugin_tools
+                .read()
+                .values()
+                .filter_map(|instance| instance.get_definitions().ok())
+                .map(|defs| defs.len())
+                .sum()
+        };
         builtin_count + plugin_count
     }
 

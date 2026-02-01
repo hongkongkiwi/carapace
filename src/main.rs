@@ -138,8 +138,14 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     logging::audit::AuditLog::init(state_dir.clone()).await;
 
     let resolved = resolve_bind_config(&cfg)?;
+    let plugin_registry = Arc::new(plugins::PluginRegistry::new());
+    let tools_registry = Arc::new(plugins::tools::ToolsRegistry::new());
+    let hook_registry = Arc::new(hooks::registry::HookRegistry::new());
+
     let ws_state = server::ws::build_ws_state_from_config().await?;
     let ws_state = configure_ws_with_llm(ws_state, &cfg)?;
+    let ws_state =
+        configure_ws_with_registries(ws_state, tools_registry.clone(), plugin_registry.clone())?;
     let ws_state = register_console_channel(ws_state)?;
     let ws_state = register_signal_channel_if_configured(ws_state, &cfg)?;
     let ws_state = register_telegram_channel_if_configured(ws_state, &cfg)?;
@@ -164,10 +170,20 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             &shutdown_rx,
             shutdown_tx,
             resolved.address,
+            hook_registry.clone(),
+            tools_registry.clone(),
         )
         .await?;
     } else {
-        launch_non_tls_server(ws_state, http_config, cfg, resolved.address).await?;
+        launch_non_tls_server(
+            ws_state,
+            http_config,
+            cfg,
+            resolved.address,
+            hook_registry.clone(),
+            tools_registry.clone(),
+        )
+        .await?;
     }
 
     info!("Gateway shut down");
@@ -225,11 +241,30 @@ fn configure_ws_with_llm(
     }
 }
 
+/// Attach shared registries (tools + plugins) to the WsServerState.
+fn configure_ws_with_registries(
+    ws_state: Arc<server::ws::WsServerState>,
+    tools_registry: Arc<plugins::tools::ToolsRegistry>,
+    plugin_registry: Arc<plugins::PluginRegistry>,
+) -> Result<Arc<server::ws::WsServerState>, Box<dyn std::error::Error>> {
+    tools_registry.set_plugin_registry(plugin_registry.clone());
+    let inner = Arc::try_unwrap(ws_state)
+        .map_err(|_| "WsServerState Arc should have single owner at startup")?;
+    Ok(Arc::new(
+        inner
+            .with_tools_registry(tools_registry)
+            .with_plugin_registry(plugin_registry),
+    ))
+}
+
 /// Register the built-in console channel (for testing/demo) on the WsServerState.
 fn register_console_channel(
     ws_state: Arc<server::ws::WsServerState>,
 ) -> Result<Arc<server::ws::WsServerState>, Box<dyn std::error::Error>> {
-    let plugin_reg = Arc::new(plugins::PluginRegistry::new());
+    let Some(plugin_reg) = ws_state.plugin_registry() else {
+        warn!("Plugin registry not configured; skipping console channel registration");
+        return Ok(ws_state);
+    };
     plugin_reg.register_channel(
         "console".to_string(),
         Arc::new(channels::console::ConsoleChannel::new()),
@@ -238,10 +273,8 @@ fn register_console_channel(
         channels::ChannelInfo::new("console", "Console")
             .with_status(channels::ChannelStatus::Connected),
     );
-    let inner = Arc::try_unwrap(ws_state)
-        .map_err(|_| "WsServerState Arc should have single owner at startup")?;
     info!("Console channel registered");
-    Ok(Arc::new(inner.with_plugin_registry(plugin_reg)))
+    Ok(ws_state)
 }
 
 /// Resolved Signal configuration (shared between registration and receive loop).
@@ -595,13 +628,15 @@ async fn launch_non_tls_server(
     http_config: server::http::HttpConfig,
     cfg: Value,
     bind_address: SocketAddr,
+    hook_registry: Arc<hooks::registry::HookRegistry>,
+    tools_registry: Arc<plugins::tools::ToolsRegistry>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let server_config = server::startup::ServerConfig {
         ws_state: ws_state.clone(),
         http_config,
         middleware_config: server::http::MiddlewareConfig::default(),
-        hook_registry: Arc::new(hooks::registry::HookRegistry::new()),
-        tools_registry: Arc::new(plugins::tools::ToolsRegistry::new()),
+        hook_registry,
+        tools_registry,
         bind_address,
         raw_config: cfg,
         spawn_background_tasks: true,
@@ -709,6 +744,7 @@ fn spawn_network_services(
 }
 
 /// Assemble and serve the TLS-enabled server path.
+#[allow(clippy::too_many_arguments)]
 async fn launch_tls_server(
     tls_result: tls::TlsSetupResult,
     http_config: server::http::HttpConfig,
@@ -717,12 +753,14 @@ async fn launch_tls_server(
     shutdown_rx: &tokio::sync::watch::Receiver<bool>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     addr: SocketAddr,
+    hook_registry: Arc<hooks::registry::HookRegistry>,
+    tools_registry: Arc<plugins::tools::ToolsRegistry>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let http_router = server::http::create_router_with_state(
         http_config,
         server::http::MiddlewareConfig::default(),
-        Arc::new(hooks::registry::HookRegistry::new()),
-        Arc::new(plugins::tools::ToolsRegistry::new()),
+        hook_registry,
+        tools_registry,
         ws_state.channel_registry().clone(),
         Some(ws_state.clone()),
         true,

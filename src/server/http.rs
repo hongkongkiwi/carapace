@@ -10,11 +10,12 @@
 //! - Security middleware (headers, CSRF, rate limiting)
 
 use axum::{
-    extract::{ConnectInfo, Path, Query, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
+    body::Bytes,
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     middleware,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{any, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -44,6 +45,7 @@ use crate::hooks::handler::{
 };
 use crate::hooks::registry::{HookMappingContext, HookMappingResult, HookRegistry};
 use crate::plugins::tools::{ToolInvokeContext, ToolInvokeResult, ToolsRegistry};
+use crate::plugins::{DispatchError, WebhookDispatcher, WebhookRequest};
 use crate::server::ws::WsServerState;
 
 /// Default max body size for hooks (256KB)
@@ -404,6 +406,12 @@ pub fn create_router_with_state(
                 post(hooks_mapping_handler),
             );
     }
+
+    // Plugin webhook routes (always enabled when plugins are registered)
+    let plugin_router = Router::new()
+        .route("/plugins/*path", any(plugins_webhook_handler))
+        .layer(DefaultBodyLimit::max(config.hooks_max_body_bytes));
+    router = router.merge(plugin_router);
 
     // Health checks (unauthenticated, always enabled)
     router = router
@@ -1006,6 +1014,113 @@ async fn hooks_mapping_handler(
 
     let ctx = build_hook_context(&headers, &uri, &path, payload);
     execute_hook_mapping(&state, &path, &ctx)
+}
+
+/// Plugin webhook handler: forwards `/plugins/<plugin-id>/<path>` to plugin instances.
+async fn plugins_webhook_handler(
+    State(state): State<AppState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    Path(path): Path<String>,
+    body: Bytes,
+) -> Response {
+    if let Some(err) = check_hooks_auth(&state.config, &headers, &uri) {
+        return err;
+    }
+
+    if body.len() > state.config.hooks_max_body_bytes {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(HooksErrorResponse::new("payload too large")),
+        )
+            .into_response();
+    }
+
+    let Some(ws_state) = state.ws_state.as_ref() else {
+        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+    };
+    let Some(plugin_registry) = ws_state.plugin_registry().cloned() else {
+        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+    };
+
+    let full_path = if path.is_empty() {
+        "/plugins".to_string()
+    } else {
+        format!("/plugins/{}", path)
+    };
+
+    let req_headers = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|v| (name.as_str().to_string(), v.to_string()))
+        })
+        .collect::<Vec<_>>();
+
+    let request = WebhookRequest {
+        method: method.to_string(),
+        path: full_path.clone(),
+        headers: req_headers,
+        body: if body.is_empty() {
+            None
+        } else {
+            Some(body.to_vec())
+        },
+        query: uri.query().map(|q| q.to_string()),
+    };
+
+    let dispatcher = WebhookDispatcher::new(plugin_registry);
+    if let Err(err) = dispatcher.refresh_path_map() {
+        warn!(error = %err, "Failed to refresh plugin webhook paths");
+    }
+
+    match dispatcher.handle(&full_path, request) {
+        Ok(response) => webhook_response_to_http(response),
+        Err(DispatchError::WebhookPathNotFound(_)) | Err(DispatchError::PluginNotFound(_)) => {
+            (StatusCode::NOT_FOUND, "Not Found").into_response()
+        }
+        Err(err) => {
+            warn!(error = %err, path = %full_path, "Plugin webhook dispatch failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Webhook handler error").into_response()
+        }
+    }
+}
+
+fn webhook_response_to_http(response: crate::plugins::WebhookResponse) -> Response {
+    let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut builder = Response::builder().status(status);
+
+    for (name, value) in response.headers {
+        let header_name = match header::HeaderName::from_bytes(name.as_bytes()) {
+            Ok(name) => name,
+            Err(_) => {
+                warn!(header = %name, "Invalid webhook response header name");
+                continue;
+            }
+        };
+        let header_value = match HeaderValue::from_str(&value) {
+            Ok(value) => value,
+            Err(_) => {
+                warn!(header = %name, "Invalid webhook response header value");
+                continue;
+            }
+        };
+        builder = builder.header(header_name, header_value);
+    }
+
+    let body = response.body.unwrap_or_default();
+    builder
+        .body(axum::body::Body::from(body))
+        .unwrap_or_else(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Invalid webhook response",
+            )
+                .into_response()
+        })
 }
 
 /// Check hooks authentication

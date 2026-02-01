@@ -671,37 +671,38 @@ features:
       - "src/plugins/permissions.rs::test_permission_enforcer_media_denied"
 
   - feature: "plugins.tool dispatch"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
       - "src/plugins/dispatch.rs::ToolDispatcher (namespacing + collision warnings)"
       - "src/plugins/runtime.rs (register_tool into PluginRegistry)"
+      - "src/plugins/tools.rs (ToolDispatcher-backed plugin tool listing/invocation)"
+      - "src/main.rs (shared tools registry + plugin registry wiring)"
+      - "src/server/http.rs::tools_invoke_handler (uses shared ToolsRegistry)"
+      - "src/agent/executor.rs::build_turn_request (agent tool listing)"
     tests:
       - "src/plugins/dispatch.rs::test_tool_dispatcher_creation"
       - "src/plugins/tests.rs::test_tool_dispatcher"
-    notes:
-      - "ToolDispatcher is not wired to /tools/invoke or agent tool routing"
 
   - feature: "plugins.hook dispatch"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
       - "src/plugins/dispatch.rs::HookDispatcher"
       - "src/plugins/runtime.rs (register_hook into PluginRegistry)"
+      - "src/agent/executor.rs (before_agent_start/before_tool_call/tool_result_persist hooks)"
+      - "src/messages/delivery.rs (message_sending/message_sent hooks)"
     tests:
       - "src/plugins/dispatch.rs::test_hook_dispatcher_creation"
       - "src/plugins/tests.rs::test_hook_dispatcher"
-    notes:
-      - "HookDispatcher is not wired into runtime event lifecycle"
 
   - feature: "plugins.webhook dispatch"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
       - "src/plugins/dispatch.rs::WebhookDispatcher"
       - "src/plugins/runtime.rs (register_webhook into PluginRegistry)"
+      - "src/server/http.rs::plugins_webhook_handler (/plugins/<id>/* routing)"
     tests:
       - "src/plugins/dispatch.rs::test_webhook_dispatcher_creation"
       - "src/plugins/tests.rs::test_webhook_dispatcher"
-    notes:
-      - "No HTTP routes invoke WebhookDispatcher (/plugins/<id>/* not registered)"
 
   - feature: "plugins.builtin tools"
     status: "verified_done"

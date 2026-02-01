@@ -607,20 +607,64 @@ impl MessagePipeline {
     ///
     /// Only works for messages that haven't been sent yet.
     pub fn cancel(&self, message_id: &MessageId) -> Result<(), PipelineError> {
-        let mut messages = self.messages.write();
-        if let Some(queued) = messages.get_mut(&message_id.0) {
-            if queued.status == DeliveryStatus::Queued {
-                queued.mark_cancelled();
-                Ok(())
+        {
+            let mut messages = self.messages.write();
+            if let Some(queued) = messages.get_mut(&message_id.0) {
+                if queued.status == DeliveryStatus::Queued {
+                    queued.mark_cancelled();
+                } else {
+                    return Err(PipelineError::InvalidMessage(format!(
+                        "Cannot cancel message with status: {}",
+                        queued.status
+                    )));
+                }
             } else {
-                Err(PipelineError::InvalidMessage(format!(
-                    "Cannot cancel message with status: {}",
-                    queued.status
-                )))
+                return Err(PipelineError::MessageNotFound(message_id.0.clone()));
             }
-        } else {
-            Err(PipelineError::MessageNotFound(message_id.0.clone()))
         }
+
+        self.remove_from_queue(message_id);
+        Ok(())
+    }
+
+    /// Update a queued message's content/metadata before delivery.
+    pub fn update_message(
+        &self,
+        message_id: &MessageId,
+        message: OutboundMessage,
+    ) -> Result<(), PipelineError> {
+        let channel_id = {
+            let mut messages = self.messages.write();
+            if let Some(queued) = messages.get_mut(&message_id.0) {
+                if queued.status != DeliveryStatus::Queued {
+                    return Err(PipelineError::InvalidMessage(format!(
+                        "Cannot update message with status: {}",
+                        queued.status
+                    )));
+                }
+                if queued.message.channel_id != message.channel_id {
+                    return Err(PipelineError::InvalidMessage(
+                        "Cannot change channel for queued message".to_string(),
+                    ));
+                }
+                queued.message = message.clone();
+                queued.message.channel_id.clone()
+            } else {
+                return Err(PipelineError::MessageNotFound(message_id.0.clone()));
+            }
+        };
+
+        let mut queues = self.queues.write();
+        if let Some(queue) = queues.get_mut(&channel_id) {
+            for entry in queue.iter_mut() {
+                if entry.message.id == *message_id {
+                    entry.message = message.clone();
+                    break;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Check if a message can be retried (from the authoritative messages map).
@@ -1125,6 +1169,29 @@ mod tests {
 
         let status = pipeline.get_status(&result.message_id);
         assert_eq!(status, Some(DeliveryStatus::Cancelled));
+        assert!(pipeline.next_for_channel("telegram").is_none());
+    }
+
+    #[test]
+    fn test_pipeline_update_message() {
+        let pipeline = MessagePipeline::new();
+        let msg = OutboundMessage::new("telegram", MessageContent::text("Hello"));
+        let result = pipeline.queue(msg, OutboundContext::new()).unwrap();
+
+        let mut updated = pipeline.get_message(&result.message_id).unwrap().message;
+        updated.content = MessageContent::text("Updated");
+        updated.metadata.recipient_id = Some("user-123".to_string());
+
+        pipeline
+            .update_message(&result.message_id, updated.clone())
+            .unwrap();
+
+        let stored = pipeline.get_message(&result.message_id).unwrap().message;
+        match stored.content {
+            MessageContent::Text { text } => assert_eq!(text, "Updated"),
+            _ => panic!("unexpected content type"),
+        }
+        assert_eq!(stored.metadata.recipient_id.as_deref(), Some("user-123"));
     }
 
     #[test]

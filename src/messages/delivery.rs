@@ -6,10 +6,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde_json::{json, Value};
 use tracing::warn;
 
 use crate::channels::ChannelRegistry;
 use crate::messages::outbound::{MessageContent, MessagePipeline};
+use crate::plugins::hook_utils;
 use crate::plugins::{self, OutboundContext, PluginRegistry};
 use crate::server::ws::WsServerState;
 
@@ -49,7 +51,7 @@ pub async fn delivery_loop(
 async fn process_channel_messages(
     channel_ids: &[String],
     pipeline: &MessagePipeline,
-    plugin_registry: &PluginRegistry,
+    plugin_registry: &Arc<PluginRegistry>,
     channel_registry: &ChannelRegistry,
 ) {
     for channel_id in channel_ids {
@@ -63,6 +65,41 @@ async fn process_channel_messages(
         };
 
         let message_id = msg.message.id.clone();
+        let mut message = msg.message.clone();
+
+        if let Some(result) = dispatch_message_hook(
+            plugin_registry,
+            "message_sending",
+            &json!({
+                "messageId": message_id.0.clone(),
+                "channel": channel_id,
+                "content": &message.content,
+                "metadata": &message.metadata,
+            }),
+        ) {
+            if result.cancelled {
+                if let Err(err) = pipeline.cancel(&message_id) {
+                    warn!(
+                        id = %message_id,
+                        error = %err,
+                        "failed to cancel message after hook cancellation"
+                    );
+                    let _ = pipeline.mark_failed(&message_id, "message cancelled by hook");
+                }
+                continue;
+            }
+
+            if let Some(payload) = parse_hook_payload(&result, "message_sending") {
+                apply_message_hook_overrides(&mut message, &payload);
+                if let Err(err) = pipeline.update_message(&message_id, message.clone()) {
+                    warn!(
+                        id = %message_id,
+                        error = %err,
+                        "failed to persist message updates from hook"
+                    );
+                }
+            }
+        }
 
         if let Err(e) = pipeline.mark_sending(&message_id) {
             warn!(id = %message_id, error = %e, "failed to mark message as sending");
@@ -77,16 +114,44 @@ async fn process_channel_messages(
             }
         };
 
-        let metadata = &msg.message.metadata;
+        let metadata = &message.metadata;
 
         let result = deliver_message(
             &plugin,
-            &msg.message.content,
+            &message.content,
             metadata.recipient_id.as_deref().unwrap_or_default(),
             metadata.reply_to.as_deref(),
             metadata.thread_id.as_deref(),
         )
         .await;
+
+        let delivery_snapshot = match &result {
+            Ok(delivery) => json!({
+                "ok": delivery.ok,
+                "messageId": delivery.message_id,
+                "error": delivery.error,
+                "retryable": delivery.retryable,
+                "conversationId": delivery.conversation_id,
+                "toJid": delivery.to_jid,
+                "pollId": delivery.poll_id,
+            }),
+            Err(err) => json!({
+                "ok": false,
+                "error": err.to_string(),
+            }),
+        };
+
+        let _ = dispatch_message_hook(
+            plugin_registry,
+            "message_sent",
+            &json!({
+                "messageId": message_id.0.clone(),
+                "channel": channel_id,
+                "content": &message.content,
+                "metadata": &message.metadata,
+                "delivery": delivery_snapshot,
+            }),
+        );
 
         handle_delivery_result(pipeline, &message_id, result);
     }
@@ -119,6 +184,41 @@ fn handle_delivery_result(
         }
         Err(e) => {
             let _ = pipeline.mark_failed(message_id, e.to_string());
+        }
+    }
+}
+
+fn dispatch_message_hook(
+    plugin_registry: &Arc<PluginRegistry>,
+    hook_name: &str,
+    payload: &Value,
+) -> Option<plugins::HookDispatchResult> {
+    hook_utils::dispatch_hook(plugin_registry.clone(), hook_name, payload)
+}
+
+fn parse_hook_payload(result: &plugins::HookDispatchResult, hook_name: &str) -> Option<Value> {
+    hook_utils::parse_hook_payload(result, hook_name)
+}
+
+fn apply_message_hook_overrides(
+    message: &mut crate::messages::outbound::OutboundMessage,
+    payload: &Value,
+) {
+    let Some(obj) = payload.as_object() else {
+        return;
+    };
+
+    if let Some(content) = obj.get("content") {
+        if let Ok(content) = serde_json::from_value::<MessageContent>(content.clone()) {
+            message.content = content;
+        }
+    }
+
+    if let Some(metadata) = obj.get("metadata") {
+        if let Ok(metadata) =
+            serde_json::from_value::<crate::messages::outbound::MessageMetadata>(metadata.clone())
+        {
+            message.metadata = metadata;
         }
     }
 }

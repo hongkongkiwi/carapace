@@ -193,9 +193,9 @@ feature_inventory_markdown: |
   - [x] **HTTP rate limiting** — 100 req/min per plugin
   - [x] **Log rate limiting** — 1000 msg/min per plugin
   - [x] **Permission enforcement** — declared + override permissions
-  - [~] **Tool dispatch** — tool invocation routing with collision warnings
-  - [~] **Hook dispatch** — lifecycle hook routing
-  - [~] **Webhook dispatch** — HTTP webhook routing
+  - [x] **Tool dispatch** — tool invocation routing with collision warnings
+  - [x] **Hook dispatch** — lifecycle hook routing
+  - [x] **Webhook dispatch** — HTTP webhook routing
   - [x] **Builtin tools** — 10 core tools (current_time, web_fetch, memory_read/write/list, message_send, session_list/read, config_read, math_eval)
 
   ### Server (`src/server/`)
