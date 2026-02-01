@@ -106,6 +106,11 @@ pub(super) fn canonicalize_ws_method_name(method: &str) -> &str {
         "agent.cancel" => "chat.abort",
         "session.list" => "sessions.list",
         "session.preview" => "sessions.preview",
+        "session.create" => "sessions.create",
+        "session.load" => "sessions.load",
+        "session.fork" => "sessions.fork",
+        "session.rename" => "sessions.rename",
+        "session.switch" => "sessions.switch",
         "session.patch" => "sessions.patch",
         "session.reset" => "sessions.reset",
         "session.delete" => "sessions.delete",
@@ -153,7 +158,7 @@ pub(super) const NODE_ONLY_METHODS: [&str; 3] = ["node.invoke.result", "node.eve
 ///
 /// Per Node.js gateway: config.*, wizard.*, update.*, skills.install/update,
 /// channels.logout, sessions.*, and cron.* require operator.admin for operators.
-const OPERATOR_ADMIN_REQUIRED_METHODS: [&str; 39] = [
+const OPERATOR_ADMIN_REQUIRED_METHODS: [&str; 43] = [
     "config.get",
     "config.set",
     "config.apply",
@@ -167,6 +172,10 @@ const OPERATOR_ADMIN_REQUIRED_METHODS: [&str; 39] = [
     "sessions.compact",
     "sessions.archive",
     "sessions.restore",
+    "sessions.create",
+    "sessions.fork",
+    "sessions.rename",
+    "sessions.switch",
     "sessions.archives",
     "sessions.archive.delete",
     "sessions.export_user",
@@ -211,6 +220,7 @@ const READ_METHODS: &[&str] = &[
     "config.schema",
     "sessions.list",
     "sessions.preview",
+    "sessions.load",
     "sessions.archives",
     "channels.status",
     "agent.identity.get",
@@ -252,6 +262,10 @@ const WRITE_METHODS: &[&str] = &[
     "config.set",
     "config.apply",
     "config.patch",
+    "sessions.create",
+    "sessions.fork",
+    "sessions.rename",
+    "sessions.switch",
     "sessions.patch",
     "sessions.reset",
     "sessions.delete",
@@ -626,10 +640,16 @@ fn dispatch_sessions(
     method: &str,
     params: Option<&Value>,
     state: &Arc<WsServerState>,
+    conn: &ConnectionContext,
 ) -> Option<Result<Value, ErrorShape>> {
     match method {
         "sessions.list" => Some(handle_sessions_list(state, params)),
         "sessions.preview" => Some(handle_sessions_preview(state, params)),
+        "sessions.create" => Some(handle_sessions_create(state, params)),
+        "sessions.load" => Some(handle_sessions_load(state, params)),
+        "sessions.fork" => Some(handle_sessions_fork(state, params)),
+        "sessions.rename" => Some(handle_sessions_rename(state, params)),
+        "sessions.switch" => Some(handle_sessions_switch(state, params, conn)),
         "sessions.patch" => Some(handle_sessions_patch(state, params)),
         "sessions.reset" => Some(handle_sessions_reset(state, params)),
         "sessions.delete" => Some(handle_sessions_delete(state, params)),
@@ -752,7 +772,7 @@ pub(super) async fn dispatch_method(
     if let Some(result) = dispatch_config(method, params, state) {
         return result;
     }
-    if let Some(result) = dispatch_sessions(method, params, state) {
+    if let Some(result) = dispatch_sessions(method, params, state, conn) {
         return result;
     }
     if let Some(result) = dispatch_tts_voice(method, params, state) {

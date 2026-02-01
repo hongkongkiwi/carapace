@@ -216,7 +216,7 @@ feature_inventory_markdown: |
   #### WebSocket Handlers
 
   - [x] **agent.run / agent.cancel** — LLM execution + cancellation
-  - [~] **session.create/load/list/fork/rename/delete/switch** — session management
+  - [x] **session.create/load/list/fork/rename/delete/switch** — session management
   - [x] **config.get/update/reload/validate** — configuration
   - [x] **exec.approve/deny/list** — exec approval workflow
   - [-] **system.info** — system information

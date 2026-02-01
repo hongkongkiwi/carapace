@@ -26,6 +26,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use super::super::*;
 
@@ -681,6 +682,29 @@ fn extract_session_key(params: Option<&Value>) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+fn resolve_session_from_params(
+    state: &WsServerState,
+    params: Option<&Value>,
+) -> Result<sessions::Session, ErrorShape> {
+    let session_id = params
+        .and_then(|v| v.get("sessionId"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    if let Some(session_id) = session_id {
+        return state
+            .session_store
+            .get_session(session_id)
+            .map_err(|err| error_shape(ERROR_INVALID_REQUEST, &err.to_string(), None));
+    }
+    let key = extract_session_key(params)
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "key is required", None))?;
+    state
+        .session_store
+        .get_session_by_key(&key)
+        .map_err(|err| error_shape(ERROR_INVALID_REQUEST, &err.to_string(), None))
+}
+
 fn read_string_param(params: Option<&Value>, key: &str) -> Option<String> {
     params
         .and_then(|v| v.get(key))
@@ -864,6 +888,337 @@ fn has_metadata_updates(meta: &sessions::SessionMetadata) -> bool {
         || meta.thinking_level.is_some()
         || !meta.tags.is_empty()
         || meta.extra.is_some()
+}
+
+fn apply_metadata_updates(
+    target: &mut sessions::SessionMetadata,
+    updates: &sessions::SessionMetadata,
+) {
+    if updates.name.is_some() {
+        target.name = updates.name.clone();
+    }
+    if updates.description.is_some() {
+        target.description = updates.description.clone();
+    }
+    if updates.agent_id.is_some() {
+        target.agent_id = updates.agent_id.clone();
+    }
+    if updates.channel.is_some() {
+        target.channel = updates.channel.clone();
+    }
+    if updates.chat_id.is_some() {
+        target.chat_id = updates.chat_id.clone();
+    }
+    if updates.user_id.is_some() {
+        target.user_id = updates.user_id.clone();
+    }
+    if updates.model.is_some() {
+        target.model = updates.model.clone();
+    }
+    if updates.thinking_level.is_some() {
+        target.thinking_level = updates.thinking_level.clone();
+    }
+    if !updates.tags.is_empty() {
+        target.tags = updates.tags.clone();
+    }
+    if updates.extra.is_some() {
+        target.extra = updates.extra.clone();
+    }
+}
+
+fn derive_fork_session_key(state: &WsServerState, base_key: &str) -> Result<String, ErrorShape> {
+    let mut candidate = format!("{}-fork", base_key);
+    for suffix in 2..=1000 {
+        match state.session_store.get_session_by_key(&candidate) {
+            Ok(_) => {
+                candidate = format!("{}-fork-{}", base_key, suffix);
+            }
+            Err(sessions::SessionStoreError::NotFound(_)) => return Ok(candidate),
+            Err(err) => {
+                return Err(error_shape(
+                    ERROR_UNAVAILABLE,
+                    &format!("session lookup failed: {}", err),
+                    None,
+                ))
+            }
+        }
+    }
+    Err(error_shape(
+        ERROR_UNAVAILABLE,
+        "failed to derive unique fork session key",
+        None,
+    ))
+}
+
+fn clone_message_for_session(
+    message: &sessions::ChatMessage,
+    session_id: &str,
+) -> sessions::ChatMessage {
+    sessions::ChatMessage {
+        id: Uuid::new_v4().to_string(),
+        session_id: session_id.to_string(),
+        role: message.role,
+        content: message.content.clone(),
+        tool_call_id: message.tool_call_id.clone(),
+        tool_name: message.tool_name.clone(),
+        tokens: message.tokens,
+        created_at: message.created_at,
+        metadata: message.metadata.clone(),
+    }
+}
+
+pub(super) fn handle_sessions_create(
+    state: &WsServerState,
+    params: Option<&Value>,
+) -> Result<Value, ErrorShape> {
+    let key = extract_session_key(params);
+    let metadata = build_session_metadata(params, state.channel_registry());
+
+    let session = if let Some(ref key) = key {
+        match state.session_store.get_session_by_key(key) {
+            Ok(_) => {
+                return Err(error_shape(
+                    ERROR_INVALID_REQUEST,
+                    "session already exists",
+                    Some(json!({ "key": key })),
+                ))
+            }
+            Err(sessions::SessionStoreError::NotFound(_)) => {}
+            Err(err) => {
+                return Err(error_shape(
+                    ERROR_UNAVAILABLE,
+                    &format!("session lookup failed: {}", err),
+                    None,
+                ))
+            }
+        }
+        state
+            .session_store
+            .get_or_create_session(key, metadata)
+            .map_err(|err| {
+                error_shape(
+                    ERROR_UNAVAILABLE,
+                    &format!("session create failed: {}", err),
+                    None,
+                )
+            })?
+    } else {
+        let agent_id = metadata
+            .agent_id
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+        state
+            .session_store
+            .create_session(agent_id, metadata)
+            .map_err(|err| {
+                error_shape(
+                    ERROR_UNAVAILABLE,
+                    &format!("session create failed: {}", err),
+                    None,
+                )
+            })?
+    };
+
+    Ok(json!({
+        "ok": true,
+        "key": session.session_key,
+        "entry": session_entry(&session)
+    }))
+}
+
+pub(super) fn handle_sessions_load(
+    state: &WsServerState,
+    params: Option<&Value>,
+) -> Result<Value, ErrorShape> {
+    let session = resolve_session_from_params(state, params)?;
+    let include_messages = params
+        .and_then(|v| v.get("includeMessages"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let limit = params
+        .and_then(|v| v.get("limit"))
+        .and_then(|v| v.as_i64())
+        .map(|v| v.max(1) as usize)
+        .unwrap_or(200)
+        .min(1000);
+
+    let messages = if include_messages {
+        state
+            .session_store
+            .get_history(&session.id, Some(limit), None)
+            .map_err(|err| error_shape(ERROR_UNAVAILABLE, &err.to_string(), None))?
+            .into_iter()
+            .map(|m| {
+                json!({
+                    "id": m.id,
+                    "role": role_to_string(m.role),
+                    "content": m.content,
+                    "ts": m.created_at
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    Ok(json!({
+        "ok": true,
+        "key": session.session_key,
+        "sessionId": session.id,
+        "messageCount": session.message_count,
+        "entry": session_entry(&session),
+        "messages": messages
+    }))
+}
+
+pub(super) fn handle_sessions_fork(
+    state: &WsServerState,
+    params: Option<&Value>,
+) -> Result<Value, ErrorShape> {
+    let source = resolve_session_from_params(state, params)?;
+    let updates = build_session_metadata(params, state.channel_registry());
+    let mut metadata = source.metadata.clone();
+    metadata.compaction = sessions::CompactionMetadata::default();
+    apply_metadata_updates(&mut metadata, &updates);
+
+    let requested_key =
+        read_string_param(params, "newKey").or_else(|| read_string_param(params, "targetKey"));
+    let target_key = if let Some(key) = requested_key {
+        key
+    } else {
+        derive_fork_session_key(state, &source.session_key)?
+    };
+
+    match state.session_store.get_session_by_key(&target_key) {
+        Ok(_) => {
+            return Err(error_shape(
+                ERROR_INVALID_REQUEST,
+                "session already exists",
+                Some(json!({ "key": target_key })),
+            ))
+        }
+        Err(sessions::SessionStoreError::NotFound(_)) => {}
+        Err(err) => {
+            return Err(error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("session lookup failed: {}", err),
+                None,
+            ))
+        }
+    }
+
+    let session = state
+        .session_store
+        .get_or_create_session(&target_key, metadata)
+        .map_err(|err| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("session create failed: {}", err),
+                None,
+            )
+        })?;
+
+    let copy_history = params
+        .and_then(|v| v.get("copyHistory"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    if copy_history {
+        let limit = params
+            .and_then(|v| v.get("limit"))
+            .and_then(|v| v.as_i64())
+            .map(|v| v.max(1) as usize)
+            .unwrap_or(200)
+            .min(1000);
+        let history = state
+            .session_store
+            .get_history(&source.id, Some(limit), None)
+            .map_err(|err| error_shape(ERROR_UNAVAILABLE, &err.to_string(), None))?;
+        let cloned = history
+            .iter()
+            .map(|msg| clone_message_for_session(msg, &session.id))
+            .collect::<Vec<_>>();
+        state
+            .session_store
+            .append_messages(&cloned)
+            .map_err(|err| error_shape(ERROR_UNAVAILABLE, &err.to_string(), None))?;
+    }
+
+    Ok(json!({
+        "ok": true,
+        "sourceKey": source.session_key,
+        "key": session.session_key,
+        "entry": session_entry(&session)
+    }))
+}
+
+pub(super) fn handle_sessions_rename(
+    state: &WsServerState,
+    params: Option<&Value>,
+) -> Result<Value, ErrorShape> {
+    let key = extract_session_key(params)
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "key is required", None))?;
+    let name = read_string_param(params, "label")
+        .or_else(|| read_string_param(params, "name"))
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "name is required", None))?;
+    let updates = sessions::SessionMetadata {
+        name: Some(name),
+        ..sessions::SessionMetadata::default()
+    };
+
+    let session = match state.session_store.get_session_by_key(&key) {
+        Ok(existing) => state
+            .session_store
+            .patch_session(&existing.id, updates)
+            .map_err(|err| {
+                error_shape(
+                    ERROR_UNAVAILABLE,
+                    &format!("session rename failed: {}", err),
+                    None,
+                )
+            })?,
+        Err(sessions::SessionStoreError::NotFound(_)) => {
+            return Err(error_shape(
+                ERROR_INVALID_REQUEST,
+                "session not found",
+                Some(json!({ "key": key })),
+            ))
+        }
+        Err(err) => {
+            return Err(error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("session load failed: {}", err),
+                None,
+            ))
+        }
+    };
+
+    Ok(json!({
+        "ok": true,
+        "key": session.session_key,
+        "entry": session_entry(&session)
+    }))
+}
+
+pub(super) fn handle_sessions_switch(
+    state: &WsServerState,
+    params: Option<&Value>,
+    conn: &ConnectionContext,
+) -> Result<Value, ErrorShape> {
+    let session = resolve_session_from_params(state, params)?;
+    let scope = read_string_param(params, "scope");
+    let defaults = state.update_session_defaults(
+        &conn.conn_id,
+        session.session_key.clone(),
+        session.metadata.agent_id.clone(),
+        scope,
+    );
+
+    Ok(json!({
+        "ok": true,
+        "key": session.session_key,
+        "entry": session_entry(&session),
+        "defaults": defaults
+    }))
 }
 
 pub(super) fn handle_sessions_patch(
@@ -1466,6 +1821,7 @@ struct AgentRequestParams<'a> {
 /// Extract and validate agent request parameters (message, idempotencyKey, sessionKey, stream).
 fn parse_agent_request_params<'a>(
     params: Option<&'a Value>,
+    default_session_key: Option<&'a str>,
 ) -> Result<AgentRequestParams<'a>, ErrorShape> {
     let message = params
         .and_then(|v| v.get("message"))
@@ -1487,6 +1843,7 @@ fn parse_agent_request_params<'a>(
         .and_then(|v| v.as_str())
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
+        .or(default_session_key)
         .unwrap_or("default");
     let stream = params
         .and_then(|v| v.get("stream"))
@@ -1564,9 +1921,10 @@ fn setup_agent_session(
 pub(super) fn handle_agent(
     params: Option<&Value>,
     state: Arc<WsServerState>,
-    _conn: &ConnectionContext,
+    conn: &ConnectionContext,
 ) -> Result<Value, ErrorShape> {
-    let agent_params = parse_agent_request_params(params)?;
+    let default_session_key = state.default_session_key(&conn.conn_id);
+    let agent_params = parse_agent_request_params(params, default_session_key.as_deref())?;
 
     // Check for duplicate idempotencyKey — return existing run status
     {
@@ -2028,9 +2386,10 @@ fn trigger_agent_if_enabled(
 pub(super) fn handle_chat_send(
     state: Arc<WsServerState>,
     params: Option<&Value>,
-    _conn: &ConnectionContext,
+    conn: &ConnectionContext,
 ) -> Result<Value, ErrorShape> {
     let chat_params = parse_chat_send_params(params)?;
+    let default_session_key = state.default_session_key(&conn.conn_id);
 
     // Check for duplicate idempotencyKey — return existing run status
     {
@@ -2060,6 +2419,7 @@ pub(super) fn handle_chat_send(
         let key = chat_params
             .session_key
             .as_deref()
+            .or(default_session_key.as_deref())
             .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "sessionKey is required", None))?;
         state
             .session_store
@@ -2462,6 +2822,114 @@ mod tests {
         let state = WsServerState::new(crate::server::ws::WsServerConfig::default())
             .with_session_store(store);
         (state, tmp)
+    }
+
+    fn make_conn(conn_id: &str) -> ConnectionContext {
+        ConnectionContext {
+            conn_id: conn_id.to_string(),
+            role: "admin".to_string(),
+            scopes: vec![],
+            client: ClientInfo {
+                id: "test-client".to_string(),
+                version: "1.0.0".to_string(),
+                platform: "test".to_string(),
+                mode: "test".to_string(),
+                display_name: None,
+                device_family: None,
+                model_identifier: None,
+                instance_id: None,
+            },
+            device_id: None,
+        }
+    }
+
+    #[test]
+    fn test_handle_sessions_create_with_key() {
+        let (state, _tmp) = make_state_with_temp_sessions();
+        let params = json!({ "key": "session-1", "label": "My Session" });
+        let result = handle_sessions_create(&state, Some(&params)).unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["key"], "session-1");
+        let session = state.session_store.get_session_by_key("session-1").unwrap();
+        assert_eq!(session.metadata.name.as_deref(), Some("My Session"));
+    }
+
+    #[test]
+    fn test_handle_sessions_load_includes_messages() {
+        let (state, _tmp) = make_state_with_temp_sessions();
+        let session = state
+            .session_store
+            .create_session("agent-1", sessions::SessionMetadata::default())
+            .unwrap();
+        state
+            .session_store
+            .append_message(sessions::ChatMessage::user(session.id.clone(), "hello"))
+            .unwrap();
+        let params = json!({ "key": session.session_key });
+        let result = handle_sessions_load(&state, Some(&params)).unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["messages"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_handle_sessions_fork_copies_history() {
+        let (state, _tmp) = make_state_with_temp_sessions();
+        let session = state
+            .session_store
+            .create_session("agent-1", sessions::SessionMetadata::default())
+            .unwrap();
+        state
+            .session_store
+            .append_message(sessions::ChatMessage::user(session.id.clone(), "hello"))
+            .unwrap();
+        let params = json!({ "key": session.session_key, "newKey": "session-fork" });
+        let result = handle_sessions_fork(&state, Some(&params)).unwrap();
+        assert_eq!(result["ok"], true);
+        let forked = state
+            .session_store
+            .get_session_by_key("session-fork")
+            .unwrap();
+        assert_eq!(forked.message_count, 1);
+        let history = state
+            .session_store
+            .get_history(&forked.id, Some(10), None)
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content, "hello");
+    }
+
+    #[test]
+    fn test_handle_sessions_rename_updates_label() {
+        let (state, _tmp) = make_state_with_temp_sessions();
+        let session = state
+            .session_store
+            .create_session("agent-1", sessions::SessionMetadata::default())
+            .unwrap();
+        let params = json!({ "key": session.session_key, "name": "Renamed" });
+        let result = handle_sessions_rename(&state, Some(&params)).unwrap();
+        assert_eq!(result["ok"], true);
+        let updated = state
+            .session_store
+            .get_session_by_key(&session.session_key)
+            .unwrap();
+        assert_eq!(updated.metadata.name.as_deref(), Some("Renamed"));
+    }
+
+    #[test]
+    fn test_handle_sessions_switch_sets_default() {
+        let (state, _tmp) = make_state_with_temp_sessions();
+        let session = state
+            .session_store
+            .create_session("agent-1", sessions::SessionMetadata::default())
+            .unwrap();
+        let conn = make_conn("conn-1");
+        let params = json!({ "key": session.session_key });
+        let result = handle_sessions_switch(&state, Some(&params), &conn).unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            state.default_session_key(&conn.conn_id).as_deref(),
+            Some(session.session_key.as_str())
+        );
     }
 
     #[test]

@@ -202,6 +202,11 @@ Note: Method dispatch is implemented in `src/server/ws/handlers/mod.rs`.
 ### Sessions
 - `sessions.list` - List sessions
 - `sessions.preview` - Preview session content
+- `sessions.create` - Create a new session (optional key + metadata)
+- `sessions.load` - Load a session (metadata and optional messages)
+- `sessions.fork` - Fork a session to a new key (optionally copy history)
+- `sessions.rename` - Rename a session (label)
+- `sessions.switch` - Set the default session for this connection
 - `sessions.patch` - Patch session metadata
 - `sessions.reset` - Reset session
 - `sessions.delete` - Delete session

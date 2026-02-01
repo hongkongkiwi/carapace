@@ -89,7 +89,7 @@ const ALLOWED_CLIENT_IDS: [&str; 12] = [
 const ALLOWED_CLIENT_MODES: [&str; 7] =
     ["webchat", "cli", "ui", "backend", "node", "probe", "test"];
 
-const GATEWAY_METHODS: [&str; 116] = [
+const GATEWAY_METHODS: [&str; 121] = [
     // Health/status
     "health",
     "status",
@@ -116,6 +116,11 @@ const GATEWAY_METHODS: [&str; 116] = [
     // Sessions
     "sessions.list",
     "sessions.preview",
+    "sessions.create",
+    "sessions.load",
+    "sessions.fork",
+    "sessions.rename",
+    "sessions.switch",
     "sessions.patch",
     "sessions.reset",
     "sessions.delete",
@@ -424,6 +429,7 @@ pub struct WsServerState {
     node_registry: Mutex<NodeRegistry>,
     node_pairing: Arc<nodes::NodePairingRegistry>,
     connections: Mutex<HashMap<String, ConnectionHandle>>,
+    session_defaults: Mutex<HashMap<String, SessionDefaults>>,
     channel_registry: Arc<channels::ChannelRegistry>,
     message_pipeline: Arc<messages::outbound::MessagePipeline>,
     session_store: Arc<sessions::SessionStore>,
@@ -488,6 +494,7 @@ impl WsServerState {
             node_registry: Mutex::new(NodeRegistry::default()),
             node_pairing: Arc::new(nodes::NodePairingRegistry::in_memory()),
             connections: Mutex::new(HashMap::new()),
+            session_defaults: Mutex::new(HashMap::new()),
             channel_registry: channels::create_registry(),
             message_pipeline: messages::outbound::create_pipeline(),
             session_store: Arc::new(sessions::SessionStore::with_base_path(
@@ -532,6 +539,7 @@ impl WsServerState {
             node_registry: Mutex::new(NodeRegistry::default()),
             node_pairing,
             connections: Mutex::new(HashMap::new()),
+            session_defaults: Mutex::new(HashMap::new()),
             channel_registry: channels::create_registry(),
             message_pipeline: messages::outbound::create_pipeline(),
             session_store: Arc::new(sessions::SessionStore::with_base_path(
@@ -601,6 +609,37 @@ impl WsServerState {
     /// Get the configured session retention period in days, if any.
     pub fn session_retention_days(&self) -> Option<u32> {
         self.config.session_retention_days
+    }
+
+    pub(crate) fn default_session_key(&self, conn_id: &str) -> Option<String> {
+        self.session_defaults
+            .lock()
+            .get(conn_id)
+            .and_then(|defaults| {
+                defaults
+                    .main_session_key
+                    .clone()
+                    .or_else(|| defaults.main_key.clone())
+            })
+    }
+
+    pub(crate) fn update_session_defaults(
+        &self,
+        conn_id: &str,
+        session_key: String,
+        agent_id: Option<String>,
+        scope: Option<String>,
+    ) -> Value {
+        let defaults = SessionDefaults {
+            default_agent_id: agent_id,
+            main_key: Some(session_key.clone()),
+            main_session_key: Some(session_key),
+            scope,
+        };
+        self.session_defaults
+            .lock()
+            .insert(conn_id.to_string(), defaults.clone());
+        defaults.to_value()
     }
 
     /// Get the tools registry, if configured.
@@ -714,6 +753,10 @@ impl WsServerState {
         {
             let mut conns = self.connections.lock();
             conns.remove(conn_id);
+        }
+        {
+            let mut defaults = self.session_defaults.lock();
+            defaults.remove(conn_id);
         }
 
         // Update presence tracking (mark as disconnect, then remove)
@@ -1485,6 +1528,25 @@ struct ConnectionHandle {
     role: String,
     scopes: Vec<String>,
     tx: mpsc::UnboundedSender<Message>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SessionDefaults {
+    default_agent_id: Option<String>,
+    main_key: Option<String>,
+    main_session_key: Option<String>,
+    scope: Option<String>,
+}
+
+impl SessionDefaults {
+    fn to_value(&self) -> Value {
+        json!({
+            "defaultAgentId": self.default_agent_id,
+            "mainKey": self.main_key,
+            "mainSessionKey": self.main_session_key,
+            "scope": self.scope,
+        })
+    }
 }
 
 pub async fn ws_handler(

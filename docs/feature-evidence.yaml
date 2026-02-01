@@ -826,13 +826,14 @@ features:
       - "agent.run aliases to agent; agent.cancel aliases to chat.abort"
 
   - feature: "ws.session management"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
-      - "src/server/ws/handlers/sessions.rs (sessions.list/preview/patch/reset/delete)"
+      - "src/server/ws/handlers/sessions.rs (sessions.create/load/fork/rename/switch/list/preview/patch/reset/delete)"
+      - "src/server/ws/mod.rs (session defaults per connection)"
       - "src/server/ws/handlers/mod.rs (sessions.* methods)"
     notes:
-      - "session.* aliases map to sessions.* for existing handlers"
-      - "No sessions.create/load/fork/rename/switch methods; patch covers rename/metadata only"
+      - "session.* aliases map to sessions.* handlers"
+      - "sessions.switch stores per-connection defaults used by agent/chat"
 
   - feature: "ws.config.get/update/reload/validate"
     status: "verified_done"
