@@ -51,7 +51,7 @@ feature_inventory_markdown: |
 
   - [x] **Channel registry** — thread-safe channel tracking, status enum
   - [x] **Console channel** — built-in testing channel
-  - [-] **Telegram/Discord/Slack** — via WASM plugin system (not in core). No plugins shipped; channel integrations do not exist yet.
+  - [x] **Telegram/Discord/Slack** — built-in channel plugins for outbound text/media delivery (Bot/Web APIs).
 
   ### CLI (`src/cli/`)
 

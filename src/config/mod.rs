@@ -44,6 +44,9 @@ const CONFIG_SECRET_PATHS: &[&str] = &[
     "/bedrock/secretAccessKey",
     "/bedrock/sessionToken",
     "/models/providers/openai/apiKey",
+    "/telegram/botToken",
+    "/discord/botToken",
+    "/slack/botToken",
 ];
 
 /// Configuration errors

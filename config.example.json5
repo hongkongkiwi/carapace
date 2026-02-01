@@ -89,6 +89,27 @@
   //   // enabled: false,                          // set to false to disable without removing config
   // },
 
+  // --- Telegram channel (via Bot API) --------------------------------------
+  // telegram: {
+  //   botToken: "${TELEGRAM_BOT_TOKEN}",          // Telegram bot token
+  //   // baseUrl: "https://api.telegram.org",     // override API base URL
+  //   // enabled: false,                          // set to false to disable without removing config
+  // },
+
+  // --- Discord channel (via REST API) --------------------------------------
+  // discord: {
+  //   botToken: "${DISCORD_BOT_TOKEN}",           // Discord bot token
+  //   // baseUrl: "https://discord.com/api/v10",  // override API base URL
+  //   // enabled: false,                          // set to false to disable without removing config
+  // },
+
+  // --- Slack channel (via Web API) -----------------------------------------
+  // slack: {
+  //   botToken: "${SLACK_BOT_TOKEN}",             // Slack bot token (xoxb-...)
+  //   // baseUrl: "https://slack.com/api",        // override API base URL
+  //   // enabled: false,                          // set to false to disable without removing config
+  // },
+
   // --- Agents -----------------------------------------------------------
   // agents: {
   //   list: [

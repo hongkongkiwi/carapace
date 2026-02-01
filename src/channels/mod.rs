@@ -4,14 +4,63 @@
 //! and their connection states.
 
 pub mod console;
+pub mod discord;
+pub(crate) mod media_fetch;
 pub mod signal;
 pub mod signal_receive;
+pub mod slack;
+pub mod telegram;
 pub mod webhook;
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelAuthErrorKind {
+    Auth,
+    Transient,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct ChannelAuthError {
+    kind: ChannelAuthErrorKind,
+    message: String,
+}
+
+impl ChannelAuthError {
+    #[allow(dead_code)]
+    pub(crate) fn auth(message: impl Into<String>) -> Self {
+        Self {
+            kind: ChannelAuthErrorKind::Auth,
+            message: message.into(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn transient(message: impl Into<String>) -> Self {
+        Self {
+            kind: ChannelAuthErrorKind::Transient,
+            message: message.into(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn is_auth(&self) -> bool {
+        self.kind == ChannelAuthErrorKind::Auth
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) type ChannelAuthResult = Result<(), ChannelAuthError>;
 
 /// Connection status of a channel
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

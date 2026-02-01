@@ -2,7 +2,7 @@
 # Keep this focused on audited entries in docs/feature-status.yaml.
 
 version: "1.0"
-updated_at: "2026-01-31"
+updated_at: "2026-02-01"
 
 features:
   - feature: "logs.tail"
@@ -22,6 +22,18 @@ features:
     tests:
       - "src/server/ws/golden_tests.rs::golden_skills_status"
       - "src/server/ws/snapshots/carapace__server__ws__golden_tests__golden_trace__golden_skills_status.snap"
+
+  - feature: "channels.telegram/discord/slack"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/channels/telegram.rs (TelegramChannel send_text/send_media)"
+      - "src/channels/discord.rs (DiscordChannel send_text/send_media)"
+      - "src/channels/slack.rs (SlackChannel send_text/send_media)"
+      - "src/main.rs (register_*_channel_if_configured)"
+    tests:
+      - "src/channels/telegram.rs::test_telegram_get_info"
+      - "src/channels/discord.rs::test_discord_get_info"
+      - "src/channels/slack.rs::test_slack_get_info"
 
   - feature: "cron.*"
     status: "verified_done"

@@ -142,6 +142,9 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let ws_state = configure_ws_with_llm(ws_state, &cfg)?;
     let ws_state = register_console_channel(ws_state)?;
     let ws_state = register_signal_channel_if_configured(ws_state, &cfg)?;
+    let ws_state = register_telegram_channel_if_configured(ws_state, &cfg)?;
+    let ws_state = register_discord_channel_if_configured(ws_state, &cfg)?;
+    let ws_state = register_slack_channel_if_configured(ws_state, &cfg)?;
 
     let http_config = server::http::build_http_config(&cfg)?;
     let tls_setup = setup_optional_tls(&cfg)?;
@@ -247,6 +250,24 @@ struct SignalConfig {
     phone_number: String,
 }
 
+/// Resolved Telegram configuration (shared between registration and dispatch).
+struct TelegramConfig {
+    base_url: String,
+    bot_token: String,
+}
+
+/// Resolved Discord configuration (shared between registration and dispatch).
+struct DiscordConfig {
+    base_url: String,
+    bot_token: String,
+}
+
+/// Resolved Slack configuration (shared between registration and dispatch).
+struct SlackConfig {
+    base_url: String,
+    bot_token: String,
+}
+
 /// Resolve Signal configuration from config file and/or environment variables.
 /// Returns `None` if Signal is not configured or is explicitly disabled.
 ///
@@ -280,6 +301,105 @@ fn resolve_signal_config(cfg: &Value) -> Option<SignalConfig> {
     Some(SignalConfig {
         base_url,
         phone_number,
+    })
+}
+
+/// Resolve Telegram configuration from config file and/or environment variables.
+/// Returns `None` if Telegram is not configured or is explicitly disabled.
+fn resolve_telegram_config(cfg: &Value) -> Option<TelegramConfig> {
+    let telegram_cfg = cfg.get("telegram");
+
+    // Explicit kill switch
+    if telegram_cfg
+        .and_then(|s| s.get("enabled"))
+        .and_then(|v| v.as_bool())
+        == Some(false)
+    {
+        return None;
+    }
+
+    let bot_token = telegram_cfg
+        .and_then(|s| s.get("botToken"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("TELEGRAM_BOT_TOKEN").ok())?;
+
+    let base_url = telegram_cfg
+        .and_then(|s| s.get("baseUrl"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("TELEGRAM_BASE_URL").ok())
+        .unwrap_or_else(|| "https://api.telegram.org".to_string());
+
+    Some(TelegramConfig {
+        base_url,
+        bot_token,
+    })
+}
+
+/// Resolve Discord configuration from config file and/or environment variables.
+/// Returns `None` if Discord is not configured or is explicitly disabled.
+fn resolve_discord_config(cfg: &Value) -> Option<DiscordConfig> {
+    let discord_cfg = cfg.get("discord");
+
+    // Explicit kill switch
+    if discord_cfg
+        .and_then(|s| s.get("enabled"))
+        .and_then(|v| v.as_bool())
+        == Some(false)
+    {
+        return None;
+    }
+
+    let bot_token = discord_cfg
+        .and_then(|s| s.get("botToken"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("DISCORD_BOT_TOKEN").ok())?;
+
+    let base_url = discord_cfg
+        .and_then(|s| s.get("baseUrl"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("DISCORD_BASE_URL").ok())
+        .unwrap_or_else(|| "https://discord.com/api/v10".to_string());
+
+    Some(DiscordConfig {
+        base_url,
+        bot_token,
+    })
+}
+
+/// Resolve Slack configuration from config file and/or environment variables.
+/// Returns `None` if Slack is not configured or is explicitly disabled.
+fn resolve_slack_config(cfg: &Value) -> Option<SlackConfig> {
+    let slack_cfg = cfg.get("slack");
+
+    // Explicit kill switch
+    if slack_cfg
+        .and_then(|s| s.get("enabled"))
+        .and_then(|v| v.as_bool())
+        == Some(false)
+    {
+        return None;
+    }
+
+    let bot_token = slack_cfg
+        .and_then(|s| s.get("botToken"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("SLACK_BOT_TOKEN").ok())?;
+
+    let base_url = slack_cfg
+        .and_then(|s| s.get("baseUrl"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("SLACK_BASE_URL").ok())
+        .unwrap_or_else(|| "https://slack.com/api".to_string());
+
+    Some(SlackConfig {
+        base_url,
+        bot_token,
     })
 }
 
@@ -318,6 +438,112 @@ fn register_signal_channel_if_configured(
     );
 
     Ok(ws_state)
+}
+
+/// Optionally register the Telegram channel plugin if configured.
+fn register_telegram_channel_if_configured(
+    ws_state: Arc<server::ws::WsServerState>,
+    cfg: &Value,
+) -> Result<Arc<server::ws::WsServerState>, Box<dyn std::error::Error>> {
+    let tc = match resolve_telegram_config(cfg) {
+        Some(c) => c,
+        None => return Ok(ws_state),
+    };
+
+    let channel = channels::telegram::TelegramChannel::new(tc.base_url.clone(), tc.bot_token);
+    let validation = channel.validate();
+
+    if let Some(registry) = ws_state.plugin_registry() {
+        registry.register_channel("telegram".to_string(), Arc::new(channel));
+    }
+
+    ws_state.channel_registry().register(
+        channels::ChannelInfo::new("telegram", "Telegram")
+            .with_status(channels::ChannelStatus::Connected),
+    );
+
+    apply_channel_validation(ws_state.channel_registry(), "telegram", validation);
+
+    info!(base_url = %tc.base_url, "Telegram channel registered");
+
+    Ok(ws_state)
+}
+
+/// Optionally register the Discord channel plugin if configured.
+fn register_discord_channel_if_configured(
+    ws_state: Arc<server::ws::WsServerState>,
+    cfg: &Value,
+) -> Result<Arc<server::ws::WsServerState>, Box<dyn std::error::Error>> {
+    let dc = match resolve_discord_config(cfg) {
+        Some(c) => c,
+        None => return Ok(ws_state),
+    };
+
+    let channel = channels::discord::DiscordChannel::new(dc.base_url.clone(), dc.bot_token);
+    let validation = channel.validate();
+
+    if let Some(registry) = ws_state.plugin_registry() {
+        registry.register_channel("discord".to_string(), Arc::new(channel));
+    }
+
+    ws_state.channel_registry().register(
+        channels::ChannelInfo::new("discord", "Discord")
+            .with_status(channels::ChannelStatus::Connected),
+    );
+
+    apply_channel_validation(ws_state.channel_registry(), "discord", validation);
+
+    info!(base_url = %dc.base_url, "Discord channel registered");
+
+    Ok(ws_state)
+}
+
+/// Optionally register the Slack channel plugin if configured.
+fn register_slack_channel_if_configured(
+    ws_state: Arc<server::ws::WsServerState>,
+    cfg: &Value,
+) -> Result<Arc<server::ws::WsServerState>, Box<dyn std::error::Error>> {
+    let sc = match resolve_slack_config(cfg) {
+        Some(c) => c,
+        None => return Ok(ws_state),
+    };
+
+    let channel = channels::slack::SlackChannel::new(sc.base_url.clone(), sc.bot_token);
+    let validation = channel.validate();
+
+    if let Some(registry) = ws_state.plugin_registry() {
+        registry.register_channel("slack".to_string(), Arc::new(channel));
+    }
+
+    ws_state.channel_registry().register(
+        channels::ChannelInfo::new("slack", "Slack")
+            .with_status(channels::ChannelStatus::Connected),
+    );
+
+    apply_channel_validation(ws_state.channel_registry(), "slack", validation);
+
+    info!(base_url = %sc.base_url, "Slack channel registered");
+
+    Ok(ws_state)
+}
+
+fn apply_channel_validation(
+    registry: &channels::ChannelRegistry,
+    channel_id: &str,
+    validation: channels::ChannelAuthResult,
+) {
+    let Err(error) = validation else {
+        return;
+    };
+
+    let message = error.message().to_string();
+    registry.set_error(channel_id, message.clone());
+
+    if !error.is_auth() {
+        registry.update_status(channel_id, channels::ChannelStatus::Connected);
+    }
+
+    warn!(channel = %channel_id, error = %message, "Channel validation failed");
 }
 
 /// Spawn the Signal receive loop if the channel is configured.

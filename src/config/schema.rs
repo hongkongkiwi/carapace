@@ -60,6 +60,9 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "bedrock",
     "venice",
     "signal",
+    "telegram",
+    "discord",
+    "slack",
     "classifier",
 ];
 
