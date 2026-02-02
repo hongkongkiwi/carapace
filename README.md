@@ -14,6 +14,17 @@ A hardened alternative to openclaw / clawdbot — for when your assistant needs 
 - **Security by default** — localhost-only binding, SSRF/DNS-rebinding defense, prompt guard, inbound message classifier, exec approval flow, output content security. Auth denies by default when no credentials configured; CSRF-protected control endpoints. AES-256-GCM secret encryption at rest with PBKDF2 key derivation. OS-level sandbox primitives (Seatbelt/Landlock/rlimits) implemented, subprocess wiring in progress
 - **Infrastructure** — TLS, mTLS, mDNS discovery, config hot-reload, Tailscale integration, Prometheus metrics, audit logging. Gateway clustering is partially implemented
 
+## Expectations vs OpenClaw
+
+Carapace focuses on a hardened core first. If you're coming from openclaw, the
+following are **planned** but not yet on par:
+
+- Broader channel coverage (e.g., WhatsApp/iMessage/Teams/Matrix/WebChat)
+- Companion apps / nodes (macOS + iOS/Android clients)
+- Browser control and live canvas/A2UI experiences
+- Skills/onboarding UX and multi-agent routing
+- Automatic model/provider failover
+
 ## Security
 
 Carapace is hardened against every major vulnerability class reported in the January 2026 openclaw security disclosures:
