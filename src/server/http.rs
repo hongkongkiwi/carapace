@@ -37,7 +37,7 @@ use crate::server::openai::{self, OpenAiState};
 use crate::server::ratelimit::{rate_limit_middleware, RateLimitConfig, RateLimiter};
 
 use crate::auth;
-use crate::channels::ChannelRegistry;
+use crate::channels::{inbound, slack_inbound, telegram_inbound, ChannelRegistry};
 use crate::hooks::auth::{extract_hooks_token, validate_hooks_token};
 use crate::hooks::handler::{
     validate_agent_request, validate_wake_request, AgentRequest, AgentResponse, HooksErrorResponse,
@@ -405,6 +405,12 @@ pub fn create_router_with_state(
             );
     }
 
+    let channel_router = Router::new()
+        .route("/channels/telegram/webhook", post(telegram_webhook_handler))
+        .route("/channels/slack/events", post(slack_events_handler))
+        .layer(DefaultBodyLimit::max(config.hooks_max_body_bytes));
+    router = router.merge(channel_router);
+
     // Plugin webhook routes (always enabled when plugins are registered)
     let plugin_router = Router::new()
         .route("/plugins/*path", any(plugins_webhook_handler))
@@ -601,6 +607,22 @@ fn normalize_hooks_path(path: &str) -> String {
     result
 }
 
+fn resolve_telegram_webhook_secret(cfg: &Value) -> Option<String> {
+    cfg.get("telegram")
+        .and_then(|t| t.get("webhookSecret"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("TELEGRAM_WEBHOOK_SECRET").ok())
+}
+
+fn resolve_slack_signing_secret(cfg: &Value) -> Option<String> {
+    cfg.get("slack")
+        .and_then(|s| s.get("signingSecret"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("SLACK_SIGNING_SECRET").ok())
+}
+
 // ============================================================================
 // Health Check
 // ============================================================================
@@ -758,23 +780,41 @@ fn dispatch_agent_run(
     ws: &Arc<WsServerState>,
     validated: &crate::hooks::handler::ValidatedAgentRequest,
     run_id: &str,
+    sender_id: &str,
 ) -> Result<(), Response> {
-    // Append user message to session
-    let session_key = &validated.session_key;
+    let cfg = crate::config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
+    let channel = if validated.channel == "last" {
+        "default"
+    } else {
+        validated.channel.as_str()
+    };
+    let peer_id = validated
+        .to
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(sender_id);
     let metadata = crate::sessions::SessionMetadata {
-        channel: Some(validated.channel.clone()),
+        channel: Some(channel.to_string()),
+        user_id: Some(sender_id.to_string()),
         ..Default::default()
     };
-    let session = ws
-        .session_store()
-        .get_or_create_session(session_key, metadata)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(AgentResponse::error(&format!("session error: {}", e))),
-            )
-                .into_response()
-        })?;
+    let session = crate::sessions::get_or_create_scoped_session(
+        ws.session_store(),
+        &cfg,
+        channel,
+        sender_id,
+        peer_id,
+        validated.session_key.as_deref(),
+        metadata,
+    )
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(AgentResponse::error(&format!("session error: {}", e))),
+        )
+            .into_response()
+    })?;
 
     ws.session_store()
         .append_message(crate::sessions::ChatMessage::user(
@@ -850,6 +890,7 @@ async fn hooks_agent_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     uri: Uri,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     body: axum::body::Bytes,
 ) -> Response {
     // Check auth
@@ -885,11 +926,155 @@ async fn hooks_agent_handler(
         }
     };
 
-    if let Err(resp) = dispatch_agent_run(&ws, &validated, &run_id) {
+    let sender_id = connect_info
+        .map(|info| info.0.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    if let Err(resp) = dispatch_agent_run(&ws, &validated, &run_id, &sender_id) {
         return resp;
     }
 
     (StatusCode::ACCEPTED, Json(AgentResponse::success(run_id))).into_response()
+}
+
+// ============================================================================
+// Channel Webhook Handlers
+// ============================================================================
+
+async fn telegram_webhook_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let ws = match &state.ws_state {
+        Some(ws) => ws.clone(),
+        None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+
+    let cfg = crate::config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
+    if cfg
+        .get("telegram")
+        .and_then(|v| v.get("enabled"))
+        .and_then(|v| v.as_bool())
+        == Some(false)
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    if let Some(secret) = resolve_telegram_webhook_secret(&cfg) {
+        let provided = headers
+            .get("X-Telegram-Bot-Api-Secret-Token")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !crate::auth::timing_safe_eq(&secret, provided) {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+    }
+
+    let update: telegram_inbound::TelegramUpdate = match serde_json::from_slice(&body) {
+        Ok(update) => update,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
+    let inbound = match telegram_inbound::extract_inbound(&update) {
+        Some(inbound) => inbound,
+        None => return StatusCode::OK.into_response(),
+    };
+
+    if let Err(err) = inbound::dispatch_inbound_text(
+        &ws,
+        "telegram",
+        &inbound.sender_id,
+        &inbound.chat_id,
+        &inbound.text,
+        Some(inbound.chat_id.clone()),
+    ) {
+        warn!("Telegram inbound dispatch failed: {}", err);
+    }
+
+    StatusCode::OK.into_response()
+}
+
+async fn slack_events_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let ws = match &state.ws_state {
+        Some(ws) => ws.clone(),
+        None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+
+    let cfg = crate::config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
+    if cfg
+        .get("slack")
+        .and_then(|v| v.get("enabled"))
+        .and_then(|v| v.as_bool())
+        == Some(false)
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let signing_secret = match resolve_slack_signing_secret(&cfg) {
+        Some(secret) => secret,
+        None => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+
+    let timestamp = match headers
+        .get("X-Slack-Request-Timestamp")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<i64>().ok())
+    {
+        Some(ts) => ts,
+        None => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+
+    let signature = match headers
+        .get("X-Slack-Signature")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(sig) => sig,
+        None => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    if (now - timestamp).abs() > slack_inbound::SLACK_SIGNATURE_TOLERANCE_SECS {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    if !slack_inbound::verify_slack_signature(&signing_secret, timestamp, signature, &body) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let payload: Value = match serde_json::from_slice(&body) {
+        Ok(payload) => payload,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
+    if payload.get("type").and_then(|v| v.as_str()) == Some("url_verification") {
+        if let Some(challenge) = payload.get("challenge").and_then(|v| v.as_str()) {
+            return (StatusCode::OK, Json(json!({ "challenge": challenge }))).into_response();
+        }
+    }
+
+    if payload.get("type").and_then(|v| v.as_str()) == Some("event_callback") {
+        if let Some(event) = payload.get("event") {
+            if let Some(inbound) = slack_inbound::extract_inbound_event(event) {
+                if let Err(err) = inbound::dispatch_inbound_text(
+                    &ws,
+                    "slack",
+                    &inbound.sender_id,
+                    &inbound.channel_id,
+                    &inbound.text,
+                    Some(inbound.channel_id.clone()),
+                ) {
+                    warn!("Slack inbound dispatch failed: {}", err);
+                }
+            }
+        }
+    }
+
+    StatusCode::OK.into_response()
 }
 
 /// Build the hook execution context from request headers, URI, path, and payload.

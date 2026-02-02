@@ -160,6 +160,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     spawn_network_services(&cfg, &tls_setup, resolved.address.port(), &shutdown_rx);
     spawn_signal_receive_loop_if_configured(&cfg, &ws_state, &shutdown_rx);
+    spawn_discord_gateway_loop_if_configured(&cfg, &ws_state, &shutdown_rx);
 
     if let Some(tls_result) = tls_setup {
         launch_tls_server(
@@ -293,6 +294,9 @@ struct TelegramConfig {
 struct DiscordConfig {
     base_url: String,
     bot_token: String,
+    gateway_url: String,
+    gateway_intents: u64,
+    gateway_enabled: bool,
 }
 
 /// Resolved Slack configuration (shared between registration and dispatch).
@@ -397,9 +401,34 @@ fn resolve_discord_config(cfg: &Value) -> Option<DiscordConfig> {
         .or_else(|| std::env::var("DISCORD_BASE_URL").ok())
         .unwrap_or_else(|| "https://discord.com/api/v10".to_string());
 
+    let gateway_url = discord_cfg
+        .and_then(|s| s.get("gatewayUrl"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("DISCORD_GATEWAY_URL").ok())
+        .unwrap_or_else(|| channels::discord_gateway::DEFAULT_DISCORD_GATEWAY_URL.to_string());
+
+    let gateway_intents = discord_cfg
+        .and_then(|s| s.get("gatewayIntents"))
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+            std::env::var("DISCORD_GATEWAY_INTENTS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+        })
+        .unwrap_or(37377);
+
+    let gateway_enabled = discord_cfg
+        .and_then(|s| s.get("gatewayEnabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
     Some(DiscordConfig {
         base_url,
         bot_token,
+        gateway_url,
+        gateway_intents,
+        gateway_enabled,
     })
 }
 
@@ -593,6 +622,31 @@ fn spawn_signal_receive_loop_if_configured(
     tokio::spawn(channels::signal_receive::signal_receive_loop(
         sc.base_url,
         sc.phone_number,
+        ws_state.clone(),
+        ws_state.channel_registry().clone(),
+        shutdown_rx.clone(),
+    ));
+}
+
+/// Spawn the Discord gateway loop if configured.
+fn spawn_discord_gateway_loop_if_configured(
+    cfg: &Value,
+    ws_state: &Arc<server::ws::WsServerState>,
+    shutdown_rx: &tokio::sync::watch::Receiver<bool>,
+) {
+    let dc = match resolve_discord_config(cfg) {
+        Some(c) => c,
+        None => return,
+    };
+
+    if !dc.gateway_enabled {
+        return;
+    }
+
+    tokio::spawn(channels::discord_gateway::discord_gateway_loop(
+        dc.gateway_url,
+        dc.bot_token,
+        dc.gateway_intents,
         ws_state.clone(),
         ws_state.channel_registry().clone(),
         shutdown_rx.clone(),

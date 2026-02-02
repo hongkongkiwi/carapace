@@ -5,11 +5,15 @@
 
 pub mod console;
 pub mod discord;
+pub mod discord_gateway;
+pub mod inbound;
 pub(crate) mod media_fetch;
 pub mod signal;
 pub mod signal_receive;
 pub mod slack;
+pub mod slack_inbound;
 pub mod telegram;
+pub mod telegram_inbound;
 pub mod webhook;
 
 use parking_lot::RwLock;
