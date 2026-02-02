@@ -10,7 +10,7 @@ use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
 use std::path::PathBuf;
 use std::sync::LazyLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Default path for usage data storage
 fn default_usage_path() -> PathBuf {
@@ -461,6 +461,10 @@ pub struct UsageTracker {
     data: UsageData,
     /// Whether there are unsaved changes
     dirty: bool,
+    /// Last time usage data was saved
+    last_save: Option<Instant>,
+    /// Minimum interval between saves
+    save_interval: Duration,
 }
 
 impl UsageTracker {
@@ -473,6 +477,8 @@ impl UsageTracker {
                 ..Default::default()
             },
             dirty: false,
+            last_save: None,
+            save_interval: Duration::from_secs(5),
         }
     }
 
@@ -488,6 +494,8 @@ impl UsageTracker {
                                 path,
                                 data,
                                 dirty: false,
+                                last_save: None,
+                                save_interval: Duration::from_secs(5),
                             }
                         }
                         Err(e) => {
@@ -519,7 +527,22 @@ impl UsageTracker {
         let writer = BufWriter::new(file);
         serde_json::to_writer_pretty(writer, &self.data)?;
         self.dirty = false;
+        self.last_save = Some(Instant::now());
         Ok(())
+    }
+
+    /// Save usage data if enough time has elapsed since the last flush.
+    fn maybe_save(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        let should_flush = match self.last_save {
+            Some(ts) => ts.elapsed() >= self.save_interval,
+            None => true,
+        };
+        if should_flush {
+            let _ = self.save();
+        }
     }
 
     /// Check if tracking is enabled
@@ -871,7 +894,7 @@ pub fn record_usage(
     let mut tracker = USAGE_TRACKER.write();
     tracker.record(provider, model, session_key, input_tokens, output_tokens);
     // Attempt to save (ignore errors for now, will retry on next write)
-    let _ = tracker.save();
+    tracker.maybe_save();
 }
 
 /// Get current usage status (global tracker)
