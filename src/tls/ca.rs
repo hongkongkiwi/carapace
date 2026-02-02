@@ -528,40 +528,13 @@ pub struct NodeCertificate {
 ///
 /// Parses the certificate's Subject Distinguished Name to find the
 /// Common Name (CN) field, which contains the node ID.
-///
-/// Falls back to checking DNS SANs if the CN is not directly extractable.
 pub fn extract_node_identity(cert_der: &CertificateDer<'_>) -> Option<String> {
-    // Use rustls to parse the certificate and extract the subject
-    // We parse the DER manually for the CN field using a minimal approach:
-    // The subject DN is ASN.1 encoded. We look for the OID 2.5.4.3 (CN).
-    let cert_bytes = cert_der.as_ref();
-
-    // OID for commonName: 2.5.4.3 -> DER encoding: 55 04 03
-    let cn_oid: &[u8] = &[0x55, 0x04, 0x03];
-
-    // Search for the CN OID in the certificate DER
-    for i in 0..cert_bytes.len().saturating_sub(cn_oid.len()) {
-        if &cert_bytes[i..i + cn_oid.len()] == cn_oid {
-            // The CN value follows: typically OID (3 bytes) + tag + length + value
-            // After the OID, there's a tag byte (usually 0x0C for UTF8String or
-            // 0x13 for PrintableString) followed by length and the actual string.
-            let after_oid = i + cn_oid.len();
-            if after_oid + 2 < cert_bytes.len() {
-                let tag = cert_bytes[after_oid];
-                // Accept UTF8String (0x0C), PrintableString (0x13), IA5String (0x16)
-                if tag == 0x0C || tag == 0x13 || tag == 0x16 {
-                    let len = cert_bytes[after_oid + 1] as usize;
-                    let start = after_oid + 2;
-                    let end = start + len;
-                    if end <= cert_bytes.len() {
-                        if let Ok(cn) = std::str::from_utf8(&cert_bytes[start..end]) {
-                            // Skip the CA's own CN
-                            if cn != "Carapace Cluster CA" {
-                                return Some(cn.to_string());
-                            }
-                        }
-                    }
-                }
+    let (_, cert) = x509_parser::parse_x509_certificate(cert_der.as_ref()).ok()?;
+    for cn in cert.subject().iter_common_name() {
+        if let Ok(value) = cn.as_str() {
+            // Skip the CA's own CN
+            if value != "Carapace Cluster CA" {
+                return Some(value.to_string());
             }
         }
     }
