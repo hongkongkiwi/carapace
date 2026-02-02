@@ -7,7 +7,14 @@ expression: normalized
   "ok": true,
   "result": {
     "managedSkillsDir": "<PATH>",
-    "skills": [],
+    "skills": [
+      {
+        "enabled": true,
+        "installId": null,
+        "name": "my-skill",
+        "requestedAt": "<TIMESTAMP>"
+      }
+    ],
     "workspaceDir": "<PATH>"
   }
 }
