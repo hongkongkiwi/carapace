@@ -54,7 +54,7 @@ messages.
 {
   "telegram": {
     "botToken": "${TELEGRAM_BOT_TOKEN}",
-    "webhookSecret": "${TELEGRAM_WEBHOOK_SECRET}" // optional
+    "webhookSecret": "${TELEGRAM_WEBHOOK_SECRET}" // required for inbound webhooks
   }
 }
 ```
@@ -65,8 +65,9 @@ messages.
 https://<your-host>/channels/telegram/webhook
 ```
 
-If `webhookSecret` is set, configure Telegram to send
-`X-Telegram-Bot-Api-Secret-Token` with the same value.
+Configure Telegram to send `X-Telegram-Bot-Api-Secret-Token` with the same
+value. Inbound webhooks are rejected if the secret is missing or does not
+match.
 
 Implementation references:
 - `src/server/http.rs::telegram_webhook_handler`

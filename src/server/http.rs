@@ -969,14 +969,20 @@ async fn telegram_webhook_handler(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    if let Some(secret) = resolve_telegram_webhook_secret(&cfg) {
-        let provided = headers
-            .get("X-Telegram-Bot-Api-Secret-Token")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if !crate::auth::timing_safe_eq(&secret, provided) {
+    let secret = match resolve_telegram_webhook_secret(&cfg) {
+        Some(secret) if !secret.is_empty() => secret,
+        _ => {
+            warn!("Telegram webhook secret not configured; rejecting inbound request");
             return StatusCode::UNAUTHORIZED.into_response();
         }
+    };
+
+    let provided = headers
+        .get("X-Telegram-Bot-Api-Secret-Token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !crate::auth::timing_safe_eq(&secret, provided) {
+        return StatusCode::UNAUTHORIZED.into_response();
     }
 
     let update: telegram_inbound::TelegramUpdate = match serde_json::from_slice(&body) {
