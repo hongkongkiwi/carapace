@@ -80,35 +80,67 @@ impl Default for WindowsCredentialBackend {
 
 impl CredentialBackend for WindowsCredentialBackend {
     async fn get_raw(&self, key: &CredentialKey) -> Result<Option<String>, CredentialError> {
-        let entry = self.get_entry(key)?;
-
-        match entry.get_password() {
-            Ok(password) => {
-                // Treat empty string as not set
-                if password.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(password))
+        let account_key = key.to_account_key();
+        let outcome = tokio::task::spawn_blocking(move || {
+            let entry = Entry::new(SERVICE_NAME, &account_key).map_err(Self::map_error)?;
+            match entry.get_password() {
+                Ok(password) => {
+                    // Treat empty string as not set
+                    if password.is_empty() {
+                        Ok(None)
+                    } else {
+                        Ok(Some(password))
+                    }
                 }
+                Err(keyring::Error::NoEntry) => Ok(None),
+                Err(e) => Err(Self::map_error(e)),
             }
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(Self::map_error(e)),
+        })
+        .await;
+
+        match outcome {
+            Ok(result) => result,
+            Err(e) => Err(CredentialError::Internal(format!(
+                "Credential task failed: {e}"
+            ))),
         }
     }
 
     async fn set_raw(&self, key: &CredentialKey, value: &str) -> Result<(), CredentialError> {
-        let entry = self.get_entry(key)?;
-        entry.set_password(value).map_err(Self::map_error)
+        let account_key = key.to_account_key();
+        let value = value.to_string();
+        let outcome = tokio::task::spawn_blocking(move || {
+            let entry = Entry::new(SERVICE_NAME, &account_key).map_err(Self::map_error)?;
+            entry.set_password(&value).map_err(Self::map_error)
+        })
+        .await;
+
+        match outcome {
+            Ok(result) => result,
+            Err(e) => Err(CredentialError::Internal(format!(
+                "Credential task failed: {e}"
+            ))),
+        }
     }
 
     async fn delete_raw(&self, key: &CredentialKey) -> Result<(), CredentialError> {
-        let entry = self.get_entry(key)?;
+        let account_key = key.to_account_key();
+        let outcome = tokio::task::spawn_blocking(move || {
+            let entry = Entry::new(SERVICE_NAME, &account_key).map_err(Self::map_error)?;
+            match entry.delete_password() {
+                Ok(()) => Ok(()),
+                // Treat "not found" as success for delete (idempotent)
+                Err(keyring::Error::NoEntry) => Ok(()),
+                Err(e) => Err(Self::map_error(e)),
+            }
+        })
+        .await;
 
-        match entry.delete_password() {
-            Ok(()) => Ok(()),
-            // Treat "not found" as success for delete (idempotent)
-            Err(keyring::Error::NoEntry) => Ok(()),
-            Err(e) => Err(Self::map_error(e)),
+        match outcome {
+            Ok(result) => result,
+            Err(e) => Err(CredentialError::Internal(format!(
+                "Credential task failed: {e}"
+            ))),
         }
     }
 
@@ -130,17 +162,24 @@ impl CredentialBackend for WindowsCredentialBackend {
             }
         };
 
-        // Try to read (should succeed even if not found)
-        let available = match entry.get_password() {
-            Ok(_) => true,
-            Err(keyring::Error::NoEntry) => true,
-            Err(e) => {
-                let err = Self::map_error(e);
-                !matches!(
-                    err,
-                    CredentialError::StoreUnavailable(_) | CredentialError::AccessDenied
-                )
+        let account_key = test_key.to_account_key();
+        let outcome = tokio::task::spawn_blocking(move || {
+            let entry = Entry::new(SERVICE_NAME, &account_key).map_err(Self::map_error)?;
+            match entry.get_password() {
+                Ok(_) => Ok(true),
+                Err(keyring::Error::NoEntry) => Ok(true),
+                Err(e) => Err(Self::map_error(e)),
             }
+        })
+        .await;
+
+        let available = match outcome {
+            Ok(Ok(available)) => available,
+            Ok(Err(err)) => !matches!(
+                err,
+                CredentialError::StoreUnavailable(_) | CredentialError::AccessDenied
+            ),
+            Err(_) => false,
         };
 
         self.available.store(available, Ordering::Release);

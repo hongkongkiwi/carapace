@@ -35,6 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runtime during file I/O.
 - **Session retention cleanup:** cleanup runs on a blocking thread to avoid
   stalling the async runtime during filesystem operations.
+- **Credential backends:** keychain/keyring operations run on blocking threads
+  to avoid stalling the async runtime during credential reads/writes.
 
 ## [0.1.0] - Unreleased
 

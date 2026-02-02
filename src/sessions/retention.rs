@@ -148,8 +148,7 @@ async fn wait_for_startup_delay(shutdown: &mut watch::Receiver<bool>) -> bool {
 
 /// Execute a single cleanup pass, logging the result.
 async fn run_cleanup(store: Arc<SessionStore>, retention_days: u32) {
-    let outcome =
-        tokio::task::spawn_blocking(move || store.cleanup_expired(retention_days)).await;
+    let outcome = tokio::task::spawn_blocking(move || store.cleanup_expired(retention_days)).await;
     match outcome {
         Ok(Ok(deleted)) => {
             if deleted > 0 {
