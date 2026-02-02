@@ -43,6 +43,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   config file.
 - **Session integrity:** HMAC sidecars now cover chat history files in addition
   to session metadata.
+- **Session creation:** session key creation now uses an advisory lock to avoid
+  duplicate keys across concurrent processes.
 
 ## [0.1.0] - Unreleased
 

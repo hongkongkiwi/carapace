@@ -6,6 +6,7 @@
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -605,6 +606,28 @@ impl SessionStore {
         Ok(self.base_path.join(format!("{}.jsonl", session_id)))
     }
 
+    fn session_key_lock_path(&self, session_key: &str) -> PathBuf {
+        let mut hasher = Sha256::new();
+        hasher.update(session_key.as_bytes());
+        let digest = hasher.finalize();
+        self.base_path
+            .join(format!("session-key-{}", hex::encode(digest)))
+    }
+
+    fn acquire_session_key_lock(&self, session_key: &str) -> Result<FileLock, SessionStoreError> {
+        let lock_path = self.session_key_lock_path(session_key);
+        FileLock::acquire(&lock_path).map_err(|e| SessionStoreError::Io(e.to_string()))
+    }
+
+    fn session_key_exists(&self, session_key: &str) -> Result<bool, SessionStoreError> {
+        if self.key_to_id.read().contains_key(session_key) {
+            return Ok(true);
+        }
+
+        self.load_sessions_from_disk()?;
+        Ok(self.key_to_id.read().contains_key(session_key))
+    }
+
     fn verify_history_hmac(
         &self,
         history_path: &Path,
@@ -675,12 +698,11 @@ impl SessionStore {
 
         let session = Session::new(agent_id, metadata);
 
-        // Check for existing session with same key
-        {
-            let key_map = self.key_to_id.read();
-            if key_map.contains_key(&session.session_key) {
-                return Err(SessionStoreError::AlreadyExists(session.session_key));
-            }
+        let _lock = self.acquire_session_key_lock(&session.session_key)?;
+
+        // Check for existing session with same key (cache + disk)
+        if self.session_key_exists(&session.session_key)? {
+            return Err(SessionStoreError::AlreadyExists(session.session_key));
         }
 
         // Persist to disk
@@ -749,11 +771,13 @@ impl SessionStore {
     ) -> Result<Session, SessionStoreError> {
         let key = session_key.into();
 
+        self.ensure_base_dir()?;
+        let _lock = self.acquire_session_key_lock(&key)?;
+
         match self.get_session_by_key(&key) {
             Ok(session) => Ok(session),
             Err(SessionStoreError::NotFound(_)) => {
                 let session = Session::with_session_key(key, metadata);
-                self.ensure_base_dir()?;
                 self.write_session_meta(&session)?;
 
                 let mut sessions = self.sessions.write();
