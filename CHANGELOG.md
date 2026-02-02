@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   field (any IANA timezone). DST transitions handled correctly.
 - **Cron job persistence:** jobs survive process restarts via
   `state_dir/cron/jobs.json`. Stale runtime state cleared on load.
+- **Media analysis tool:** `media_analyze` built-in tool for image analysis
+  (OpenAI/Anthropic), Whisper transcription, and cached results.
 - **Bedrock provider wiring:** AWS Bedrock models available via config or
   standard AWS env vars (`AWS_REGION`, `AWS_ACCESS_KEY_ID`,
   `AWS_SECRET_ACCESS_KEY`). Optional session token and explicit kill switch.
@@ -60,8 +62,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Multi-provider LLM support:** Anthropic, OpenAI, Ollama, Google Gemini,
   AWS Bedrock, and Venice AI with MultiProvider dispatch.
 - **Built-in agent tools:** 10 core tools -- current_time, web_fetch,
-  memory_read/write/list, message_send, session_list/read, config_read,
-  math_eval.
+  media_analyze, memory_read/write/list, message_send, session_list/read,
+  config_read, math_eval.
 - **Channel-specific tools:** 15 tools for Telegram (edit, delete, pin,
   reply_markup, send_photo), Discord (reaction, embed, thread, edit, delete),
   and Slack (blocks, ephemeral, reaction, update, delete).

@@ -5,8 +5,9 @@
 //! standard tool dispatch path.
 
 use std::collections::HashMap;
+use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
@@ -19,6 +20,7 @@ pub fn builtin_tools() -> Vec<BuiltinTool> {
     vec![
         current_time_tool(),
         web_fetch_tool(),
+        media_analyze_tool(),
         memory_read_tool(),
         memory_write_tool(),
         memory_list_tool(),
@@ -87,6 +89,345 @@ fn web_fetch_tool() -> BuiltinTool {
         }),
         handler: Box::new(|args, _ctx| handle_web_fetch(args)),
     }
+}
+
+// ---------------------------------------------------------------------------
+// media_analyze
+// ---------------------------------------------------------------------------
+
+fn media_analyze_tool() -> BuiltinTool {
+    BuiltinTool {
+        name: "media_analyze".to_string(),
+        description: "Analyze an image or audio file by URL or local path. \
+                       Uses OpenAI (vision/Whisper) or Anthropic (vision) and \
+                       caches results alongside the file."
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Remote URL to fetch and analyze (http/https)."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Local file path to analyze."
+                },
+                "mime_type": {
+                    "type": "string",
+                    "description": "Optional MIME type override (e.g., image/png)."
+                },
+                "provider": {
+                    "type": "string",
+                    "description": "Optional provider override: openai or anthropic."
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "Optional prompt for image analysis."
+                },
+                "max_bytes": {
+                    "type": "integer",
+                    "description": "Maximum bytes to fetch when using a URL. Defaults to 50MB."
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Optional model override for image analysis."
+                },
+                "max_tokens": {
+                    "type": "integer",
+                    "description": "Optional max tokens for image analysis responses."
+                }
+            },
+            "additionalProperties": false,
+            "oneOf": [
+                { "required": ["url"] },
+                { "required": ["path"] }
+            ]
+        }),
+        handler: Box::new(|args, _ctx| handle_media_analyze(args)),
+    }
+}
+
+/// Default max response size for media_analyze (50 MB).
+const MEDIA_ANALYZE_DEFAULT_MAX_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Maximum allowed value for max_bytes (100 MB).
+const MEDIA_ANALYZE_MAX_ALLOWED_BYTES: u64 = 100 * 1024 * 1024;
+
+fn handle_media_analyze(args: Value) -> ToolInvokeResult {
+    let url = args
+        .get("url")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let path = args
+        .get("path")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    if url.is_some() == path.is_some() {
+        return ToolInvokeResult::tool_error("provide exactly one of: url or path");
+    }
+
+    let mime_override = args
+        .get("mime_type")
+        .and_then(|v| v.as_str())
+        .map(normalize_mime_type);
+    let provider_override = args
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_lowercase());
+    let prompt = args
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let model_override = args
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let max_tokens = args
+        .get("max_tokens")
+        .and_then(|v| v.as_u64())
+        .map(|v| v.min(u32::MAX as u64) as u32);
+
+    let max_bytes = args
+        .get("max_bytes")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(MEDIA_ANALYZE_DEFAULT_MAX_BYTES)
+        .min(MEDIA_ANALYZE_MAX_ALLOWED_BYTES);
+
+    if let Some(provider) = provider_override.as_deref() {
+        if provider != "openai" && provider != "anthropic" {
+            return ToolInvokeResult::tool_error(format!("unsupported provider: {provider}"));
+        }
+    }
+
+    let result = tokio::task::block_in_place(|| {
+        let handle = tokio::runtime::Handle::current();
+        handle.block_on(async {
+            use crate::media::analysis::{
+                analyze, AnthropicMediaAnalyzer, MediaType, OpenAiMediaAnalyzer,
+            };
+            use crate::media::fetch::{FetchConfig, MediaFetcher};
+            use crate::media::{MediaStore, StoreConfig};
+
+            let cfg = crate::config::load_config().unwrap_or_else(|_| json!({}));
+
+            let (media_path, mime_type) = if let Some(url) = url {
+                let config = FetchConfig::default().with_max_size(max_bytes);
+                let fetcher = MediaFetcher::with_config(config);
+                let fetch = fetcher.fetch(&url).await.map_err(|e| e.to_string())?;
+
+                let mime = mime_override
+                    .or(fetch.content_type.as_deref().map(normalize_mime_type))
+                    .ok_or_else(|| "missing mime_type and no Content-Type returned".to_string())?;
+
+                let store = MediaStore::new(StoreConfig::default())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let metadata = store
+                    .store(fetch.bytes, Some(mime.clone()))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                (metadata.path, mime)
+            } else if let Some(path) = path {
+                let media_path = PathBuf::from(path);
+                if !media_path.exists() {
+                    return Err("file path does not exist".to_string());
+                }
+                let mime = mime_override
+                    .or_else(|| guess_mime_from_path(&media_path))
+                    .ok_or_else(|| "missing mime_type for local file".to_string())?;
+                (media_path, mime)
+            } else {
+                return Err("missing url or path".to_string());
+            };
+
+            let media_type = MediaType::from_mime(&mime_type)
+                .ok_or_else(|| format!("unsupported MIME type: {}", mime_type))?;
+
+            let openai_key = resolve_openai_media_key(&cfg);
+            let anthropic_key = resolve_anthropic_media_key(&cfg);
+
+            let provider = match provider_override.as_deref() {
+                Some("openai") => "openai",
+                Some("anthropic") => "anthropic",
+                None => match media_type {
+                    MediaType::Audio => {
+                        if openai_key.is_some() {
+                            "openai"
+                        } else {
+                            return Err("OpenAI API key is required for audio transcription".into());
+                        }
+                    }
+                    MediaType::Image => {
+                        if openai_key.is_some() {
+                            "openai"
+                        } else if anthropic_key.is_some() {
+                            "anthropic"
+                        } else {
+                            return Err("no media analysis provider configured".into());
+                        }
+                    }
+                    MediaType::Video => {
+                        return Err("video analysis is not implemented".into());
+                    }
+                },
+                _ => unreachable!("provider validated before async block"),
+            };
+
+            let cache_path = analysis_cache_path(&media_path);
+            let cached = cache_path.exists();
+
+            let analysis: crate::media::analysis::MediaAnalysis = match provider {
+                "openai" => {
+                    let key = openai_key.ok_or_else(|| {
+                        "OpenAI API key not configured; set OPENAI_API_KEY or openai.apiKey"
+                            .to_string()
+                    })?;
+                    let mut analyzer = OpenAiMediaAnalyzer::new(key).map_err(|e| e.to_string())?;
+                    if let Some(base_url) = resolve_openai_base_url(&cfg) {
+                        analyzer = analyzer.with_base_url(base_url);
+                    }
+                    if let Some(model) = model_override.clone() {
+                        analyzer = analyzer.with_vision_model(model);
+                    }
+                    if let Some(max_tokens) = max_tokens {
+                        analyzer = analyzer.with_max_tokens(max_tokens);
+                    }
+                    analyze(&media_path, &mime_type, &analyzer, prompt.as_deref())
+                        .await
+                        .map_err(|e| e.to_string())?
+                }
+                "anthropic" => {
+                    if media_type == MediaType::Audio {
+                        return Err("Anthropic does not support audio transcription".into());
+                    }
+                    let key = anthropic_key.ok_or_else(|| {
+                        "Anthropic API key not configured; set ANTHROPIC_API_KEY or anthropic.apiKey"
+                            .to_string()
+                    })?;
+                    let mut analyzer =
+                        AnthropicMediaAnalyzer::new(key).map_err(|e| e.to_string())?;
+                    if let Some(base_url) = resolve_anthropic_base_url(&cfg) {
+                        analyzer = analyzer.with_base_url(base_url);
+                    }
+                    if let Some(model) = model_override.clone() {
+                        analyzer = analyzer.with_model(model);
+                    }
+                    if let Some(max_tokens) = max_tokens {
+                        analyzer = analyzer.with_max_tokens(max_tokens);
+                    }
+                    analyze(&media_path, &mime_type, &analyzer, prompt.as_deref())
+                        .await
+                        .map_err(|e| e.to_string())?
+                }
+                _ => return Err("unsupported provider".into()),
+            };
+
+            Ok(json!({
+                "analysis": analysis,
+                "mimeType": mime_type,
+                "cached": cached
+            }))
+        })
+    });
+
+    match result {
+        Ok(value) => ToolInvokeResult::success(value),
+        Err(e) => ToolInvokeResult::tool_error(e),
+    }
+}
+
+fn resolve_openai_media_key(cfg: &Value) -> Option<String> {
+    env::var("OPENAI_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
+        .or_else(|| {
+            cfg.get("models")
+                .and_then(|v| v.get("providers"))
+                .and_then(|v| v.get("openai"))
+                .and_then(|v| v.get("apiKey"))
+                .and_then(|v| v.as_str())
+                .filter(|k| !k.is_empty())
+                .map(|k| k.to_string())
+        })
+        .or_else(|| {
+            cfg.get("openai")
+                .and_then(|v| v.get("apiKey"))
+                .and_then(|v| v.as_str())
+                .filter(|k| !k.is_empty())
+                .map(|k| k.to_string())
+        })
+}
+
+fn resolve_openai_base_url(cfg: &Value) -> Option<String> {
+    env::var("OPENAI_BASE_URL")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            cfg.get("openai")
+                .and_then(|v| v.get("baseUrl"))
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .map(|v| v.to_string())
+        })
+}
+
+fn resolve_anthropic_media_key(cfg: &Value) -> Option<String> {
+    env::var("ANTHROPIC_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
+        .or_else(|| {
+            cfg.get("anthropic")
+                .and_then(|v| v.get("apiKey"))
+                .and_then(|v| v.as_str())
+                .filter(|k| !k.is_empty())
+                .map(|k| k.to_string())
+        })
+}
+
+fn resolve_anthropic_base_url(cfg: &Value) -> Option<String> {
+    env::var("ANTHROPIC_BASE_URL")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            cfg.get("anthropic")
+                .and_then(|v| v.get("baseUrl"))
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .map(|v| v.to_string())
+        })
+}
+
+fn normalize_mime_type(raw: &str) -> String {
+    raw.split(';').next().unwrap_or(raw).trim().to_lowercase()
+}
+
+fn guess_mime_from_path(path: &Path) -> Option<String> {
+    let ext = path.extension()?.to_string_lossy().to_lowercase();
+    let mime = match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" => "audio/ogg",
+        "flac" => "audio/flac",
+        "m4a" => "audio/mp4",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        _ => return None,
+    };
+    Some(mime.to_string())
+}
+
+fn analysis_cache_path(path: &Path) -> PathBuf {
+    let mut cache_path = path.as_os_str().to_owned();
+    cache_path.push(".analysis.json");
+    PathBuf::from(cache_path)
 }
 
 /// Default max response size for web_fetch (1 MB).
@@ -1083,15 +1424,57 @@ mod tests {
         }
     }
 
+    // -- media_analyze tests --
+
+    #[test]
+    fn test_media_analyze_missing_source() {
+        let tool = media_analyze_tool();
+        let ctx = ToolInvokeContext::default();
+        let result = (tool.handler)(json!({}), &ctx);
+        match result {
+            ToolInvokeResult::Error { .. } => {}
+            _ => panic!("expected error for missing url/path"),
+        }
+    }
+
+    #[test]
+    fn test_media_analyze_conflicting_source() {
+        let tool = media_analyze_tool();
+        let ctx = ToolInvokeContext::default();
+        let result = (tool.handler)(
+            json!({"url": "https://example.com", "path": "/tmp/a.png"}),
+            &ctx,
+        );
+        match result {
+            ToolInvokeResult::Error { .. } => {}
+            _ => panic!("expected error for both url and path"),
+        }
+    }
+
+    #[test]
+    fn test_media_analyze_unsupported_provider() {
+        let tool = media_analyze_tool();
+        let ctx = ToolInvokeContext::default();
+        let result = (tool.handler)(
+            json!({"url": "https://example.com/image.png", "provider": "unknown"}),
+            &ctx,
+        );
+        match result {
+            ToolInvokeResult::Error { .. } => {}
+            _ => panic!("expected error for unsupported provider"),
+        }
+    }
+
     // -- builtin_tools registration --
 
     #[test]
     fn test_builtin_tools_returns_all_tools() {
         let tools = builtin_tools();
-        assert_eq!(tools.len(), 10, "should have 10 built-in tools");
+        assert_eq!(tools.len(), 11, "should have 11 built-in tools");
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"current_time"));
         assert!(names.contains(&"web_fetch"));
+        assert!(names.contains(&"media_analyze"));
         assert!(names.contains(&"memory_read"));
         assert!(names.contains(&"memory_write"));
         assert!(names.contains(&"memory_list"));

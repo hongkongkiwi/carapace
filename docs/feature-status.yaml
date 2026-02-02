@@ -160,10 +160,10 @@ feature_inventory_markdown: |
   - [x] **Redirect blocking** — prevents redirect-based bypass
   - [x] **Streaming with size limits** — configurable max size (50MB default)
   - [x] **Temp file storage** — TTL-based expiration with cleanup (1hr TTL)
-  - [~] **Image analysis (Claude Vision)** — Anthropic image understanding
-  - [~] **Image analysis (GPT-4 Vision)** — OpenAI image understanding
-  - [~] **Audio transcription (Whisper)** — OpenAI Whisper API
-  - [~] **Analysis caching** — .analysis.json sidecar files
+  - [x] **Image analysis (Claude Vision)** — Anthropic image understanding
+  - [x] **Image analysis (GPT-4 Vision)** — OpenAI image understanding
+  - [x] **Audio transcription (Whisper)** — OpenAI Whisper API
+  - [x] **Analysis caching** — .analysis.json sidecar files
 
   ### Messages (`src/messages/`)
 
@@ -196,7 +196,7 @@ feature_inventory_markdown: |
   - [x] **Tool dispatch** — tool invocation routing with collision warnings
   - [x] **Hook dispatch** — lifecycle hook routing
   - [x] **Webhook dispatch** — HTTP webhook routing
-  - [x] **Builtin tools** — 10 core tools (current_time, web_fetch, memory_read/write/list, message_send, session_list/read, config_read, math_eval)
+  - [x] **Builtin tools** — 11 core tools (current_time, web_fetch, media_analyze, memory_read/write/list, message_send, session_list/read, config_read, math_eval)
 
   ### Server (`src/server/`)
 

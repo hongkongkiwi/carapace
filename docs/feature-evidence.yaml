@@ -457,44 +457,40 @@ features:
       - "src/media/store.rs::test_load_existing_entries_on_startup"
 
   - feature: "media.image analysis (claude vision)"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
       - "src/media/analysis.rs::AnthropicMediaAnalyzer (analyze_image)"
+      - "src/agent/builtin_tools.rs::handle_media_analyze (Anthropic path)"
     tests:
       - "src/media/analysis.rs::test_anthropic_analyze_empty_image"
       - "src/media/analysis.rs::test_validate_image_mime_unsupported"
-    notes:
-      - "No runtime path constructs a MediaAnalyzer for image analysis"
 
   - feature: "media.image analysis (gpt-4 vision)"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
       - "src/media/analysis.rs::OpenAiMediaAnalyzer (analyze_image)"
+      - "src/agent/builtin_tools.rs::handle_media_analyze (OpenAI vision path)"
     tests:
       - "src/media/analysis.rs::test_openai_analyze_empty_image"
       - "src/media/analysis.rs::test_validate_image_mime_unsupported"
-    notes:
-      - "No runtime path constructs a MediaAnalyzer for image analysis"
 
   - feature: "media.audio transcription (whisper)"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
       - "src/media/analysis.rs::OpenAiMediaAnalyzer::transcribe_audio"
+      - "src/agent/builtin_tools.rs::handle_media_analyze (OpenAI audio path)"
     tests:
       - "src/media/analysis.rs::test_openai_transcribe_empty_audio"
       - "src/media/analysis.rs::test_openai_transcribe_wrong_mime"
-    notes:
-      - "No runtime path constructs a MediaAnalyzer for audio transcription"
 
   - feature: "media.analysis caching"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
       - "src/media/analysis.rs::analyze (analysis_cache_path + read/write cached analysis)"
+      - "src/agent/builtin_tools.rs::handle_media_analyze (analysis cache integration)"
     tests:
       - "src/media/analysis.rs::test_analysis_cache_path"
       - "src/media/analysis.rs::test_write_and_read_cached_analysis"
-    notes:
-      - "analyze() is not invoked by runtime or tools"
 
   - feature: "messages.outbound message pipeline"
     status: "verified_done"
