@@ -128,6 +128,19 @@ OLLAMA_BASE_URL=http://localhost:8000 cargo run
 Or configure via `config.json5` — see [`config.example.json5`](config.example.json5)
 for the `openai` and `ollama` provider sections.
 
+### Channels
+
+Setup guides for Signal, Telegram, Discord, and Slack (including inbound
+webhooks and gateway configuration) live in:
+
+- `docs/channels.md`
+
+### Getting Started
+
+End‑to‑end setup, auth, TLS, and ops guidance:
+
+- `docs/getting-started.md`
+
 ### Signal
 
 Requires [signal-cli-rest-api](https://github.com/bbernhard/signal-cli-rest-api):

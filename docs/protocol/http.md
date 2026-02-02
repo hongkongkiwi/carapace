@@ -109,6 +109,33 @@ Possible responses:
 - 400 Bad Request for invalid mapping
 - 500 Internal Server Error if mapping evaluation fails
 
+## Channel Webhooks
+
+Inbound channel integrations are handled via dedicated HTTP endpoints.
+These are **not** protected by gateway auth; each channel uses its own
+validation mechanism.
+
+Common behavior:
+- Method: **POST**
+- Max body size: `hooks.maxBodyBytes` (default 256 KB)
+
+### POST `/channels/telegram/webhook`
+Telegram Bot API webhook endpoint.
+
+- Auth: optional `X-Telegram-Bot-Api-Secret-Token` when `telegram.webhookSecret` is set.
+- Body: Telegram Update JSON.
+- Response: `200 OK` on success (ignored updates still return 200).
+
+### POST `/channels/slack/events`
+Slack Events API endpoint.
+
+- Auth: Slack signature validation using `slack.signingSecret`.
+  - Requires `X-Slack-Request-Timestamp` and `X-Slack-Signature` headers.
+- Body: Slack Events API JSON.
+- Response:
+  - `200 OK` with `{ "challenge": "..." }` for `url_verification`.
+  - `200 OK` for event callbacks.
+
 ## OpenAI-Compatible
 
 ### POST `/v1/chat/completions`

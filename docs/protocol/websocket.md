@@ -316,6 +316,13 @@ Compatibility aliases:
 ### Usage
 - `usage.status` - Get usage status
 - `usage.cost` - Get usage cost
+- `usage.session` - Get usage for a session
+- `usage.providers` - Get usage by provider
+- `usage.daily` - Get daily usage summaries
+- `usage.monthly` - Get monthly usage summaries
+- `usage.enable` - Enable usage tracking
+- `usage.disable` - Disable usage tracking
+- `usage.reset` - Reset usage tracking
 
 ### Heartbeat
 - `last-heartbeat` - Get last heartbeat time
@@ -324,6 +331,7 @@ Compatibility aliases:
 ### System
 - `wake` - Wake the gateway
 - `send` - Send a message
+- `system.info` - Get system metadata
 - `system-presence` - Report system presence
 - `system-event` - Send system event
 

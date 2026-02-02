@@ -1,0 +1,149 @@
+# Channels Setup
+
+This guide explains how to configure inbound/outbound messaging for Signal,
+Telegram, Discord, and Slack. It focuses on the *carapace* gateway wiring and
+the minimum external setup needed to make each channel usable.
+
+All examples assume `config.json5` (see `config.example.json5`) and the default
+HTTP bind on port 8080. Adjust paths/ports for your deployment.
+
+## Common Notes
+
+- Inbound webhooks require a public HTTPS URL. If you are behind a reverse
+  proxy, ensure it forwards to the gateway and preserves the request body.
+- Secrets are encrypted at rest when config encryption is enabled.
+- Channel tools (agent actions) are available when `session.metadata.channel`
+  is set for the conversation.
+
+## Signal (signal-cli-rest-api)
+
+Signal uses a polling loop against the local `signal-cli-rest-api` container.
+Inbound messages are delivered by polling `GET /v1/receive/{number}`.
+
+1) Start signal-cli-rest-api:
+
+```bash
+docker run -d -p 8080:8080 -v $HOME/.local/share/signal-api:/home/.local/share/signal-cli \
+  -e MODE=native bbernhard/signal-cli-rest-api
+```
+
+2) Configure carapace:
+
+```json5
+{
+  "signal": {
+    "baseUrl": "http://localhost:8080",
+    "phoneNumber": "+15551234567"
+  }
+}
+```
+
+Implementation references:
+- `src/channels/signal_receive.rs`
+- `src/main.rs::spawn_signal_receive_loop_if_configured`
+
+## Telegram (Bot API + Webhook)
+
+Telegram uses the Bot API for outbound delivery and a webhook for inbound
+messages.
+
+1) Create a Telegram bot token (via BotFather).
+2) Configure carapace:
+
+```json5
+{
+  "telegram": {
+    "botToken": "${TELEGRAM_BOT_TOKEN}",
+    "webhookSecret": "${TELEGRAM_WEBHOOK_SECRET}" // optional
+  }
+}
+```
+
+3) Set the webhook URL on Telegram to:
+
+```
+https://<your-host>/channels/telegram/webhook
+```
+
+If `webhookSecret` is set, configure Telegram to send
+`X-Telegram-Bot-Api-Secret-Token` with the same value.
+
+Implementation references:
+- `src/server/http.rs::telegram_webhook_handler`
+- `src/channels/telegram_inbound.rs`
+
+## Slack (Web API + Events API)
+
+Slack uses the Web API for outbound delivery and the Events API for inbound
+messages.
+
+1) Create a Slack app, install it to your workspace, and obtain a bot token
+   (`xoxb-...`).
+2) Enable **Events API** and set the request URL to:
+
+```
+https://<your-host>/channels/slack/events
+```
+
+3) Configure the Slack signing secret in carapace:
+
+```json5
+{
+  "slack": {
+    "botToken": "${SLACK_BOT_TOKEN}",
+    "signingSecret": "${SLACK_SIGNING_SECRET}"
+  }
+}
+```
+
+The gateway validates `X-Slack-Request-Timestamp` and `X-Slack-Signature`.
+Slack’s `url_verification` handshake is supported.
+
+Implementation references:
+- `src/server/http.rs::slack_events_handler`
+- `src/channels/slack_inbound.rs`
+
+## Discord (REST + Gateway)
+
+Discord uses the REST API for outbound delivery and the Gateway WebSocket for
+inbound messages.
+
+1) Create a Discord application and bot token.
+2) Enable the **Message Content Intent** if you want access to full message
+   content in guilds.
+3) Configure carapace:
+
+```json5
+{
+  "discord": {
+    "botToken": "${DISCORD_BOT_TOKEN}",
+    "gatewayEnabled": true,
+    "gatewayIntents": 37377 // includes MESSAGE_CONTENT by default
+  }
+}
+```
+
+The gateway connects to Discord and dispatches `MESSAGE_CREATE` events into
+the agent pipeline.
+
+Implementation references:
+- `src/channels/discord_gateway.rs`
+- `src/main.rs::spawn_discord_gateway_loop_if_configured`
+
+## Environment Variables
+
+All channel config can be supplied via environment variables:
+
+- `SIGNAL_CLI_URL`, `SIGNAL_PHONE_NUMBER`
+- `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `TELEGRAM_BASE_URL`
+- `DISCORD_BOT_TOKEN`, `DISCORD_BASE_URL`, `DISCORD_GATEWAY_URL`, `DISCORD_GATEWAY_INTENTS`
+- `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACK_BASE_URL`
+
+## Inbound Session Routing
+
+Inbound messages create (or reuse) a scoped session key based on channel +
+sender + peer ID. Responses are delivered back through the channel pipeline.
+
+Implementation references:
+- `src/channels/inbound.rs`
+- `src/sessions/mod.rs::get_or_create_scoped_session`

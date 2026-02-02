@@ -92,6 +92,7 @@
   // --- Telegram channel (via Bot API) --------------------------------------
   // telegram: {
   //   botToken: "${TELEGRAM_BOT_TOKEN}",          // Telegram bot token
+  //   // webhookSecret: "${TELEGRAM_WEBHOOK_SECRET}", // validate webhook secret token header
   //   // baseUrl: "https://api.telegram.org",     // override API base URL
   //   // enabled: false,                          // set to false to disable without removing config
   // },
@@ -99,6 +100,9 @@
   // --- Discord channel (via REST API) --------------------------------------
   // discord: {
   //   botToken: "${DISCORD_BOT_TOKEN}",           // Discord bot token
+  //   // gatewayEnabled: true,                    // connect to Discord gateway for inbound messages
+  //   // gatewayIntents: 37377,                   // intents bitmask (includes MESSAGE_CONTENT)
+  //   // gatewayUrl: "wss://gateway.discord.gg/?v=10&encoding=json",
   //   // baseUrl: "https://discord.com/api/v10",  // override API base URL
   //   // enabled: false,                          // set to false to disable without removing config
   // },
@@ -106,6 +110,7 @@
   // --- Slack channel (via Web API) -----------------------------------------
   // slack: {
   //   botToken: "${SLACK_BOT_TOKEN}",             // Slack bot token (xoxb-...)
+  //   // signingSecret: "${SLACK_SIGNING_SECRET}", // validate Events API signatures
   //   // baseUrl: "https://slack.com/api",        // override API base URL
   //   // enabled: false,                          // set to false to disable without removing config
   // },

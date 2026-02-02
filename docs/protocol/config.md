@@ -125,9 +125,9 @@ All keys are optional. Unknown keys are rejected (strict schema).
 - `venice` – Venice AI provider settings (apiKey, baseUrl)
 - `classifier` – inbound message classifier (mode, model, blockThreshold)
 - `signal` – Signal channel settings (via signal-cli REST API)
-- `telegram` – Telegram Bot API settings (botToken, baseUrl)
-- `discord` – Discord Bot API settings (botToken, baseUrl)
-- `slack` – Slack Web API settings (botToken, baseUrl)
+- `telegram` – Telegram Bot API settings (botToken, baseUrl, webhookSecret)
+- `discord` – Discord Bot API settings (botToken, baseUrl, gatewayEnabled, gatewayIntents, gatewayUrl)
+- `slack` – Slack Web API settings (botToken, baseUrl, signingSecret)
 
 ### Notable subkeys
 
@@ -147,6 +147,14 @@ This is a condensed map; refer to the JSON schema for full detail.
   - `apiKey`, `baseUrl`
 - `classifier`
   - `enabled`, `mode` (`off` | `warn` | `block`), `model`, `blockThreshold`
+- `telegram`
+  - `webhookSecret` (validates `X-Telegram-Bot-Api-Secret-Token`)
+- `discord`
+  - `gatewayEnabled` (connect to the Gateway for inbound messages)
+  - `gatewayIntents` (intents bitmask, default includes MESSAGE_CONTENT)
+  - `gatewayUrl` (override Gateway URL)
+- `slack`
+  - `signingSecret` (validates Events API signatures)
 
 ## Defaults
 

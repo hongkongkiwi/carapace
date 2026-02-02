@@ -2,7 +2,7 @@
 # Keep this focused on audited entries in docs/feature-status.yaml.
 
 version: "1.0"
-updated_at: "2026-02-01"
+updated_at: "2026-02-02"
 
 features:
   - feature: "logs.tail"
@@ -27,13 +27,20 @@ features:
     status: "verified_done"
     runtime_wiring:
       - "src/channels/telegram.rs (TelegramChannel send_text/send_media)"
+      - "src/channels/telegram_inbound.rs (Telegram webhook parsing)"
       - "src/channels/discord.rs (DiscordChannel send_text/send_media)"
+      - "src/channels/discord_gateway.rs (Gateway loop + MESSAGE_CREATE handling)"
       - "src/channels/slack.rs (SlackChannel send_text/send_media)"
+      - "src/channels/slack_inbound.rs (Slack signature + event parsing)"
       - "src/main.rs (register_*_channel_if_configured)"
+      - "src/main.rs (spawn_discord_gateway_loop_if_configured)"
+      - "src/server/http.rs (telegram_webhook_handler, slack_events_handler)"
     tests:
       - "src/channels/telegram.rs::test_telegram_get_info"
+      - "src/channels/telegram_inbound.rs::test_extract_inbound_message"
       - "src/channels/discord.rs::test_discord_get_info"
       - "src/channels/slack.rs::test_slack_get_info"
+      - "src/channels/slack_inbound.rs::test_verify_slack_signature"
 
   - feature: "cron.*"
     status: "verified_done"
@@ -852,10 +859,55 @@ features:
       - "exec.list aliases to exec.approvals.get; exec.approve/deny alias to exec.approval.resolve"
       - "exec.approve/deny inject default decision values (allow-once/deny) when missing"
 
-  - feature: "ws.system.info"
-    status: "verified_missing"
+  - feature: "ws.config.schema"
+    status: "verified_done"
     runtime_wiring:
-      - "src/server/ws/handlers/mod.rs (no system.info method)"
+      - "src/server/ws/handlers/config.rs::handle_config_schema"
+      - "src/config/schema.rs::known_top_level_keys"
+      - "src/server/ws/handlers/mod.rs (config.schema dispatch)"
+    tests:
+      - "src/server/ws/golden_tests.rs::golden_config_schema"
+      - "src/server/ws/golden_tests.rs::config_lifecycle_3_schema"
+
+  - feature: "ws.system.last-heartbeat/set-heartbeats"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/server/ws/handlers/system.rs (handle_last_heartbeat, handle_set_heartbeats)"
+      - "src/server/ws/mod.rs (heartbeat state + broadcast)"
+    tests:
+      - "src/server/ws/golden_tests.rs::golden_last_heartbeat"
+
+  - feature: "ws.system.wake"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/server/ws/handlers/system.rs::handle_wake"
+      - "src/server/ws/mod.rs::enqueue_system_event"
+
+  - feature: "ws.talk.devices"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/server/ws/handlers/talk.rs::handle_talk_devices"
+    tests:
+      - "src/server/ws/golden_tests.rs::golden_talk_devices"
+
+  - feature: "ws.tts.stop"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/server/ws/handlers/tts.rs::handle_tts_stop"
+
+  - feature: "ws.voicewake.test"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/server/ws/handlers/voicewake.rs::handle_voicewake_test"
+
+  - feature: "ws.system.info"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/server/ws/handlers/system.rs::handle_system_info"
+      - "src/server/ws/handlers/mod.rs (system.info dispatch)"
+      - "src/server/ws/mod.rs (system.info in method list)"
+    notes:
+      - "includes runtime metadata, counts, and heartbeat config"
 
   - feature: "tailscale.serve"
     status: "verified_done"
@@ -1052,7 +1104,9 @@ features:
   - feature: "usage.session tracking"
     status: "verified_done"
     runtime_wiring:
-      - "src/server/ws/handlers/usage.rs (record_usage + handle_usage_session)"
+      - "src/usage/mod.rs::record (session totals + persistence)"
+      - "src/agent/executor.rs::record_turn_usage (usage recording)"
+      - "src/server/ws/handlers/usage.rs::handle_usage_session"
       - "src/server/ws/handlers/mod.rs (usage.session dispatch)"
     tests:
       - "src/server/ws/handlers/usage.rs (usage session tests)"
@@ -1060,11 +1114,10 @@ features:
   - feature: "usage.cost calculation"
     status: "verified_done"
     runtime_wiring:
-      - "src/agent/executor.rs (estimate_cost -> record_usage)"
-      - "src/usage/mod.rs (ModelPricing + calculate_cost)"
+      - "src/usage/mod.rs (ModelPricing + default_pricing + calculate_cost)"
+      - "src/agent/executor.rs::record_turn_usage (usage recording)"
     tests:
       - "src/usage/mod.rs (calculate_cost tests)"
-      - "src/agent/executor.rs (estimate_cost tests)"
 
   - feature: "tests.integration"
     status: "verified_done"
@@ -1209,12 +1262,23 @@ features:
       - "src/channels/console.rs (unit tests)"
 
   - feature: "telegram/discord/slack channels"
-    status: "verified_missing"
+    status: "verified_done"
     runtime_wiring:
-      - "src/channels/mod.rs (only console/signal/webhook modules in core)"
-      - "src/plugins/loader.rs (WASM plugin loader; no built-in channel plugins)"
-    notes:
-      - "No Telegram/Discord/Slack channel plugin implementations shipped in repo"
+      - "src/channels/telegram.rs (TelegramChannel send_text/send_media)"
+      - "src/channels/telegram_inbound.rs (Telegram webhook parsing)"
+      - "src/channels/discord.rs (DiscordChannel send_text/send_media)"
+      - "src/channels/discord_gateway.rs (Gateway loop + MESSAGE_CREATE handling)"
+      - "src/channels/slack.rs (SlackChannel send_text/send_media)"
+      - "src/channels/slack_inbound.rs (Slack signature + event parsing)"
+      - "src/main.rs (register_*_channel_if_configured)"
+      - "src/main.rs (spawn_discord_gateway_loop_if_configured)"
+      - "src/server/http.rs (telegram_webhook_handler, slack_events_handler)"
+    tests:
+      - "src/channels/telegram.rs::test_telegram_get_info"
+      - "src/channels/telegram_inbound.rs::test_extract_inbound_message"
+      - "src/channels/discord.rs::test_discord_get_info"
+      - "src/channels/slack.rs::test_slack_get_info"
+      - "src/channels/slack_inbound.rs::test_verify_slack_signature"
 
   - feature: "start"
     status: "verified_done"
@@ -1478,45 +1542,41 @@ features:
       - "src/auth/mod.rs::test_timing_safe_eq"
 
   - feature: "sessions.scoping"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
       - "src/sessions/scoping.rs (scope + reset policy)"
+      - "src/sessions/mod.rs (scoped session resolution + reset enforcement helper)"
+      - "src/channels/signal_receive.rs (scoped key + reset)"
+      - "src/server/ws/handlers/sessions.rs (agent/chat scoping + reset)"
+      - "src/server/http.rs (hooks/agent scoping + reset)"
     notes:
-      - "Session key resolution does not apply scoping in WS/HTTP/channel routing"
-      - "Reset policy not enforced in runtime paths"
+      - "Explicit sessionKey still honored; reset policy enforced on existing sessions"
 
   - feature: "usage.daily/monthly summaries"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
       - "src/usage/mod.rs (daily + monthly aggregation)"
-      - "src/server/ws/handlers/usage.rs (daily_summaries only)"
-    notes:
-      - "WS usage path does not use persistent tracker"
-      - "Monthly summaries not exposed in WS usage handlers"
+      - "src/server/ws/handlers/usage.rs::handle_usage_daily/handle_usage_monthly"
+    tests:
+      - "src/usage/mod.rs (daily summary tests)"
 
   - feature: "usage.provider/model breakdown"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
       - "src/usage/mod.rs (by_provider + by_model aggregation)"
-      - "src/server/ws/handlers/usage.rs (providers only)"
-    notes:
-      - "Model-level breakdown not surfaced in WS usage handlers"
+      - "src/server/ws/handlers/usage.rs (usage.cost byProvider/byModel)"
 
   - feature: "usage.persistent JSON storage"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
       - "src/usage/mod.rs (UsageTracker load/save usage.json)"
-    notes:
-      - "WS usage handlers use in-memory state only"
+      - "src/server/ws/handlers/usage.rs (handlers use persistent tracker)"
 
   - feature: "usage.enable/disable tracking"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
       - "src/usage/mod.rs (enable/disable + save)"
       - "src/server/ws/handlers/usage.rs (enable/disable handlers)"
-    notes:
-      - "WS toggles are not persisted to usage.json"
-      - "record_usage re-enables when config says enabled"
 
   - feature: "tests.unit tests"
     status: "verified_done"

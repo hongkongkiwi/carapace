@@ -51,7 +51,7 @@ feature_inventory_markdown: |
 
   - [x] **Channel registry** — thread-safe channel tracking, status enum
   - [x] **Console channel** — built-in testing channel
-  - [x] **Telegram/Discord/Slack** — built-in channel plugins for outbound text/media delivery (Bot/Web APIs).
+  - [x] **Telegram/Discord/Slack** — outbound + inbound (Telegram webhook, Slack Events API, Discord Gateway).
 
   ### CLI (`src/cli/`)
 
@@ -219,18 +219,18 @@ feature_inventory_markdown: |
   - [x] **session.create/load/list/fork/rename/delete/switch** — session management
   - [x] **config.get/update/reload/validate** — configuration
   - [x] **exec.approve/deny/list** — exec approval workflow
-  - [-] **system.info** — system information
+  - [x] **system.info** — system metadata + runtime stats
   - [x] **logs.tail** — streaming log buffer
   - [x] **skills.status** — skill listing
   - [x] **cron.*** — cron job CRUD + lifecycle
   - [x] **tts.speak / tts.voices** — text-to-speech
   - [x] **voicewake.get / voicewake.keywords** — wake word config
-  - [s] **config.schema** — stub: returns minimal placeholder
-  - [s] **system.last-heartbeat / set-heartbeats** — stub: returns null / discards
-  - [s] **system.wake** — stub: accepts target, no action
-  - [s] **talk.devices** — stub: returns hardcoded device list
-  - [s] **tts.stop** — stub: returns stopped=true without stopping
-  - [s] **voicewake.test** — stub: returns hardcoded detection=false
+  - [x] **config.schema** — top-level schema + known keys
+  - [x] **system.last-heartbeat / set-heartbeats** — read last heartbeat + update interval
+  - [x] **system.wake** — enqueue wake system event
+  - [x] **talk.devices** — list selected/default audio devices
+  - [x] **tts.stop** — stop current playback state
+  - [x] **voicewake.test** — validate audioData + return detection sample
   - [x] **wizard** — setup/channel/agent wizards apply config
 
   ### Sessions (`src/sessions/`)
@@ -242,7 +242,7 @@ feature_inventory_markdown: |
   - [x] **Session filters** — list/search by criteria
   - [x] **File locking** — concurrent-safe operations (flock RAII)
   - [x] **Retention policies** — age-based cleanup
-  - [~] **Scoping** — multi-tenant session isolation
+  - [x] **Scoping** — channel/session scope + reset policy across ingress
 
   ### Tailscale (`src/tailscale/`)
 
@@ -267,12 +267,12 @@ feature_inventory_markdown: |
 
   ### Usage (`src/usage/`)
 
-  - [~] **Daily/monthly summaries** — aggregated usage data
+  - [x] **Daily/monthly summaries** — aggregated usage data
   - [x] **Session usage tracking** — per-session totals
-  - [~] **Provider/model breakdown** — per-provider and per-model aggregation
+  - [x] **Provider/model breakdown** — per-provider and per-model aggregation
   - [x] **Cost calculation** — per-million-token pricing
-  - [~] **Persistent JSON storage** — pretty JSON format
-  - [~] **Enable/disable tracking** — privacy control
+  - [x] **Persistent JSON storage** — pretty JSON format
+  - [x] **Enable/disable tracking** — privacy control
 
   ### Tests & CI
 
