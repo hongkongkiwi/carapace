@@ -1,7 +1,8 @@
 # Config File Format
 
 This document describes the config file format as implemented by the carapace
-gateway. The format is compatible with the original Node.js openclaw gateway.
+gateway. The format is derived from the original Node.js openclaw gateway and
+is compatible on a best-effort basis (new fields and defaults may diverge).
 
 ## File Location
 

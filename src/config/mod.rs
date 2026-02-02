@@ -1,7 +1,7 @@
 //! Configuration parsing module
 //!
 //! Handles JSON5 configuration with includes, environment variable substitution,
-//! and caching. Matches the legacy openclaw format for compatibility.
+//! and caching. Derived from the legacy openclaw format (best-effort compatibility).
 
 pub mod defaults;
 pub mod schema;
