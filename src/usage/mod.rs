@@ -72,7 +72,7 @@ struct PricingOverride {
     pricing: ModelPricing,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MatchType {
     Contains,
     Exact,
@@ -135,12 +135,19 @@ fn pricing_override(
     overrides: &[PricingOverride],
 ) -> Option<ModelPricing> {
     for override_entry in overrides {
-        let matches = match override_entry.match_type {
-            MatchType::Contains => model_lower.contains(&override_entry.pattern),
-            MatchType::Exact => model.eq_ignore_ascii_case(&override_entry.pattern),
-        };
+        if override_entry.match_type != MatchType::Exact {
+            continue;
+        }
+        if model.eq_ignore_ascii_case(&override_entry.pattern) {
+            return Some(override_entry.pricing.clone());
+        }
+    }
 
-        if matches {
+    for override_entry in overrides {
+        if override_entry.match_type != MatchType::Contains {
+            continue;
+        }
+        if model_lower.contains(&override_entry.pattern) {
             return Some(override_entry.pricing.clone());
         }
     }
