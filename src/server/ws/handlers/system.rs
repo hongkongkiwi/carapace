@@ -203,38 +203,103 @@ fn fallback_mode(text: &str) -> Option<String> {
 
 /// Handle last-heartbeat - returns heartbeat info
 /// Per Node semantics: returns getLastHeartbeatEvent() which is the last heartbeat event object or null
-pub(super) fn handle_last_heartbeat() -> Result<Value, ErrorShape> {
-    tracing::debug!("system.last-heartbeat: stub response");
-    // Node returns the last heartbeat event object, or null if none
-    // For now, return null since we don't track heartbeat events yet
-    Ok(json!({ "stub": true }))
+pub(super) fn handle_last_heartbeat(state: &WsServerState) -> Result<Value, ErrorShape> {
+    let snapshot = state.heartbeat_snapshot();
+    if let Some(ts) = snapshot.last_heartbeat_ms {
+        Ok(json!({ "ts": ts }))
+    } else {
+        Ok(Value::Null)
+    }
 }
 
-pub(super) fn handle_set_heartbeats(params: Option<&Value>) -> Result<Value, ErrorShape> {
+pub(super) fn handle_set_heartbeats(
+    state: &WsServerState,
+    params: Option<&Value>,
+) -> Result<Value, ErrorShape> {
     let enabled = params
         .and_then(|v| v.get("enabled"))
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
-    tracing::debug!(
-        enabled,
-        "system.set-heartbeats: stub response; enabled flag accepted but not acted on"
-    );
+
+    let interval_ms = params
+        .and_then(|v| v.get("intervalMs").or_else(|| v.get("interval")))
+        .and_then(|v| v.as_i64())
+        .map(|v| v.max(0) as u64)
+        .unwrap_or(DEFAULT_HEARTBEAT_INTERVAL_MS);
+
+    let snapshot = state.set_heartbeat_settings(enabled, interval_ms);
+
     Ok(json!({
-        "stub": true,
         "ok": true,
-        "enabled": enabled
+        "enabled": snapshot.enabled,
+        "intervalMs": snapshot.interval_ms
     }))
 }
 
-pub(super) fn handle_wake(params: Option<&Value>) -> Result<Value, ErrorShape> {
-    tracing::debug!("system.wake: stub response");
+pub(super) fn handle_wake(
+    state: &WsServerState,
+    params: Option<&Value>,
+) -> Result<Value, ErrorShape> {
     let target = params
         .and_then(|v| v.get("target"))
-        .and_then(|v| v.as_str());
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let text = match target.as_deref() {
+        Some(t) if !t.is_empty() => format!("wake {}", t),
+        _ => "wake".to_string(),
+    };
+
+    state.enqueue_system_event(SystemEvent {
+        ts: now_ms(),
+        text,
+        host: None,
+        ip: None,
+        device_id: None,
+        instance_id: None,
+        reason: Some("wake".to_string()),
+    });
+
     Ok(json!({
-        "stub": true,
         "ok": true,
         "target": target
+    }))
+}
+
+/// Return system info and runtime metadata.
+pub(super) fn handle_system_info(state: &WsServerState) -> Result<Value, ErrorShape> {
+    let sessions = state
+        .session_store
+        .list_sessions(crate::sessions::SessionFilter::new())
+        .unwrap_or_default();
+    let heartbeat = state.heartbeat_snapshot();
+
+    Ok(json!({
+        "ts": now_ms(),
+        "uptimeMs": state.start_time.elapsed().as_millis() as u64,
+        "version": env!("CARGO_PKG_VERSION"),
+        "runtime": {
+            "name": "carapace",
+            "platform": std::env::consts::OS,
+            "arch": std::env::consts::ARCH
+        },
+        "configPath": config::get_config_path().display().to_string(),
+        "stateDir": resolve_state_dir().display().to_string(),
+        "channels": {
+            "total": state.channel_registry.len(),
+            "connected": state
+                .channel_registry
+                .count_by_status(crate::channels::ChannelStatus::Connected)
+        },
+        "sessions": {
+            "count": sessions.len()
+        },
+        "presenceCount": state.presence.lock().len(),
+        "heartbeat": {
+            "enabled": heartbeat.enabled,
+            "intervalMs": heartbeat.interval_ms,
+            "lastTs": heartbeat.last_heartbeat_ms
+        }
     }))
 }
 

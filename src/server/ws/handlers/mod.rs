@@ -251,10 +251,12 @@ const READ_METHODS: &[&str] = &[
     "usage.session",
     "usage.providers",
     "usage.daily",
+    "usage.monthly",
     "update.status",
     "update.releaseNotes",
     "logs.tail",
     "system-presence",
+    "system.info",
 ];
 
 /// Write methods (requires write or admin role).
@@ -738,6 +740,7 @@ fn dispatch_cron_usage_update(
         "usage.session" => Some(handle_usage_session(params)),
         "usage.providers" => Some(handle_usage_providers()),
         "usage.daily" => Some(handle_usage_daily(params)),
+        "usage.monthly" => Some(handle_usage_monthly(params)),
         "usage.reset" => Some(handle_usage_reset(params)),
         "update.status" => Some(handle_update_status()),
         "update.setChannel" => Some(handle_update_set_channel(params)),
@@ -849,10 +852,11 @@ pub(super) async fn dispatch_method(
         "logs.tail" => handle_logs_tail(params),
 
         // Misc
-        "last-heartbeat" => handle_last_heartbeat(),
-        "set-heartbeats" => handle_set_heartbeats(params),
-        "wake" => handle_wake(params),
+        "last-heartbeat" => handle_last_heartbeat(state),
+        "set-heartbeats" => handle_set_heartbeats(state, params),
+        "wake" => handle_wake(state, params),
         "send" => handle_send(state, params, conn),
+        "system.info" => handle_system_info(state),
         "system-presence" => handle_system_presence(state),
         "system-event" => handle_system_event(params, state, conn),
 

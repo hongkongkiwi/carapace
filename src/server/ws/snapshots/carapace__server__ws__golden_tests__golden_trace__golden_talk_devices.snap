@@ -11,11 +11,6 @@ expression: normalized
         "default": true,
         "id": "default",
         "name": "Default Input"
-      },
-      {
-        "default": false,
-        "id": "built-in-mic",
-        "name": "Built-in Microphone"
       }
     ],
     "outputDevices": [
@@ -23,13 +18,9 @@ expression: normalized
         "default": true,
         "id": "default",
         "name": "Default Output"
-      },
-      {
-        "default": false,
-        "id": "built-in-speakers",
-        "name": "Built-in Speakers"
       }
     ],
-    "stub": true
+    "selectedInput": null,
+    "selectedOutput": null
   }
 }

@@ -19,6 +19,11 @@ pub struct SchemaIssue {
     pub message: String,
 }
 
+/// Return the list of known top-level configuration keys.
+pub fn known_top_level_keys() -> &'static [&'static str] {
+    KNOWN_TOP_LEVEL_KEYS
+}
+
 /// Known top-level configuration keys.
 const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "meta",

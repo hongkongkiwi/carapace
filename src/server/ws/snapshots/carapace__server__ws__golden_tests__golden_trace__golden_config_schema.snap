@@ -7,18 +7,183 @@ expression: normalized
   "ok": true,
   "result": {
     "$schema": "http://json-schema.org/draft-07/schema#",
+    "type": "object",
+    "additionalProperties": false,
     "properties": {
-      "agent": {
+      "meta": {
+        "type": "object"
+      },
+      "env": {
+        "type": "object"
+      },
+      "wizard": {
+        "type": "object"
+      },
+      "diagnostics": {
+        "type": "object"
+      },
+      "logging": {
+        "type": "object"
+      },
+      "update": {
+        "type": "object"
+      },
+      "browser": {
+        "type": "object"
+      },
+      "ui": {
+        "type": "object"
+      },
+      "auth": {
+        "type": "object"
+      },
+      "models": {
+        "type": "object"
+      },
+      "nodeHost": {
+        "type": "object"
+      },
+      "agents": {
+        "type": "object"
+      },
+      "tools": {
+        "type": "object"
+      },
+      "bindings": {
+        "type": "object"
+      },
+      "broadcast": {
+        "type": "object"
+      },
+      "audio": {
+        "type": "object"
+      },
+      "media": {
+        "type": "object"
+      },
+      "messages": {
+        "type": "object"
+      },
+      "commands": {
+        "type": "object"
+      },
+      "approvals": {
+        "type": "object"
+      },
+      "session": {
+        "type": "object"
+      },
+      "cron": {
+        "type": "object"
+      },
+      "hooks": {
+        "type": "object"
+      },
+      "web": {
         "type": "object"
       },
       "channels": {
         "type": "object"
       },
+      "discovery": {
+        "type": "object"
+      },
+      "canvasHost": {
+        "type": "object"
+      },
+      "talk": {
+        "type": "object"
+      },
       "gateway": {
+        "type": "object"
+      },
+      "skills": {
+        "type": "object"
+      },
+      "plugins": {
+        "type": "object"
+      },
+      "anthropic": {
+        "type": "object"
+      },
+      "sessions": {
+        "type": "object"
+      },
+      "openai": {
+        "type": "object"
+      },
+      "google": {
+        "type": "object"
+      },
+      "providers": {
+        "type": "object"
+      },
+      "bedrock": {
+        "type": "object"
+      },
+      "venice": {
+        "type": "object"
+      },
+      "signal": {
+        "type": "object"
+      },
+      "telegram": {
+        "type": "object"
+      },
+      "discord": {
+        "type": "object"
+      },
+      "slack": {
+        "type": "object"
+      },
+      "classifier": {
         "type": "object"
       }
     },
-    "stub": true,
-    "type": "object"
+    "knownKeys": [
+      "meta",
+      "env",
+      "wizard",
+      "diagnostics",
+      "logging",
+      "update",
+      "browser",
+      "ui",
+      "auth",
+      "models",
+      "nodeHost",
+      "agents",
+      "tools",
+      "bindings",
+      "broadcast",
+      "audio",
+      "media",
+      "messages",
+      "commands",
+      "approvals",
+      "session",
+      "cron",
+      "hooks",
+      "web",
+      "channels",
+      "discovery",
+      "canvasHost",
+      "talk",
+      "gateway",
+      "skills",
+      "plugins",
+      "anthropic",
+      "sessions",
+      "openai",
+      "google",
+      "providers",
+      "bedrock",
+      "venice",
+      "signal",
+      "telegram",
+      "discord",
+      "slack",
+      "classifier"
+    ]
   }
 }

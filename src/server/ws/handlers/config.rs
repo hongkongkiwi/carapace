@@ -375,17 +375,18 @@ pub(super) fn handle_config_validate(params: Option<&Value>) -> Result<Value, Er
 }
 
 pub(super) fn handle_config_schema() -> Result<Value, ErrorShape> {
-    tracing::debug!("config.schema: stub response");
-    // Return JSON schema for config
+    let keys = config::schema::known_top_level_keys();
+    let mut properties = serde_json::Map::new();
+    for key in keys {
+        properties.insert(key.to_string(), json!({ "type": "object" }));
+    }
+
     Ok(json!({
-        "stub": true,
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
-        "properties": {
-            "gateway": { "type": "object" },
-            "agent": { "type": "object" },
-            "channels": { "type": "object" }
-        }
+        "additionalProperties": false,
+        "properties": properties,
+        "knownKeys": keys
     }))
 }
 

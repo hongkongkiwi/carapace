@@ -487,9 +487,9 @@ fn record_turn_usage(session_key: &str, model: &str, usage: &TokenUsage) {
     crate::server::ws::record_usage(
         session_key,
         provider_name,
+        model,
         usage.input_tokens,
         usage.output_tokens,
-        estimate_cost(model, usage.input_tokens, usage.output_tokens),
     );
 }
 
@@ -988,18 +988,6 @@ fn sanitize_provider_error(message: &str) -> String {
     } else {
         sanitized
     }
-}
-
-/// Cost estimate per model using the shared pricing table. Returns USD.
-fn estimate_cost(model: &str, input_tokens: u64, output_tokens: u64) -> f64 {
-    use crate::usage::{get_model_pricing, ModelPricing};
-
-    let pricing = get_model_pricing(model).unwrap_or(ModelPricing {
-        // Default to sonnet pricing for unknown models
-        input_cost_per_mtok: 3.0,
-        output_cost_per_mtok: 15.0,
-    });
-    pricing.calculate_cost(input_tokens, output_tokens)
 }
 
 #[cfg(test)]
@@ -1631,29 +1619,6 @@ mod tests {
     fn test_sanitize_empty_string() {
         let result = sanitize_provider_error("");
         assert_eq!(result, "");
-    }
-
-    // ============== estimate_cost Tests ==============
-
-    #[test]
-    fn test_estimate_cost_sonnet() {
-        let cost = estimate_cost("claude-sonnet-4-20250514", 1000, 500);
-        // 1000 * 3/1M + 500 * 15/1M = 0.003 + 0.0075 = 0.0105
-        assert!((cost - 0.0105).abs() < 0.0001);
-    }
-
-    #[test]
-    fn test_estimate_cost_opus() {
-        let cost = estimate_cost("claude-opus-4-20250514", 1000, 500);
-        // 1000 * 15/1M + 500 * 75/1M = 0.015 + 0.0375 = 0.0525
-        assert!((cost - 0.0525).abs() < 0.0001);
-    }
-
-    #[test]
-    fn test_estimate_cost_haiku() {
-        let cost = estimate_cost("claude-haiku-3-20250514", 1000, 500);
-        // 1000 * 0.25/1M + 500 * 1.25/1M = 0.00025 + 0.000625 = 0.000875
-        assert!((cost - 0.000875).abs() < 0.00001);
     }
 
     #[tokio::test]

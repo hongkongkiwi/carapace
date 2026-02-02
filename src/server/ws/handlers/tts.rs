@@ -39,6 +39,9 @@ pub struct TtsState {
     pub volume: f64,
     /// Provider-specific API keys (stored securely in production)
     pub provider_config: ProviderConfig,
+    /// Current speech ID (if a speak call is active)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_speech_id: Option<String>,
 }
 
 impl Default for TtsState {
@@ -51,6 +54,7 @@ impl Default for TtsState {
             pitch: 0.0,
             volume: 1.0,
             provider_config: ProviderConfig::default(),
+            current_speech_id: None,
         }
     }
 }
@@ -445,12 +449,12 @@ pub(super) fn handle_tts_configure(params: Option<&Value>) -> Result<Value, Erro
 
 /// Stop any ongoing TTS playback
 pub(super) fn handle_tts_stop() -> Result<Value, ErrorShape> {
-    tracing::debug!("tts.stop: stub response");
-    // In a real implementation, this would stop audio playback
+    let mut state = TTS_STATE.write();
+    let stopped_id = state.current_speech_id.take();
     Ok(json!({
-        "stub": true,
         "ok": true,
-        "stopped": true
+        "stopped": stopped_id.is_some(),
+        "speechId": stopped_id
     }))
 }
 
@@ -474,6 +478,10 @@ pub(super) async fn handle_tts_speak(params: Option<&Value>) -> Result<Value, Er
 
     // Generate a unique ID for this speech request
     let speech_id = uuid::Uuid::new_v4().to_string();
+    {
+        let mut state = TTS_STATE.write();
+        state.current_speech_id = Some(speech_id.clone());
+    }
 
     // Delegate to the convert pipeline for the actual audio synthesis.
     let mut converted = handle_tts_convert(params).await?;

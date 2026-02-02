@@ -236,23 +236,24 @@ pub(super) fn handle_voicewake_keywords() -> Result<Value, ErrorShape> {
 
 /// Test voicewake detection (for calibration)
 pub(super) fn handle_voicewake_test(params: Option<&Value>) -> Result<Value, ErrorShape> {
-    tracing::debug!("voicewake.test: stub response");
     let audio_data = params
         .and_then(|v| v.get("audioData"))
-        .and_then(|v| v.as_str());
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "audioData is required", None))?;
 
     let state = VOICEWAKE_STATE.read();
 
     // In a real implementation, this would process audio through wake word detection
     // For now, return a simulated result
     Ok(json!({
-        "stub": true,
         "ok": true,
         "detected": false,
         "confidence": 0.0,
         "keyword": state.keyword,
         "threshold": state.threshold,
-        "hasAudioData": audio_data.is_some()
+        "audioBytes": audio_data.len()
     }))
 }
 

@@ -57,6 +57,9 @@ const PROTOCOL_VERSION: u32 = 3;
 const MAX_PAYLOAD_BYTES: usize = 512 * 1024;
 const MAX_BUFFERED_BYTES: usize = (1024 * 1024 * 3) / 2;
 const TICK_INTERVAL_MS: u64 = 30_000;
+const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 30_000;
+const MIN_HEARTBEAT_INTERVAL_MS: u64 = 1_000;
+const MAX_HEARTBEAT_INTERVAL_MS: u64 = 300_000;
 const HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
 const SIGNATURE_SKEW_MS: i64 = 600_000;
 const LOGS_DEFAULT_LIMIT: usize = 500;
@@ -89,7 +92,7 @@ const ALLOWED_CLIENT_IDS: [&str; 12] = [
 const ALLOWED_CLIENT_MODES: [&str; 7] =
     ["webchat", "cli", "ui", "backend", "node", "probe", "test"];
 
-const GATEWAY_METHODS: [&str; 121] = [
+const GATEWAY_METHODS: [&str; 123] = [
     // Health/status
     "health",
     "status",
@@ -221,6 +224,7 @@ const GATEWAY_METHODS: [&str; 121] = [
     "usage.session",
     "usage.providers",
     "usage.daily",
+    "usage.monthly",
     "usage.reset",
     // Misc
     "last-heartbeat",
@@ -229,6 +233,7 @@ const GATEWAY_METHODS: [&str; 121] = [
     "send",
     "system-presence",
     "system-event",
+    "system.info",
 ];
 
 const GATEWAY_EVENTS: [&str; 20] = [
@@ -375,6 +380,13 @@ pub struct HealthSnapshot {
     pub agent: Option<Value>,
 }
 
+#[derive(Debug, Clone)]
+struct HeartbeatState {
+    enabled: bool,
+    interval_ms: u64,
+    last_heartbeat_ms: Option<u64>,
+}
+
 /// System event entry for history
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -440,6 +452,8 @@ pub struct WsServerState {
     health_cache: Mutex<HealthSnapshot>,
     /// Tracks state versions for presence and health
     state_versions: Mutex<StateVersionTracker>,
+    /// Heartbeat configuration and last event timestamp
+    heartbeat_state: Mutex<HeartbeatState>,
     /// Exec approval manager
     exec_manager: exec::ExecApprovalManager,
     /// Cron job scheduler
@@ -509,6 +523,11 @@ impl WsServerState {
                 agent: None,
             }),
             state_versions: Mutex::new(StateVersionTracker::default()),
+            heartbeat_state: Mutex::new(HeartbeatState {
+                enabled: false,
+                interval_ms: DEFAULT_HEARTBEAT_INTERVAL_MS,
+                last_heartbeat_ms: None,
+            }),
             exec_manager: exec::ExecApprovalManager::new(),
             cron_scheduler: cron::CronScheduler::in_memory(),
             agent_run_registry: Mutex::new(handlers::AgentRunRegistry::new()),
@@ -554,6 +573,11 @@ impl WsServerState {
                 agent: None,
             }),
             state_versions: Mutex::new(StateVersionTracker::default()),
+            heartbeat_state: Mutex::new(HeartbeatState {
+                enabled: false,
+                interval_ms: DEFAULT_HEARTBEAT_INTERVAL_MS,
+                last_heartbeat_ms: None,
+            }),
             exec_manager: exec::ExecApprovalManager::new(),
             cron_scheduler: {
                 let scheduler =
@@ -831,6 +855,27 @@ impl WsServerState {
         self.health_cache.lock().clone()
     }
 
+    /// Get a snapshot of heartbeat state.
+    fn heartbeat_snapshot(&self) -> HeartbeatState {
+        self.heartbeat_state.lock().clone()
+    }
+
+    /// Update heartbeat settings.
+    fn set_heartbeat_settings(&self, enabled: bool, interval_ms: u64) -> HeartbeatState {
+        let mut state = self.heartbeat_state.lock();
+        state.enabled = enabled;
+        state.interval_ms = interval_ms.clamp(MIN_HEARTBEAT_INTERVAL_MS, MAX_HEARTBEAT_INTERVAL_MS);
+        state.clone()
+    }
+
+    /// Record a heartbeat event and return the timestamp.
+    fn record_heartbeat(&self) -> u64 {
+        let mut state = self.heartbeat_state.lock();
+        let ts = now_ms();
+        state.last_heartbeat_ms = Some(ts);
+        ts
+    }
+
     /// Update health snapshot and broadcast if changed
     pub fn update_health(&self, status: &str, channels: Option<Value>, agent: Option<Value>) {
         let new_snapshot = HealthSnapshot {
@@ -982,7 +1027,9 @@ pub async fn build_ws_state_from_config() -> Result<Arc<WsServerState>, WsConfig
         }
     }
 
-    Ok(Arc::new(state))
+    let state = Arc::new(state);
+    spawn_heartbeat_task(state.clone());
+    Ok(state)
 }
 
 pub async fn build_ws_config_from_files() -> Result<WsServerConfig, WsConfigError> {
@@ -1757,6 +1804,23 @@ fn spawn_tick_task(
             };
             if send_json(&tick_tx, &event).is_err() {
                 break;
+            }
+        }
+    })
+}
+
+fn spawn_heartbeat_task(state: Arc<WsServerState>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let snapshot = state.heartbeat_snapshot();
+            if !snapshot.enabled {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+            let interval_ms = snapshot.interval_ms.max(MIN_HEARTBEAT_INTERVAL_MS);
+            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+            if state.heartbeat_snapshot().enabled {
+                broadcast_heartbeat(&state);
             }
         }
     })
@@ -3135,8 +3199,9 @@ pub fn broadcast_shutdown(state: &WsServerState, reason: &str, restart_expected_
 /// # Arguments
 /// * `state` - Server state
 pub fn broadcast_heartbeat(state: &WsServerState) {
+    let ts = state.record_heartbeat();
     let payload = json!({
-        "ts": now_ms()
+        "ts": ts
     });
     broadcast_event(state, "heartbeat", payload);
 }

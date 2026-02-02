@@ -2,123 +2,137 @@
 //!
 //! Manages usage statistics, cost tracking, and quota monitoring.
 
-use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::LazyLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::super::*;
+use crate::usage;
+use crate::usage::{DailyCost, DailySummary, ModelUsage, MonthlySummary, ProviderUsage};
 
-/// Global usage state
-static USAGE_STATE: LazyLock<RwLock<UsageState>> =
-    LazyLock::new(|| RwLock::new(UsageState::default()));
-
-/// Usage tracking state
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct UsageState {
-    /// Whether usage tracking is enabled
-    pub enabled: bool,
-    /// Per-session usage data
-    pub sessions: HashMap<String, SessionUsage>,
-    /// Per-provider usage data
-    pub providers: HashMap<String, ProviderUsage>,
-    /// Daily usage summaries
-    pub daily_summaries: Vec<DailySummary>,
+fn provider_usage_to_value(usage: &ProviderUsage) -> Value {
+    json!({
+        "provider": usage.provider,
+        "inputTokens": usage.input_tokens,
+        "outputTokens": usage.output_tokens,
+        "totalTokens": usage.input_tokens + usage.output_tokens,
+        "requests": usage.requests,
+        "cost": usage.cost_usd
+    })
 }
 
-/// Usage data for a session
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SessionUsage {
-    /// Session key
-    pub session_key: String,
-    /// Input tokens consumed
-    pub input_tokens: u64,
-    /// Output tokens generated
-    pub output_tokens: u64,
-    /// Number of requests
-    pub requests: u64,
-    /// Estimated cost in USD
-    pub cost_usd: f64,
-    /// First usage timestamp (ms)
-    pub first_used_at: u64,
-    /// Last usage timestamp (ms)
-    pub last_used_at: u64,
+fn model_usage_to_value(usage: &ModelUsage) -> Value {
+    json!({
+        "provider": usage.provider,
+        "model": usage.model,
+        "inputTokens": usage.input_tokens,
+        "outputTokens": usage.output_tokens,
+        "totalTokens": usage.input_tokens + usage.output_tokens,
+        "requests": usage.requests,
+        "cost": usage.cost_usd
+    })
 }
 
-/// Usage data for a provider
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ProviderUsage {
-    /// Provider ID
-    pub provider: String,
-    /// Input tokens consumed
-    pub input_tokens: u64,
-    /// Output tokens generated
-    pub output_tokens: u64,
-    /// Number of requests
-    pub requests: u64,
-    /// Estimated cost in USD
-    pub cost_usd: f64,
+fn daily_cost_to_value(cost: &DailyCost) -> Value {
+    json!({
+        "date": cost.date,
+        "cost": cost.cost_usd,
+        "requests": cost.requests
+    })
 }
 
-/// Daily usage summary
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DailySummary {
-    /// Date (YYYY-MM-DD)
-    pub date: String,
-    /// Input tokens consumed
-    pub input_tokens: u64,
-    /// Output tokens generated
-    pub output_tokens: u64,
-    /// Number of requests
-    pub requests: u64,
-    /// Estimated cost in USD
-    pub cost_usd: f64,
+fn map_provider_breakdown(map: &HashMap<String, ProviderUsage>) -> Vec<Value> {
+    let mut providers: Vec<&ProviderUsage> = map.values().collect();
+    providers.sort_by(|a, b| a.provider.cmp(&b.provider));
+    providers.into_iter().map(provider_usage_to_value).collect()
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::from_secs(0))
-        .as_millis() as u64
+fn map_model_breakdown(map: &HashMap<String, ModelUsage>) -> Vec<Value> {
+    let mut models: Vec<&ModelUsage> = map.values().collect();
+    models.sort_by(|a, b| a.model.cmp(&b.model));
+    models.into_iter().map(model_usage_to_value).collect()
+}
+
+fn daily_summary_to_value(summary: &DailySummary) -> Value {
+    json!({
+        "date": summary.date,
+        "inputTokens": summary.input_tokens,
+        "outputTokens": summary.output_tokens,
+        "totalTokens": summary.input_tokens + summary.output_tokens,
+        "requests": summary.requests,
+        "cost": summary.cost_usd,
+        "byProvider": map_provider_breakdown(&summary.by_provider),
+        "byModel": map_model_breakdown(&summary.by_model)
+    })
+}
+
+fn monthly_summary_to_value(summary: &MonthlySummary) -> Value {
+    json!({
+        "month": summary.month,
+        "inputTokens": summary.input_tokens,
+        "outputTokens": summary.output_tokens,
+        "totalTokens": summary.input_tokens + summary.output_tokens,
+        "requests": summary.requests,
+        "cost": summary.cost_usd,
+        "byProvider": map_provider_breakdown(&summary.by_provider),
+        "byModel": map_model_breakdown(&summary.by_model)
+    })
+}
+
+fn totals_from_providers(providers: &[ProviderUsage]) -> (u64, u64, u64, f64) {
+    let mut input_tokens = 0;
+    let mut output_tokens = 0;
+    let mut requests = 0;
+    let mut cost_usd = 0.0;
+
+    for usage in providers {
+        input_tokens += usage.input_tokens;
+        output_tokens += usage.output_tokens;
+        requests += usage.requests;
+        cost_usd += usage.cost_usd;
+    }
+
+    (input_tokens, output_tokens, requests, cost_usd)
+}
+
+fn provider_daily_costs(provider: &str, summaries: &[DailySummary]) -> Vec<DailyCost> {
+    let mut daily = Vec::new();
+    for summary in summaries {
+        if let Some(usage) = summary.by_provider.get(provider) {
+            daily.push(DailyCost {
+                date: summary.date.clone(),
+                cost_usd: usage.cost_usd,
+                requests: usage.requests,
+            });
+        }
+    }
+    daily.sort_by(|a, b| a.date.cmp(&b.date));
+    daily
 }
 
 /// Get usage status
 pub(super) fn handle_usage_status() -> Result<Value, ErrorShape> {
-    let state = USAGE_STATE.read();
-
-    let total_input: u64 = state.sessions.values().map(|s| s.input_tokens).sum();
-    let total_output: u64 = state.sessions.values().map(|s| s.output_tokens).sum();
-    let total_requests: u64 = state.sessions.values().map(|s| s.requests).sum();
-    let total_cost: f64 = state.sessions.values().map(|s| s.cost_usd).sum();
-
-    // Also check config for tracking setting
-    let tracking = config::load_config()
-        .ok()
-        .and_then(|cfg| cfg.get("usage")?.get("enabled")?.as_bool())
-        .unwrap_or(true);
+    let status = usage::get_status();
+    let providers = usage::get_providers();
+    let (input_tokens, output_tokens, requests, total_cost) = totals_from_providers(&providers);
 
     Ok(json!({
-        "enabled": state.enabled || tracking,
-        "tracking": tracking,
+        "enabled": status.enabled,
+        "tracking": status.enabled,
         "summary": {
-            "inputTokens": total_input,
-            "outputTokens": total_output,
-            "totalTokens": total_input + total_output,
-            "requests": total_requests,
+            "inputTokens": input_tokens,
+            "outputTokens": output_tokens,
+            "totalTokens": input_tokens + output_tokens,
+            "requests": requests,
             "totalCost": total_cost
         },
-        "sessionCount": state.sessions.len(),
-        "providerCount": state.providers.len()
+        "sessionCount": status.session_count,
+        "providerCount": providers.len()
     }))
 }
 
 /// Enable usage tracking
 pub(super) fn handle_usage_enable() -> Result<Value, ErrorShape> {
-    let mut state = USAGE_STATE.write();
-    state.enabled = true;
-
+    usage::enable_tracking();
     Ok(json!({
         "ok": true,
         "enabled": true
@@ -127,9 +141,7 @@ pub(super) fn handle_usage_enable() -> Result<Value, ErrorShape> {
 
 /// Disable usage tracking
 pub(super) fn handle_usage_disable() -> Result<Value, ErrorShape> {
-    let mut state = USAGE_STATE.write();
-    state.enabled = false;
-
+    usage::disable_tracking();
     Ok(json!({
         "ok": true,
         "enabled": false
@@ -155,40 +167,85 @@ pub(super) fn handle_usage_cost(params: Option<&Value>) -> Result<Value, ErrorSh
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let state = USAGE_STATE.read();
+    let cutoff = now_ms().saturating_sub(days as u64 * 24 * 60 * 60 * 1000);
 
-    let now = now_ms();
-    let cutoff = now - (days as u64 * 24 * 60 * 60 * 1000);
-
-    // Filter sessions based on criteria
-    let filtered: Vec<&SessionUsage> = state
-        .sessions
-        .values()
-        .filter(|s| {
-            if let Some(ref key) = session_key {
-                if &s.session_key != key {
-                    return false;
-                }
+    if let Some(ref session_key) = session_key {
+        let usage = usage::get_session_usage(session_key);
+        let (input_tokens, output_tokens, requests, total_cost, session_count) = match usage {
+            Some(u) if u.last_used_at >= cutoff => {
+                (u.input_tokens, u.output_tokens, u.requests, u.cost_usd, 1)
             }
-            s.last_used_at >= cutoff
-        })
-        .collect();
+            _ => (0, 0, 0, 0.0, 0),
+        };
 
-    let input_tokens: u64 = filtered.iter().map(|s| s.input_tokens).sum();
-    let output_tokens: u64 = filtered.iter().map(|s| s.output_tokens).sum();
-    let requests: u64 = filtered.iter().map(|s| s.requests).sum();
-    let total_cost: f64 = filtered.iter().map(|s| s.cost_usd).sum();
+        return Ok(json!({
+            "days": days,
+            "sessionKey": session_key,
+            "provider": provider,
+            "inputTokens": input_tokens,
+            "outputTokens": output_tokens,
+            "totalTokens": input_tokens + output_tokens,
+            "requests": requests,
+            "totalCost": total_cost,
+            "sessionCount": session_count,
+            "byProvider": [],
+            "byModel": [],
+            "daily": []
+        }));
+    }
+
+    let breakdown = usage::get_cost_breakdown(days as u64);
+    let mut by_provider = breakdown.by_provider;
+    let mut by_model = breakdown.by_model;
+    let mut daily = breakdown.daily;
+
+    if let Some(ref provider) = provider {
+        by_provider.retain(|entry| entry.provider == *provider);
+        by_model.retain(|entry| entry.provider == *provider);
+        let (input_tokens, output_tokens, requests, total_cost) =
+            totals_from_providers(&by_provider);
+        let summaries = usage::get_daily_summaries(days as usize);
+        daily = provider_daily_costs(provider, &summaries);
+
+        let session_count = usage::get_sessions()
+            .into_iter()
+            .filter(|session| session.last_used_at >= cutoff)
+            .count();
+
+        return Ok(json!({
+            "days": days,
+            "sessionKey": session_key,
+            "provider": provider,
+            "inputTokens": input_tokens,
+            "outputTokens": output_tokens,
+            "totalTokens": input_tokens + output_tokens,
+            "requests": requests,
+            "totalCost": total_cost,
+            "sessionCount": session_count,
+            "byProvider": by_provider.iter().map(provider_usage_to_value).collect::<Vec<_>>(),
+            "byModel": by_model.iter().map(model_usage_to_value).collect::<Vec<_>>(),
+            "daily": daily.iter().map(daily_cost_to_value).collect::<Vec<_>>()
+        }));
+    }
+
+    let session_count = usage::get_sessions()
+        .into_iter()
+        .filter(|session| session.last_used_at >= cutoff)
+        .count();
 
     Ok(json!({
         "days": days,
         "sessionKey": session_key,
         "provider": provider,
-        "inputTokens": input_tokens,
-        "outputTokens": output_tokens,
-        "totalTokens": input_tokens + output_tokens,
-        "requests": requests,
-        "totalCost": total_cost,
-        "sessionCount": filtered.len()
+        "inputTokens": breakdown.total_input_tokens,
+        "outputTokens": breakdown.total_output_tokens,
+        "totalTokens": breakdown.total_input_tokens + breakdown.total_output_tokens,
+        "requests": breakdown.total_requests,
+        "totalCost": breakdown.total_cost,
+        "sessionCount": session_count,
+        "byProvider": by_provider.iter().map(provider_usage_to_value).collect::<Vec<_>>(),
+        "byModel": by_model.iter().map(model_usage_to_value).collect::<Vec<_>>(),
+        "daily": daily.iter().map(daily_cost_to_value).collect::<Vec<_>>()
     }))
 }
 
@@ -199,9 +256,7 @@ pub(super) fn handle_usage_session(params: Option<&Value>) -> Result<Value, Erro
         .and_then(|v| v.as_str())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "sessionKey is required", None))?;
 
-    let state = USAGE_STATE.read();
-
-    match state.sessions.get(session_key) {
+    match usage::get_session_usage(session_key) {
         Some(usage) => Ok(json!({
             "sessionKey": usage.session_key,
             "inputTokens": usage.input_tokens,
@@ -227,25 +282,9 @@ pub(super) fn handle_usage_session(params: Option<&Value>) -> Result<Value, Erro
 
 /// Get usage by provider
 pub(super) fn handle_usage_providers() -> Result<Value, ErrorShape> {
-    let state = USAGE_STATE.read();
-
-    let providers: Vec<Value> = state
-        .providers
-        .values()
-        .map(|p| {
-            json!({
-                "provider": p.provider,
-                "inputTokens": p.input_tokens,
-                "outputTokens": p.output_tokens,
-                "totalTokens": p.input_tokens + p.output_tokens,
-                "requests": p.requests,
-                "cost": p.cost_usd
-            })
-        })
-        .collect();
-
+    let providers = usage::get_providers();
     Ok(json!({
-        "providers": providers
+        "providers": providers.iter().map(provider_usage_to_value).collect::<Vec<_>>()
     }))
 }
 
@@ -257,29 +296,27 @@ pub(super) fn handle_usage_daily(params: Option<&Value>) -> Result<Value, ErrorS
         .unwrap_or(30)
         .clamp(1, 365) as usize;
 
-    let state = USAGE_STATE.read();
-
-    // Return last N days of summaries
-    let summaries: Vec<Value> = state
-        .daily_summaries
-        .iter()
-        .rev()
-        .take(days)
-        .map(|s| {
-            json!({
-                "date": s.date,
-                "inputTokens": s.input_tokens,
-                "outputTokens": s.output_tokens,
-                "totalTokens": s.input_tokens + s.output_tokens,
-                "requests": s.requests,
-                "cost": s.cost_usd
-            })
-        })
-        .collect();
+    let summaries = usage::get_daily_summaries(days);
 
     Ok(json!({
         "days": days,
-        "summaries": summaries
+        "summaries": summaries.iter().map(daily_summary_to_value).collect::<Vec<_>>()
+    }))
+}
+
+/// Get monthly usage summaries
+pub(super) fn handle_usage_monthly(params: Option<&Value>) -> Result<Value, ErrorShape> {
+    let months = params
+        .and_then(|v| v.get("months"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(12)
+        .clamp(1, 120) as usize;
+
+    let summaries = usage::get_monthly_summaries(months);
+
+    Ok(json!({
+        "months": months,
+        "summaries": summaries.iter().map(monthly_summary_to_value).collect::<Vec<_>>()
     }))
 }
 
@@ -291,30 +328,23 @@ pub(super) fn handle_usage_reset(params: Option<&Value>) -> Result<Value, ErrorS
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    let mut state = USAGE_STATE.write();
-
     if let Some(key) = session_key {
-        // Reset specific session
-        if state.sessions.remove(&key).is_some() {
+        if usage::reset_session(&key) {
             return Ok(json!({
                 "ok": true,
                 "reset": "session",
                 "sessionKey": key
             }));
-        } else {
-            return Ok(json!({
-                "ok": true,
-                "reset": "none",
-                "reason": "session not found"
-            }));
         }
+        return Ok(json!({
+            "ok": true,
+            "reset": "none",
+            "reason": "session not found"
+        }));
     }
 
-    // Reset all usage
-    let session_count = state.sessions.len();
-    state.sessions.clear();
-    state.providers.clear();
-    state.daily_summaries.clear();
+    let session_count = usage::get_sessions().len();
+    usage::reset_all();
 
     Ok(json!({
         "ok": true,
@@ -323,60 +353,21 @@ pub(super) fn handle_usage_reset(params: Option<&Value>) -> Result<Value, ErrorS
     }))
 }
 
-/// Record usage (internal helper, would be called by agent execution)
+/// Record usage (internal helper, called by agent execution)
 pub fn record_usage(
     session_key: &str,
     provider: &str,
+    model: &str,
     input_tokens: u64,
     output_tokens: u64,
-    cost: f64,
 ) {
-    let mut state = USAGE_STATE.write();
-
-    // Sync enabled state from config if still at default (false).
-    // This ensures record_usage doesn't silently drop data when
-    // config says tracking is enabled but in-memory state wasn't initialized.
-    if !state.enabled {
-        let config_enabled = config::load_config()
-            .ok()
-            .and_then(|cfg| cfg.get("usage")?.get("enabled")?.as_bool())
-            .unwrap_or(true);
-        if config_enabled {
-            state.enabled = true;
-        } else {
-            return;
-        }
-    }
-
-    let now = now_ms();
-
-    // Update session usage
-    let session = state
-        .sessions
-        .entry(session_key.to_string())
-        .or_insert_with(|| SessionUsage {
-            session_key: session_key.to_string(),
-            first_used_at: now,
-            ..Default::default()
-        });
-    session.input_tokens += input_tokens;
-    session.output_tokens += output_tokens;
-    session.requests += 1;
-    session.cost_usd += cost;
-    session.last_used_at = now;
-
-    // Update provider usage
-    let provider_usage = state
-        .providers
-        .entry(provider.to_string())
-        .or_insert_with(|| ProviderUsage {
-            provider: provider.to_string(),
-            ..Default::default()
-        });
-    provider_usage.input_tokens += input_tokens;
-    provider_usage.output_tokens += output_tokens;
-    provider_usage.requests += 1;
-    provider_usage.cost_usd += cost;
+    usage::record_usage(
+        provider,
+        model,
+        Some(session_key),
+        input_tokens,
+        output_tokens,
+    );
 }
 
 #[cfg(test)]
@@ -388,9 +379,10 @@ mod tests {
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn reset_state() {
-        let mut state = USAGE_STATE.write();
-        *state = UsageState::default();
-        state.enabled = true;
+        let path =
+            std::env::temp_dir().join(format!("usage_ws_test_{}.json", uuid::Uuid::new_v4()));
+        usage::reset_global_for_tests(path);
+        usage::enable_tracking();
     }
 
     #[test]
@@ -428,7 +420,13 @@ mod tests {
     fn test_record_usage() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
-        record_usage("test-session", "anthropic", 100, 50, 0.01);
+        record_usage(
+            "test-session",
+            "anthropic",
+            "claude-sonnet-4-20250514",
+            100,
+            50,
+        );
 
         let result = handle_usage_status().unwrap();
         assert_eq!(result["summary"]["inputTokens"], 100);
@@ -440,7 +438,13 @@ mod tests {
     fn test_usage_session() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
-        record_usage("test-session", "anthropic", 100, 50, 0.01);
+        record_usage(
+            "test-session",
+            "anthropic",
+            "claude-sonnet-4-20250514",
+            100,
+            50,
+        );
 
         let params = json!({ "sessionKey": "test-session" });
         let result = handle_usage_session(Some(&params)).unwrap();
@@ -453,8 +457,8 @@ mod tests {
     fn test_usage_providers() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
-        record_usage("session1", "anthropic", 100, 50, 0.01);
-        record_usage("session2", "openai", 200, 100, 0.02);
+        record_usage("session1", "anthropic", "claude-sonnet-4-20250514", 100, 50);
+        record_usage("session2", "openai", "gpt-4o", 200, 100);
 
         let result = handle_usage_providers().unwrap();
         let providers = result["providers"].as_array().unwrap();
@@ -465,7 +469,13 @@ mod tests {
     fn test_usage_reset() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
-        record_usage("test-session", "anthropic", 100, 50, 0.01);
+        record_usage(
+            "test-session",
+            "anthropic",
+            "claude-sonnet-4-20250514",
+            100,
+            50,
+        );
 
         // Reset all
         let result = handle_usage_reset(None).unwrap();
@@ -480,8 +490,8 @@ mod tests {
     fn test_usage_reset_session() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
-        record_usage("session1", "anthropic", 100, 50, 0.01);
-        record_usage("session2", "anthropic", 100, 50, 0.01);
+        record_usage("session1", "anthropic", "claude-sonnet-4-20250514", 100, 50);
+        record_usage("session2", "anthropic", "claude-sonnet-4-20250514", 100, 50);
 
         let params = json!({ "sessionKey": "session1" });
         let result = handle_usage_reset(Some(&params)).unwrap();

@@ -134,6 +134,13 @@ pub fn get_model_pricing(model: &str) -> Option<ModelPricing> {
     None
 }
 
+fn default_pricing() -> ModelPricing {
+    ModelPricing {
+        input_cost_per_mtok: 3.0,
+        output_cost_per_mtok: 15.0,
+    }
+}
+
 /// Get current timestamp in milliseconds
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -550,9 +557,8 @@ impl UsageTracker {
         let month = current_month();
 
         // Calculate cost
-        let cost = get_model_pricing(model)
-            .map(|p| p.calculate_cost(input_tokens, output_tokens))
-            .unwrap_or(0.0);
+        let pricing = get_model_pricing(model).unwrap_or_else(default_pricing);
+        let cost = pricing.calculate_cost(input_tokens, output_tokens);
 
         let record = UsageRecord {
             timestamp: now,
@@ -710,6 +716,11 @@ impl UsageTracker {
         self.data.sessions.get(session_key)
     }
 
+    /// Get all session usage entries
+    pub fn get_sessions(&self) -> Vec<SessionUsage> {
+        self.data.sessions.values().cloned().collect()
+    }
+
     /// Get all providers with usage
     pub fn get_providers(&self) -> Vec<ProviderUsage> {
         let mut providers: HashMap<String, ProviderUsage> = HashMap::new();
@@ -737,6 +748,14 @@ impl UsageTracker {
         let mut summaries: Vec<DailySummary> = self.data.daily.values().cloned().collect();
         summaries.sort_by(|a, b| b.date.cmp(&a.date));
         summaries.truncate(days);
+        summaries
+    }
+
+    /// Get monthly summaries for the last N months
+    pub fn get_monthly_summaries(&self, months: usize) -> Vec<MonthlySummary> {
+        let mut summaries: Vec<MonthlySummary> = self.data.monthly.values().cloned().collect();
+        summaries.sort_by(|a, b| b.month.cmp(&a.month));
+        summaries.truncate(months);
         summaries
     }
 
@@ -893,6 +912,12 @@ pub fn get_session_usage(session_key: &str) -> Option<SessionUsage> {
     tracker.get_session_usage(session_key).cloned()
 }
 
+/// Get all session usage entries (global tracker)
+pub fn get_sessions() -> Vec<SessionUsage> {
+    let tracker = USAGE_TRACKER.read();
+    tracker.get_sessions()
+}
+
 /// Get all providers (global tracker)
 pub fn get_providers() -> Vec<ProviderUsage> {
     let tracker = USAGE_TRACKER.read();
@@ -903,6 +928,12 @@ pub fn get_providers() -> Vec<ProviderUsage> {
 pub fn get_daily_summaries(days: usize) -> Vec<DailySummary> {
     let tracker = USAGE_TRACKER.read();
     tracker.get_daily_summaries(days)
+}
+
+/// Get monthly summaries (global tracker)
+pub fn get_monthly_summaries(months: usize) -> Vec<MonthlySummary> {
+    let tracker = USAGE_TRACKER.read();
+    tracker.get_monthly_summaries(months)
 }
 
 /// Reset all usage data (global tracker)
@@ -918,6 +949,12 @@ pub fn reset_session(session_key: &str) -> bool {
     let result = tracker.reset_session(session_key);
     let _ = tracker.save();
     result
+}
+
+#[cfg(test)]
+pub fn reset_global_for_tests(path: PathBuf) {
+    let mut tracker = USAGE_TRACKER.write();
+    *tracker = UsageTracker::new(path);
 }
 
 // ============== Tests ==============
