@@ -37,6 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stalling the async runtime during filesystem operations.
 - **Credential backends:** keychain/keyring operations run on blocking threads
   to avoid stalling the async runtime during credential reads/writes.
+- **Usage tracking:** old daily/monthly/session usage entries are pruned with
+  retention windows and size caps to keep usage.json bounded.
 
 ## [0.1.0] - Unreleased
 

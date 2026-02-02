@@ -29,6 +29,33 @@ static USAGE_TRACKER: LazyLock<RwLock<UsageTracker>> = LazyLock::new(|| {
     RwLock::new(tracker)
 });
 
+const DAY_MS: u64 = 86_400_000;
+const USAGE_DAILY_RETENTION_DAYS: u64 = 365;
+const USAGE_MONTHLY_RETENTION_MONTHS: u64 = 24;
+const USAGE_SESSION_RETENTION_DAYS: u64 = 90;
+const USAGE_MAX_DAILY_ENTRIES: usize = 400;
+const USAGE_MAX_MONTHLY_ENTRIES: usize = 36;
+const USAGE_MAX_SESSIONS: usize = 1000;
+
+#[derive(Clone, Copy)]
+struct UsageRetention {
+    daily_retention_days: u64,
+    monthly_retention_months: u64,
+    session_retention_days: u64,
+    max_daily_entries: usize,
+    max_monthly_entries: usize,
+    max_sessions: usize,
+}
+
+const DEFAULT_USAGE_RETENTION: UsageRetention = UsageRetention {
+    daily_retention_days: USAGE_DAILY_RETENTION_DAYS,
+    monthly_retention_months: USAGE_MONTHLY_RETENTION_MONTHS,
+    session_retention_days: USAGE_SESSION_RETENTION_DAYS,
+    max_daily_entries: USAGE_MAX_DAILY_ENTRIES,
+    max_monthly_entries: USAGE_MAX_MONTHLY_ENTRIES,
+    max_sessions: USAGE_MAX_SESSIONS,
+};
+
 /// Model pricing information (cost per million tokens)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelPricing {
@@ -490,13 +517,17 @@ impl UsageTracker {
                     let reader = BufReader::new(file);
                     match serde_json::from_reader(reader) {
                         Ok(data) => {
-                            return Self {
+                            let mut tracker = Self {
                                 path,
                                 data,
                                 dirty: false,
                                 last_save: None,
                                 save_interval: Duration::from_secs(5),
+                            };
+                            if tracker.prune_data() {
+                                let _ = tracker.save();
                             }
+                            return tracker;
                         }
                         Err(e) => {
                             tracing::warn!("Failed to parse usage data: {}", e);
@@ -629,6 +660,95 @@ impl UsageTracker {
 
         self.data.last_updated = now;
         self.dirty = true;
+        self.prune_data();
+    }
+
+    fn prune_data(&mut self) -> bool {
+        self.prune_data_with_limits(&DEFAULT_USAGE_RETENTION)
+    }
+
+    fn prune_data_with_limits(&mut self, limits: &UsageRetention) -> bool {
+        let mut pruned = false;
+        let now = now_ms();
+
+        if limits.daily_retention_days > 0 {
+            let cutoff = now.saturating_sub(limits.daily_retention_days.saturating_mul(DAY_MS));
+            let before = self.data.daily.len();
+            self.data
+                .daily
+                .retain(|date, _| date_within_range(date, cutoff));
+            if self.data.daily.len() != before {
+                pruned = true;
+            }
+        }
+
+        if limits.max_daily_entries > 0 && self.data.daily.len() > limits.max_daily_entries {
+            let mut keys: Vec<String> = self.data.daily.keys().cloned().collect();
+            keys.sort();
+            let remove_count = self.data.daily.len() - limits.max_daily_entries;
+            for key in keys.into_iter().take(remove_count) {
+                self.data.daily.remove(&key);
+            }
+            pruned = true;
+        }
+
+        if limits.monthly_retention_months > 0 {
+            if let Some((year, month)) = parse_month(&current_month()) {
+                let current_index = month_to_index(year, month);
+                let cutoff = current_index - limits.monthly_retention_months as i64 + 1;
+                let before = self.data.monthly.len();
+                self.data.monthly.retain(|month_key, _| {
+                    parse_month(month_key)
+                        .map(|(y, m)| month_to_index(y, m) >= cutoff)
+                        .unwrap_or(false)
+                });
+                if self.data.monthly.len() != before {
+                    pruned = true;
+                }
+            }
+        }
+
+        if limits.max_monthly_entries > 0 && self.data.monthly.len() > limits.max_monthly_entries {
+            let mut keys: Vec<String> = self.data.monthly.keys().cloned().collect();
+            keys.sort();
+            let remove_count = self.data.monthly.len() - limits.max_monthly_entries;
+            for key in keys.into_iter().take(remove_count) {
+                self.data.monthly.remove(&key);
+            }
+            pruned = true;
+        }
+
+        if limits.session_retention_days > 0 {
+            let cutoff = now.saturating_sub(limits.session_retention_days.saturating_mul(DAY_MS));
+            let before = self.data.sessions.len();
+            self.data
+                .sessions
+                .retain(|_, usage| usage.last_used_at >= cutoff);
+            if self.data.sessions.len() != before {
+                pruned = true;
+            }
+        }
+
+        if limits.max_sessions > 0 && self.data.sessions.len() > limits.max_sessions {
+            let mut sessions: Vec<(String, u64)> = self
+                .data
+                .sessions
+                .iter()
+                .map(|(key, usage)| (key.clone(), usage.last_used_at))
+                .collect();
+            sessions.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            let remove_count = self.data.sessions.len() - limits.max_sessions;
+            for (key, _) in sessions.into_iter().take(remove_count) {
+                self.data.sessions.remove(&key);
+            }
+            pruned = true;
+        }
+
+        if pruned {
+            self.dirty = true;
+        }
+
+        pruned
     }
 
     /// Get current period status
@@ -665,7 +785,7 @@ impl UsageTracker {
         for (date, summary) in &self.data.daily {
             // Parse date to check if it's within range
             // Simple check: compare string dates (works for YYYY-MM-DD format)
-            if self.date_within_range(date, cutoff_ms) {
+            if date_within_range(date, cutoff_ms) {
                 total_input_tokens += summary.input_tokens;
                 total_output_tokens += summary.output_tokens;
                 total_requests += summary.requests;
@@ -722,16 +842,6 @@ impl UsageTracker {
             by_model: by_model.into_values().collect(),
             daily: daily_costs,
         }
-    }
-
-    /// Check if a date string is within the range
-    fn date_within_range(&self, date_str: &str, cutoff_ms: u64) -> bool {
-        // Parse YYYY-MM-DD and convert to approximate ms timestamp
-        if let Some((year, month, day)) = parse_date(date_str) {
-            let date_ms = date_to_ms(year, month, day);
-            return date_ms >= cutoff_ms;
-        }
-        false
     }
 
     /// Get session usage
@@ -812,6 +922,32 @@ fn parse_date(date_str: &str) -> Option<(u64, u64, u64)> {
     let month = parts[1].parse().ok()?;
     let day = parts[2].parse().ok()?;
     Some((year, month, day))
+}
+
+fn date_within_range(date_str: &str, cutoff_ms: u64) -> bool {
+    // Parse YYYY-MM-DD and convert to approximate ms timestamp.
+    if let Some((year, month, day)) = parse_date(date_str) {
+        let date_ms = date_to_ms(year, month, day);
+        return date_ms >= cutoff_ms;
+    }
+    false
+}
+
+fn parse_month(month_str: &str) -> Option<(i64, i64)> {
+    let parts: Vec<&str> = month_str.split('-').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let year: i64 = parts[0].parse().ok()?;
+    let month: i64 = parts[1].parse().ok()?;
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    Some((year, month))
+}
+
+fn month_to_index(year: i64, month: i64) -> i64 {
+    year.saturating_mul(12).saturating_add(month - 1)
 }
 
 fn date_to_ms(year: u64, month: u64, day: u64) -> u64 {
@@ -1218,6 +1354,126 @@ mod tests {
 
         // Clean up
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_usage_prune_by_retention() {
+        let mut tracker = create_test_tracker();
+        let today = today_date();
+        let month = current_month();
+
+        tracker.data.daily.insert(
+            "1999-01-01".to_string(),
+            DailySummary::new("1999-01-01".to_string()),
+        );
+        tracker
+            .data
+            .daily
+            .insert(today.clone(), DailySummary::new(today.clone()));
+        tracker.data.monthly.insert(
+            "1999-01".to_string(),
+            MonthlySummary::new("1999-01".to_string()),
+        );
+        tracker
+            .data
+            .monthly
+            .insert(month.clone(), MonthlySummary::new(month.clone()));
+
+        let now = now_ms();
+        tracker.data.sessions.insert(
+            "old".to_string(),
+            SessionUsage {
+                session_key: "old".to_string(),
+                ..Default::default()
+            },
+        );
+        tracker.data.sessions.insert(
+            "recent".to_string(),
+            SessionUsage {
+                session_key: "recent".to_string(),
+                first_used_at: now,
+                last_used_at: now,
+                ..Default::default()
+            },
+        );
+
+        let pruned = tracker.prune_data_with_limits(&UsageRetention {
+            daily_retention_days: 1,
+            monthly_retention_months: 1,
+            session_retention_days: 1,
+            max_daily_entries: 10,
+            max_monthly_entries: 10,
+            max_sessions: 10,
+        });
+
+        assert!(pruned);
+        assert!(tracker.data.daily.contains_key(&today));
+        assert!(!tracker.data.daily.contains_key("1999-01-01"));
+        assert!(tracker.data.monthly.contains_key(&month));
+        assert!(!tracker.data.monthly.contains_key("1999-01"));
+        assert!(tracker.data.sessions.contains_key("recent"));
+        assert!(!tracker.data.sessions.contains_key("old"));
+    }
+
+    #[test]
+    fn test_usage_prune_by_max_entries() {
+        let mut tracker = create_test_tracker();
+        let today = today_date();
+        let month = current_month();
+
+        tracker.data.daily.insert(
+            "1999-01-01".to_string(),
+            DailySummary::new("1999-01-01".to_string()),
+        );
+        tracker
+            .data
+            .daily
+            .insert(today.clone(), DailySummary::new(today.clone()));
+        tracker.data.monthly.insert(
+            "1999-01".to_string(),
+            MonthlySummary::new("1999-01".to_string()),
+        );
+        tracker
+            .data
+            .monthly
+            .insert(month.clone(), MonthlySummary::new(month.clone()));
+
+        let now = now_ms();
+        tracker.data.sessions.insert(
+            "older".to_string(),
+            SessionUsage {
+                session_key: "older".to_string(),
+                first_used_at: now.saturating_sub(1_000),
+                last_used_at: now.saturating_sub(1_000),
+                ..Default::default()
+            },
+        );
+        tracker.data.sessions.insert(
+            "newer".to_string(),
+            SessionUsage {
+                session_key: "newer".to_string(),
+                first_used_at: now,
+                last_used_at: now,
+                ..Default::default()
+            },
+        );
+
+        let pruned = tracker.prune_data_with_limits(&UsageRetention {
+            daily_retention_days: 100_000,
+            monthly_retention_months: 2400,
+            session_retention_days: 100_000,
+            max_daily_entries: 1,
+            max_monthly_entries: 1,
+            max_sessions: 1,
+        });
+
+        assert!(pruned);
+        assert_eq!(tracker.data.daily.len(), 1);
+        assert!(tracker.data.daily.contains_key(&today));
+        assert_eq!(tracker.data.monthly.len(), 1);
+        assert!(tracker.data.monthly.contains_key(&month));
+        assert_eq!(tracker.data.sessions.len(), 1);
+        assert!(tracker.data.sessions.contains_key("newer"));
     }
 
     #[test]
