@@ -19,9 +19,13 @@ RUN apt-get update \
 
 COPY --from=builder /build/target/release/carapace /usr/local/bin/carapace
 
+RUN groupadd --system carapace && useradd --system --gid carapace carapace
+
 # State directory for sessions, cron, config
 ENV CARAPACE_STATE_DIR=/data
-RUN mkdir -p /data
+RUN mkdir -p /data && chown carapace:carapace /data
+
+USER carapace
 
 EXPOSE 18789
 

@@ -311,13 +311,6 @@ struct GatewayStore {
 
 impl GatewayStore {
     const VERSION: u32 = 1;
-
-    fn new() -> Self {
-        Self {
-            version: Self::VERSION,
-            gateways: Vec::new(),
-        }
-    }
 }
 
 /// Thread-safe registry of remote gateways with persistence.

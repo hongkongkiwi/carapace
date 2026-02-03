@@ -176,8 +176,14 @@ pub fn apply_resource_limits(config: &ProcessSandboxConfig) -> Result<(), Sandbo
     Ok(())
 }
 
+/// Resource type alias — `c_int` on macOS/BSDs, `__rlimit_resource_t` (u32) on Linux glibc.
+#[cfg(target_os = "linux")]
+type RlimitResource = libc::__rlimit_resource_t;
+#[cfg(all(unix, not(target_os = "linux")))]
+type RlimitResource = libc::c_int;
+
 #[cfg(unix)]
-fn set_rlimit(resource: libc::c_int, limit: u64) -> Result<(), SandboxError> {
+fn set_rlimit(resource: RlimitResource, limit: u64) -> Result<(), SandboxError> {
     // Get current limits so we can respect the existing hard limit.
     // Unprivileged processes cannot raise the hard limit.
     let mut current = libc::rlimit {
@@ -218,7 +224,7 @@ fn set_rlimit(resource: libc::c_int, limit: u64) -> Result<(), SandboxError> {
 }
 
 #[cfg(unix)]
-fn rlimit_name(resource: libc::c_int) -> &'static str {
+fn rlimit_name(resource: RlimitResource) -> &'static str {
     match resource {
         libc::RLIMIT_CPU => "RLIMIT_CPU",
         libc::RLIMIT_AS => "RLIMIT_AS",
@@ -722,7 +728,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_rlimit_name_unknown_resource() {
-        assert_eq!(rlimit_name(9999), "RLIMIT_UNKNOWN");
+        assert_eq!(rlimit_name(9999 as RlimitResource), "RLIMIT_UNKNOWN");
     }
 
     // ==================== macOS Seatbelt ====================
@@ -902,10 +908,10 @@ mod tests {
     #[test]
     fn test_landlock_noop_on_non_linux() {
         // On non-Linux, apply_landlock should be a no-op
-        let config = ProcessSandboxConfig::default();
+        let _config = ProcessSandboxConfig::default();
         #[cfg(not(target_os = "linux"))]
         {
-            let result = apply_landlock(&config);
+            let result = apply_landlock(&_config);
             assert!(result.is_ok());
         }
     }
