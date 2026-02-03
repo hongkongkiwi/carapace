@@ -771,7 +771,53 @@ fn handle_skills_update_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex};
     use tempfile::TempDir;
+
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    struct TestConfigEnv {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _dir: TempDir,
+        prev_config: Option<String>,
+        prev_disable_cache: Option<String>,
+    }
+
+    impl TestConfigEnv {
+        fn new() -> Self {
+            let lock = ENV_LOCK.lock().unwrap();
+            let dir = TempDir::new().unwrap();
+            let config_path = dir.path().join("carapace.json");
+
+            let prev_config = std::env::var("CARAPACE_CONFIG_PATH").ok();
+            let prev_disable_cache = std::env::var("CARAPACE_DISABLE_CONFIG_CACHE").ok();
+
+            std::env::set_var("CARAPACE_CONFIG_PATH", &config_path);
+            std::env::set_var("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+            crate::config::clear_cache();
+
+            Self {
+                _lock: lock,
+                _dir: dir,
+                prev_config,
+                prev_disable_cache,
+            }
+        }
+    }
+
+    impl Drop for TestConfigEnv {
+        fn drop(&mut self) {
+            match &self.prev_config {
+                Some(value) => std::env::set_var("CARAPACE_CONFIG_PATH", value),
+                None => std::env::remove_var("CARAPACE_CONFIG_PATH"),
+            }
+            match &self.prev_disable_cache {
+                Some(value) => std::env::set_var("CARAPACE_DISABLE_CONFIG_CACHE", value),
+                None => std::env::remove_var("CARAPACE_DISABLE_CONFIG_CACHE"),
+            }
+            crate::config::clear_cache();
+        }
+    }
 
     #[test]
     fn test_build_skills_array_empty_config() {
@@ -1138,8 +1184,9 @@ mod tests {
         let skills_dir = dir.path().join("skills");
         let params = json!({ "name": "my-skill", "version": "2.0.0" });
 
-        // This will fail at the config write stage (no real config file in test env),
-        // but we can verify the manifest was written before that point.
+        let _env = TestConfigEnv::new();
+
+        // Isolate config writes to a temp path so this test doesn't touch user config.
         let _ = handle_skills_install_inner(Some(&params), &skills_dir);
 
         // Check that the manifest was created

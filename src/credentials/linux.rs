@@ -164,7 +164,7 @@ impl CredentialBackend for LinuxCredentialBackend {
 
         // Try a test operation to check availability
         let test_key = CredentialKey::new("_health", "_check", "_test");
-        let entry = match self.get_entry(&test_key) {
+        let _entry = match self.get_entry(&test_key) {
             Ok(e) => e,
             Err(_) => {
                 self.available.store(false, Ordering::Release);
