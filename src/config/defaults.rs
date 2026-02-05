@@ -45,9 +45,6 @@ struct ConfigWithDefaults {
     cron: CronDefaults,
 
     #[serde(default)]
-    hooks: HooksDefaults,
-
-    #[serde(default)]
     messages: MessagesDefaults,
 }
 
@@ -81,6 +78,9 @@ struct GatewayDefaults {
 
     #[serde(default)]
     control_ui: GatewayControlUiDefaults,
+
+    #[serde(default)]
+    hooks: HooksDefaults,
 }
 
 impl Default for GatewayDefaults {
@@ -90,6 +90,7 @@ impl Default for GatewayDefaults {
             bind: default_bind_mode(),
             reload: GatewayReloadDefaults::default(),
             control_ui: GatewayControlUiDefaults::default(),
+            hooks: HooksDefaults::default(),
         }
     }
 }
@@ -514,7 +515,6 @@ pub fn apply_defaults(config: &mut Value) {
                 session: SessionDefaults::default(),
                 logging: LoggingDefaults::default(),
                 cron: CronDefaults::default(),
-                hooks: HooksDefaults::default(),
                 messages: MessagesDefaults::default(),
             }
         }
@@ -647,11 +647,11 @@ mod tests {
             DEFAULT_CRON_MAX_CONCURRENT
         );
 
-        // Hooks defaults
-        assert_eq!(config["hooks"]["enabled"], false);
-        assert_eq!(config["hooks"]["path"], "/hooks");
+        // Hooks defaults (nested under gateway)
+        assert_eq!(config["gateway"]["hooks"]["enabled"], false);
+        assert_eq!(config["gateway"]["hooks"]["path"], "/hooks");
         assert_eq!(
-            config["hooks"]["maxBodyBytes"],
+            config["gateway"]["hooks"]["maxBodyBytes"],
             DEFAULT_HOOKS_MAX_BODY_BYTES
         );
 
@@ -856,17 +856,19 @@ mod tests {
     #[test]
     fn test_hooks_defaults_applied() {
         let mut config = json!({
-            "hooks": {
-                "enabled": true
+            "gateway": {
+                "hooks": {
+                    "enabled": true
+                }
             }
         });
 
         apply_defaults(&mut config);
 
-        assert_eq!(config["hooks"]["enabled"], true);
-        assert_eq!(config["hooks"]["path"], "/hooks");
+        assert_eq!(config["gateway"]["hooks"]["enabled"], true);
+        assert_eq!(config["gateway"]["hooks"]["path"], "/hooks");
         assert_eq!(
-            config["hooks"]["maxBodyBytes"],
+            config["gateway"]["hooks"]["maxBodyBytes"],
             DEFAULT_HOOKS_MAX_BODY_BYTES
         );
     }
@@ -939,6 +941,6 @@ mod tests {
             DEFAULT_REDACT_SENSITIVE
         );
         assert_eq!(config["cron"]["enabled"], false);
-        assert_eq!(config["hooks"]["enabled"], false);
+        assert_eq!(config["gateway"]["hooks"]["enabled"], false);
     }
 }
