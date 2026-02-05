@@ -288,23 +288,12 @@ fn validate_gateway(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schem
 }
 
 fn validate_hooks(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
-    let hooks = match obj.get("hooks").and_then(|v| v.as_object()) {
-        Some(h) => h,
-        None => return,
-    };
-
-    if let Some(max_bytes) = hooks.get("maxBodyBytes") {
-        check_positive_integer(max_bytes, ".hooks.maxBodyBytes", issues);
-    }
-
-    if let Some(enabled) = hooks.get("enabled") {
-        if !enabled.is_boolean() {
-            issues.push(SchemaIssue {
-                severity: Severity::Warning,
-                path: ".hooks.enabled".to_string(),
-                message: "enabled must be a boolean".to_string(),
-            });
-        }
+    if obj.get("hooks").is_some() {
+        issues.push(SchemaIssue {
+            severity: Severity::Error,
+            path: ".hooks".to_string(),
+            message: "hooks must be configured under gateway.hooks".to_string(),
+        });
     }
 }
 
@@ -852,9 +841,12 @@ mod tests {
     #[test]
     fn test_valid_config_no_issues() {
         let cfg = json!({
-            "gateway": { "port": 18789, "bind": "loopback" },
-            "logging": { "level": "info", "format": "json" },
-            "hooks": { "enabled": true, "maxBodyBytes": 262144 }
+            "gateway": {
+                "port": 18789,
+                "bind": "loopback",
+                "hooks": { "enabled": true, "maxBodyBytes": 262144 }
+            },
+            "logging": { "level": "info", "format": "json" }
         });
         let issues = validate_schema(&cfg);
         assert!(issues.is_empty(), "expected no issues, got: {:?}", issues);
@@ -966,17 +958,12 @@ mod tests {
     // --- hooks ---
 
     #[test]
-    fn test_hooks_enabled_non_bool() {
-        let cfg = json!({ "hooks": { "enabled": "yes" } });
+    fn test_hooks_root_is_error() {
+        let cfg = json!({ "hooks": { "enabled": true } });
         let issues = validate_schema(&cfg);
-        assert!(issues.iter().any(|i| i.path == ".hooks.enabled"));
-    }
-
-    #[test]
-    fn test_hooks_max_body_bytes_string() {
-        let cfg = json!({ "hooks": { "maxBodyBytes": "big" } });
-        let issues = validate_schema(&cfg);
-        assert!(issues.iter().any(|i| i.path == ".hooks.maxBodyBytes"));
+        assert!(issues
+            .iter()
+            .any(|i| i.path == ".hooks" && i.severity == Severity::Error));
     }
 
     // --- logging ---

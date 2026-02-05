@@ -792,8 +792,7 @@ mod tests {
     #[test]
     fn test_validation_known_keys_pass() {
         let config = serde_json::json!({
-            "gateway": { "port": 18789 },
-            "hooks": { "enabled": true },
+            "gateway": { "port": 18789, "hooks": { "enabled": true } },
             "logging": { "level": "debug" }
         });
 

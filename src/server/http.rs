@@ -124,11 +124,13 @@ impl Default for HttpConfig {
 /// (CARAPACE_GATEWAY_TOKEN, CARAPACE_GATEWAY_PASSWORD) with env taking precedence.
 pub fn build_http_config(cfg: &Value) -> Result<HttpConfig, String> {
     let gateway = cfg.get("gateway").and_then(|v| v.as_object());
+    if cfg.get("hooks").is_some() {
+        return Err("hooks must be configured under gateway.hooks".to_string());
+    }
 
     let hooks_obj = gateway
         .and_then(|g| g.get("hooks"))
-        .and_then(|v| v.as_object())
-        .or_else(|| cfg.get("hooks").and_then(|v| v.as_object()));
+        .and_then(|v| v.as_object());
     let auth_obj = gateway
         .and_then(|g| g.get("auth"))
         .and_then(|v| v.as_object());
