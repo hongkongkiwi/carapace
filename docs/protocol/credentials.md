@@ -168,7 +168,7 @@ No secret fields are written to this file.
 - **Username:** `carapace` (static)
 - **Storage:** JSON string payloads
 
-## Migration from Plaintext — Planned
+## Migration from Plaintext — Implemented (best-effort)
 
 ### Strategy
 
@@ -182,6 +182,12 @@ No secret fields are written to this file.
 3. After successful writes:
    - Delete legacy plaintext files containing secrets.
    - Leave non-secret metadata files intact.
+
+**Behavior notes:**
+- Migration runs during gateway startup.
+- If the secret store is unavailable, migration is skipped and legacy files remain.
+- If a stored credential conflicts with a legacy value, the legacy file is left in place and
+  `migration.state` remains for manual resolution.
 
 ### File-by-file mapping
 
@@ -297,7 +303,7 @@ Multiple processes may access credentials simultaneously:
 - Even if a plugin attempts key injection (`../other-plugin:token`), the host
   sanitizes the key and always prepends `{plugin_id}:`
 
-### Migration Failure Recovery — Planned
+### Migration Failure Recovery — Implemented (best-effort)
 
 Migration may fail partway through (crash, power loss, etc.).
 
@@ -308,11 +314,11 @@ Migration may fail partway through (crash, power loss, etc.).
 - Delete state file only after full migration success
 
 **Recovery behavior:**
-- On startup, if `migration.state` exists, resume migration
-- Skip keys already in `completed` array
+- On startup, if `migration.state` exists, resume migration (idempotent)
+- Use `completed` for bookkeeping; keys may be re-checked safely
 - If legacy file exists AND key in secret store, verify match, then delete legacy
 
-**Integrity checks:**
+**Integrity checks (planned):**
 - After migration, verify all keys in index.json are readable
 - If any key unreadable, log WARN but continue (operator may need to re-enter)
 

@@ -16,6 +16,10 @@ mod linux;
 #[cfg(target_os = "windows")]
 mod windows;
 
+mod migration;
+
+pub use migration::{migrate_plaintext_credentials, MigrationReport};
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -923,6 +927,31 @@ impl<B: CredentialBackend> CredentialStore<B> {
         self.save_index().await?;
 
         Ok(())
+    }
+
+    /// Record or refresh a credential entry in the index without touching the store.
+    pub async fn record_index_entry(
+        &self,
+        key: &CredentialKey,
+        provider: Option<String>,
+    ) -> Result<(), CredentialError> {
+        let mut index = self.index.write().await;
+        let existing_provider = index
+            .entries
+            .get(&key.to_account_key())
+            .and_then(|entry| entry.provider.clone());
+        let entry = IndexEntry {
+            key: key.clone(),
+            provider: provider.or(existing_provider),
+            last_updated: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        };
+        index.entries.insert(key.to_account_key(), entry);
+        Self::recalculate_plugin_quotas(&mut index);
+        drop(index);
+        self.save_index().await
     }
 
     /// Get a plugin credential with isolation

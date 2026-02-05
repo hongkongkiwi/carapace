@@ -979,8 +979,11 @@ pub enum WsConfigError {
 
 pub async fn build_ws_state_from_config() -> Result<Arc<WsServerState>, WsConfigError> {
     let cfg = config::load_config()?;
-    let config = build_ws_config_from_files().await?;
     let state_dir = resolve_state_dir();
+    if let Err(err) = credentials::migrate_plaintext_credentials(state_dir.clone()).await {
+        tracing::warn!(error = %err, "Credential migration failed");
+    }
+    let config = build_ws_config_from_files().await?;
     let mut state = WsServerState::new_persistent(config, state_dir)?;
 
     // Wire session integrity HMAC key from config
