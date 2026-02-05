@@ -49,7 +49,7 @@
     // Webhook / hooks API
     hooks: {
       enabled: false,
-      // token: "${HOOKS_TOKEN}",
+      // token: "${CARAPACE_HOOKS_TOKEN}",
       // path: "/hooks",
       // maxBodyBytes: 262144,   // 256 KB
     },

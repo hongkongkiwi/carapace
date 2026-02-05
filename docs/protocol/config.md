@@ -115,7 +115,6 @@ All keys are optional. Unknown keys are rejected (strict schema).
 - `sessions` – session behavior (retention, cleanup)
 - `usage` – usage tracking configuration (pricing overrides)
 - `cron` – cron scheduler settings
-- `hooks` – HTTP hooks config
 - `web` – web provider settings (WhatsApp Web)
 - `channels` – per-channel configs
 - `discovery` – gateway discovery settings
@@ -136,14 +135,17 @@ All keys are optional. Unknown keys are rejected (strict schema).
 This is a condensed map; refer to the JSON schema for full detail.
 
 - `gateway`
-  - `port`, `mode`, `bind`, `controlUi`, `auth`, `trustedProxies`, `tailscale`, `remote`, `reload`, `tls`, `mtls`, `http.endpoints`, `nodes`
+  - `port`, `mode`, `bind`, `controlUi`, `hooks`, `auth`, `trustedProxies`, `tailscale`, `remote`, `reload`, `tls`, `mtls`, `http.endpoints`, `nodes`
+  - `controlUi`: `enabled`, `path` (wired); `basePath` (planned)
   - `mtls` – gateway-to-gateway mTLS (`enabled`, `caCert`, `nodeCert`, `nodeKey`, `crlPath`, `requireClientCert`)
   - `remote` – outbound gateway connections (`enabled`, `authToken`, `autoReconnect`,
     `reconnectIntervalMs`, `maxReconnectAttempts`, `gateways[]`)
     - `gateways[]` entries: `name`, `url`, `fingerprint` (TOFU pin), `autoConnect`,
       optional `ssh` (`host`, `port`, `user`, `remotePort`)
-- `hooks`
-  - `enabled`, `path`, `token`, `maxBodyBytes`, `mappings`, `gmail`, `internal`
+- `gateway.hooks`
+  - `enabled`, `token` (wired)
+  - `path`, `maxBodyBytes` (planned; not wired yet)
+  - Note: top-level `hooks` is legacy and ignored by the Rust gateway
 - `browser`
   - `enabled`, `controlUrl`, `cdpUrl`, `profiles` (names must match `/^[a-z0-9-]+$/`)
 - `plugins`

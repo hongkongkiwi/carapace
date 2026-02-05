@@ -7,7 +7,7 @@ It focuses on endpoints handled directly by the gateway server and the Control U
 
 Endpoints fall into two buckets:
 
-- **Hooks** use a separate hooks token (`hooks.token`) and do **not** use gateway auth.
+- **Hooks** use a separate hooks token (`gateway.hooks.token`) and do **not** use gateway auth.
 - **Gateway endpoints** use **gateway auth** (token/password) or **Tailscale Serve** when enabled.
 
 Gateway auth uses a bearer token in the `Authorization` header:
@@ -24,7 +24,9 @@ Error formats vary by endpoint; each section calls out the exact JSON shape.
 
 ## Hooks
 
-Hooks are enabled only when `hooks.enabled=true`. The base path defaults to `/hooks` and can be overridden by `hooks.path`.
+Hooks are enabled only when `gateway.hooks.enabled=true`.
+The base path is `/hooks`. Configurable `gateway.hooks.path` and `gateway.hooks.maxBodyBytes`
+are planned but not wired yet in the current build.
 The path **must not** be `/`.
 
 ### Auth
@@ -37,7 +39,7 @@ Hooks require a **hooks token** (not gateway auth). Accepted forms:
 ### Common behavior
 - Method: **POST** only
 - Content-Type: `application/json`
-- Max body size: `hooks.maxBodyBytes` (default 256 KB)
+- Max body size: 256 KB (override via `gateway.hooks.maxBodyBytes` is planned)
 - Errors:
   - 401 Unauthorized (token missing/mismatch)
   - 405 Method Not Allowed
@@ -117,7 +119,7 @@ validation mechanism.
 
 Common behavior:
 - Method: **POST**
-- Max body size: `hooks.maxBodyBytes` (default 256 KB)
+- Max body size: 256 KB (override via `gateway.hooks.maxBodyBytes` is planned)
 
 ### POST `/channels/telegram/webhook`
 Telegram Bot API webhook endpoint.
@@ -143,7 +145,7 @@ Plugins can register webhook paths. The gateway routes any request under
 
 Common behavior:
 - Method: **any**
-- Max body size: `hooks.maxBodyBytes` (default 256 KB)
+- Max body size: 256 KB (override via `gateway.hooks.maxBodyBytes` is planned)
 - Auth: **none at the gateway layer** — plugins must validate their own secrets
   (e.g., shared tokens or signatures).
 - Response: status, headers, and body are forwarded from the plugin.
@@ -254,8 +256,8 @@ Responses:
 ## Control UI
 
 The Control UI is served as static assets + SPA.
-Base path is `gateway.controlUi.basePath` (normalized to `"/path"`). If unset or empty, the
-default UI path is `/ui`.
+Current base path is `/ui`. A configurable `gateway.controlUi.basePath` is planned but not
+wired yet in the current build.
 
 ### GET/HEAD `{basePath}/...`
 - A request to `{basePath}` redirects to `{basePath}/`.
