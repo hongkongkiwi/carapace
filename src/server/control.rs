@@ -301,7 +301,12 @@ pub async fn config_handler(
     }
 
     // Block sensitive paths
-    let blocked_prefixes = ["gateway.auth", "hooks.token", "credentials", "secrets"];
+    let blocked_prefixes = [
+        "gateway.auth",
+        "gateway.hooks.token",
+        "credentials",
+        "secrets",
+    ];
 
     for prefix in blocked_prefixes {
         if req.path.starts_with(prefix) {
