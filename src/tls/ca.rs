@@ -372,14 +372,10 @@ impl ClusterCA {
             KeyPair::generate().map_err(|e| TlsError::CertGenerationFailed(e.to_string()))?;
 
         // Sign with the CA
-        let ca_cert_for_signing = self
-            .ca_params
-            .clone()
-            .self_signed(&self.ca_key_pair)
-            .map_err(|e| TlsError::CertGenerationFailed(e.to_string()))?;
+        let issuer = rcgen::Issuer::from_params(&self.ca_params, &self.ca_key_pair);
 
         let node_cert = params
-            .signed_by(&node_key_pair, &ca_cert_for_signing, &self.ca_key_pair)
+            .signed_by(&node_key_pair, &issuer)
             .map_err(|e| TlsError::CertGenerationFailed(e.to_string()))?;
 
         let cert_pem = node_cert.pem();
