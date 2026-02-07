@@ -3,6 +3,7 @@
 //! HTTP and WebSocket servers with real handlers.
 
 pub mod bind;
+pub mod connect_info;
 pub mod control;
 pub mod csrf;
 pub mod headers;

@@ -6,19 +6,18 @@
 //! - OpenAI compatibility endpoints
 //! - Control endpoints
 
-use axum::extract::ConnectInfo;
 use carapace::auth::AuthMode;
 use carapace::channels::{ChannelInfo, ChannelRegistry, ChannelStatus};
 use carapace::hooks::{
     HookAction, HookMapping, HookMappingContext, HookMappingResult, HookRegistry,
 };
 use carapace::plugins::{ToolInvokeContext, ToolInvokeResult, ToolsRegistry};
+use carapace::server::connect_info::MaybeConnectInfo;
 use serde_json::json;
 use std::collections::HashMap;
-use std::net::SocketAddr;
 
-fn loopback_connect_info() -> Option<ConnectInfo<SocketAddr>> {
-    Some(ConnectInfo("127.0.0.1:1234".parse().unwrap()))
+fn loopback_connect_info() -> MaybeConnectInfo {
+    MaybeConnectInfo(Some("127.0.0.1:1234".parse().unwrap()))
 }
 
 // ============================================================================

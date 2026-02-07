@@ -10,7 +10,6 @@
 
 use axum::{
     body::Body,
-    extract::ConnectInfo,
     http::{header, HeaderValue, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -22,6 +21,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, warn};
+
+use crate::server::connect_info::MaybeConnectInfo;
 
 /// Default rate limit (requests per second)
 const DEFAULT_RATE: u32 = 100;
@@ -513,7 +514,7 @@ async fn apply_rate_limit(
 /// Rate limiting middleware
 pub async fn rate_limit_middleware(
     limiter: axum::extract::State<RateLimiter>,
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: MaybeConnectInfo,
     request: Request<Body>,
     next: Next,
 ) -> Response<Body> {
@@ -522,7 +523,7 @@ pub async fn rate_limit_middleware(
     }
 
     let path = request.uri().path().to_string();
-    let remote_addr = connect_info.map(|ci| ci.0);
+    let remote_addr = connect_info.0;
 
     let client_ip = match resolve_client_ip(
         remote_addr,

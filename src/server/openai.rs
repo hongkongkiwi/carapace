@@ -6,7 +6,7 @@
 
 use axum::{
     body::Body,
-    extract::{ConnectInfo, State},
+    extract::State,
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -23,6 +23,7 @@ use crate::agent::provider::{
 };
 use crate::agent::LlmProvider;
 use crate::auth;
+use crate::server::connect_info::MaybeConnectInfo;
 
 /// OpenAI chat completions request
 #[derive(Debug, Deserialize)]
@@ -465,7 +466,7 @@ fn build_error_sse_response(error_msg: String) -> Response {
 /// POST /v1/chat/completions handler
 pub async fn chat_completions_handler(
     State(state): State<OpenAiState>,
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: MaybeConnectInfo,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
@@ -475,7 +476,7 @@ pub async fn chat_completions_handler(
     }
 
     // Check auth
-    let remote_addr = connect_info.map(|ci| ci.0);
+    let remote_addr = connect_info.0;
     if let Some(err) = check_openai_auth(&state, &headers, remote_addr) {
         return err;
     }
@@ -816,7 +817,7 @@ fn responses_input_to_chat_messages(
 /// POST /v1/responses handler
 pub async fn responses_handler(
     State(state): State<OpenAiState>,
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: MaybeConnectInfo,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
@@ -826,7 +827,7 @@ pub async fn responses_handler(
     }
 
     // Check auth
-    let remote_addr = connect_info.map(|ci| ci.0);
+    let remote_addr = connect_info.0;
     if let Some(err) = check_openai_auth(&state, &headers, remote_addr) {
         return err;
     }
@@ -992,11 +993,11 @@ fn validate_tool_choice(req: &ResponsesRequest) -> Option<Response> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::extract::ConnectInfo;
-    use std::net::SocketAddr;
 
-    fn loopback_connect_info() -> Option<ConnectInfo<SocketAddr>> {
-        Some(ConnectInfo("127.0.0.1:1234".parse().unwrap()))
+    use crate::server::connect_info::MaybeConnectInfo;
+
+    fn loopback_connect_info() -> MaybeConnectInfo {
+        MaybeConnectInfo(Some("127.0.0.1:1234".parse().unwrap()))
     }
 
     #[test]

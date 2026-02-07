@@ -11,7 +11,7 @@
 
 use axum::{
     body::Bytes,
-    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     middleware,
     response::{IntoResponse, Response},
@@ -28,6 +28,7 @@ use tokio::fs;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+use crate::server::connect_info::MaybeConnectInfo;
 use crate::server::control::{self, ControlState};
 use crate::server::csrf::{
     csrf_cookie_name, csrf_middleware, ensure_csrf_cookies, CsrfConfig, CsrfTokenStore,
@@ -442,7 +443,7 @@ pub fn create_router_with_state(
             .route(&format!("{}/wake", hooks_path), post(hooks_wake_handler))
             .route(&format!("{}/agent", hooks_path), post(hooks_agent_handler))
             .route(
-                &format!("{}/*path", hooks_path),
+                &format!("{}/{{*path}}", hooks_path),
                 post(hooks_mapping_handler),
             );
     }
@@ -455,7 +456,7 @@ pub fn create_router_with_state(
 
     // Plugin webhook routes (always enabled when plugins are registered)
     let plugin_router = Router::new()
-        .route("/plugins/*path", any(plugins_webhook_handler))
+        .route("/plugins/{*path}", any(plugins_webhook_handler))
         .layer(DefaultBodyLimit::max(config.hooks_max_body_bytes));
     router = router.merge(plugin_router);
 
@@ -487,13 +488,20 @@ pub fn create_router_with_state(
         if config.openai_chat_completions_enabled {
             router = router.route(
                 "/v1/chat/completions",
-                post(move |connect_info, headers, body| {
-                    let state = openai_state.clone();
-                    async move {
-                        openai::chat_completions_handler(State(state), connect_info, headers, body)
+                post(
+                    move |connect_info: MaybeConnectInfo, headers: HeaderMap, body: Bytes| {
+                        let state = openai_state.clone();
+                        async move {
+                            openai::chat_completions_handler(
+                                State(state),
+                                connect_info,
+                                headers,
+                                body,
+                            )
                             .await
-                    }
-                }),
+                        }
+                    },
+                ),
             );
         }
 
@@ -511,12 +519,15 @@ pub fn create_router_with_state(
         if config.openai_responses_enabled {
             router = router.route(
                 "/v1/responses",
-                post(move |connect_info, headers, body| {
-                    let state = openai_state2.clone();
-                    async move {
-                        openai::responses_handler(State(state), connect_info, headers, body).await
-                    }
-                }),
+                post(
+                    move |connect_info: MaybeConnectInfo, headers: HeaderMap, body: Bytes| {
+                        let state = openai_state2.clone();
+                        async move {
+                            openai::responses_handler(State(state), connect_info, headers, body)
+                                .await
+                        }
+                    },
+                ),
             );
         }
     }
@@ -588,30 +599,28 @@ fn register_session_routes(
     router
         .route(
             "/control/status",
-            get(move |connect_info, headers| {
+            get(move |connect_info: MaybeConnectInfo, headers: HeaderMap| {
                 let state = control_state_status.clone();
-                async move {
-                    control::status_handler(State(state), connect_info, headers).await
-                }
+                async move { control::status_handler(State(state), connect_info, headers).await }
             }),
         )
         .route(
             "/control/channels",
-            get(move |connect_info, headers| {
+            get(move |connect_info: MaybeConnectInfo, headers: HeaderMap| {
                 let state = control_state_channels.clone();
-                async move {
-                    control::channels_handler(State(state), connect_info, headers).await
-                }
+                async move { control::channels_handler(State(state), connect_info, headers).await }
             }),
         )
         .route(
             "/control/config",
-            post(move |connect_info, headers, body| {
-                let state = control_state_config.clone();
-                async move {
-                    control::config_handler(State(state), connect_info, headers, body).await
-                }
-            }),
+            post(
+                move |connect_info: MaybeConnectInfo, headers: HeaderMap, body: Bytes| {
+                    let state = control_state_config.clone();
+                    async move {
+                        control::config_handler(State(state), connect_info, headers, body).await
+                    }
+                },
+            ),
         )
 }
 
@@ -627,10 +636,10 @@ fn register_admin_routes(router: Router<AppState>, config: &HttpConfig) -> Route
         .route(&base, get(control_ui_redirect))
         .route(&format!("{}/", base), get(control_ui_index))
         .route(
-            &format!("{}/__carapace_avatar__/:agent_id", base),
+            &format!("{}/__carapace_avatar__/{{agent_id}}", base),
             get(avatar_handler),
         )
-        .route(&format!("{}/*path", base), get(control_ui_static))
+        .route(&format!("{}/{{*path}}", base), get(control_ui_static))
 }
 
 /// Normalize hooks path (ensure leading slash, no trailing slash)
@@ -949,7 +958,7 @@ async fn hooks_agent_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     uri: Uri,
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: MaybeConnectInfo,
     body: axum::body::Bytes,
 ) -> Response {
     // Check auth
@@ -986,7 +995,8 @@ async fn hooks_agent_handler(
     };
 
     let sender_id = connect_info
-        .map(|info| info.0.ip().to_string())
+        .0
+        .map(|addr| addr.ip().to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
     if let Err(resp) = dispatch_agent_run(&ws, &validated, &run_id, &sender_id) {
@@ -1424,13 +1434,13 @@ pub struct ToolsError {
 /// POST /tools/invoke - Tool invocation endpoint
 async fn tools_invoke_handler(
     State(state): State<AppState>,
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: MaybeConnectInfo,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
     // Check gateway auth (requires loopback if no auth configured)
     // If ConnectInfo is unavailable (e.g., in tests), treat as non-loopback
-    let remote_addr = connect_info.map(|ci| ci.0);
+    let remote_addr = connect_info.0;
     if let Some(err) = check_gateway_auth(&state.config, &headers, remote_addr) {
         return err;
     }
@@ -1797,7 +1807,7 @@ pub struct AvatarQuery {
     pub meta: Option<String>,
 }
 
-/// GET /__carapace_avatar__/:agent_id - Serve agent avatar
+/// GET /__carapace_avatar__/{agent_id} - Serve agent avatar
 async fn avatar_handler(
     State(state): State<AppState>,
     Path(agent_id): Path<String>,

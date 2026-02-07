@@ -6,7 +6,7 @@
 //! - POST /control/config - Config updates
 
 use axum::{
-    extract::{ConnectInfo, State},
+    extract::State,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -20,6 +20,7 @@ use crate::auth;
 use crate::channels::{ChannelRegistry, ChannelStatus};
 use crate::config;
 use crate::logging::audit::{audit, AuditEvent};
+use crate::server::connect_info::MaybeConnectInfo;
 use crate::server::ws::{map_validation_issues, persist_config_file, read_config_snapshot};
 
 /// Control endpoint state
@@ -178,11 +179,11 @@ impl ControlError {
 /// GET /control/status - Gateway status
 pub async fn status_handler(
     State(state): State<ControlState>,
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: MaybeConnectInfo,
     headers: HeaderMap,
 ) -> Response {
     // Check auth
-    let remote_addr = connect_info.map(|ci| ci.0);
+    let remote_addr = connect_info.0;
     if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
         return err;
     }
@@ -228,11 +229,11 @@ pub async fn status_handler(
 /// GET /control/channels - Channel status
 pub async fn channels_handler(
     State(state): State<ControlState>,
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: MaybeConnectInfo,
     headers: HeaderMap,
 ) -> Response {
     // Check auth
-    let remote_addr = connect_info.map(|ci| ci.0);
+    let remote_addr = connect_info.0;
     if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
         return err;
     }
@@ -269,12 +270,12 @@ pub async fn channels_handler(
 /// POST /control/config - Update configuration
 pub async fn config_handler(
     State(state): State<ControlState>,
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: MaybeConnectInfo,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
     // Check auth
-    let remote_addr = connect_info.map(|ci| ci.0);
+    let remote_addr = connect_info.0;
     if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
         return err;
     }
