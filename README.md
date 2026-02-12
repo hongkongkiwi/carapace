@@ -40,6 +40,7 @@ Carapace is hardened against every major vulnerability class reported in the Jan
 | SSRF / DNS rebinding | Private IP blocking + post-resolution validation |
 
 See [docs/security.md](docs/security.md) for the full security model.
+See [docs/security-comparison.md](docs/security-comparison.md) for a threat-by-threat comparison with OpenClaw.
 
 ## Docs
 
@@ -74,9 +75,9 @@ Known gaps:
 
 ## Install
 
-### Prebuilt binaries (coming soon)
+### Prebuilt binaries
 
-Releases are not published yet. For now, build from source. Planned release artifacts:
+Download from the [latest release](https://github.com/puremachinery/carapace/releases):
 
 - `cara-x86_64-linux`
 - `cara-aarch64-linux`
