@@ -981,18 +981,22 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn test_update_check_records_error_on_http_failure() {
+    async fn test_update_check_clears_checking_flag() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
-        // This will attempt to reach GitHub and fail in test environments
+        // May reach GitHub (CI with network) or fail (sandboxed/offline).
+        // Either way, the checking flag must be cleared afterward.
         let result = handle_update_check().await.unwrap();
         assert_eq!(result["ok"], true);
-        // After a failed HTTP call, checking flag must be cleared
         let state = UPDATE_STATE.read();
         assert!(!state.checking);
-        // last_error should be populated since HTTP failed
-        assert!(state.last_error.is_some());
-        assert!(!state.update_available);
+        // Exactly one of these should be true: error recorded or version fetched
+        let got_error = state.last_error.is_some();
+        let got_version = state.latest_version.is_some();
+        assert!(
+            got_error || got_version,
+            "expected either last_error or latest_version to be set"
+        );
     }
 
     // -----------------------------------------------------------------------
