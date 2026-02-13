@@ -1977,6 +1977,17 @@ pub struct WhatsAppChannel {
 impl WhatsAppChannel {
     /// Create a new WhatsApp channel with the given configuration.
     pub fn new(config: WhatsAppConfig) -> Self {
+        // Validate configuration
+        let session_path = PathBuf::from(&config.session_path);
+        if let Some(parent) = session_path.parent() {
+            if !parent.exists() {
+                // Session directory doesn't exist, create it
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    tracing::warn!("Failed to create session directory: {}", e);
+                }
+            }
+        }
+
         let client = Arc::new(WhatsAppClient::new(config.clone()));
         Self { config, client }
     }
@@ -2007,6 +2018,8 @@ impl WhatsAppChannel {
     }
 
     /// Validate the configuration.
+    /// Note: Currently called implicitly in new() for session directory creation.
+    /// Full validation will be used when channel is wired into main app.
     #[allow(dead_code)]
     pub(crate) fn validate(&self) -> ChannelAuthResult {
         // Check if session file exists or can be created
@@ -2157,13 +2170,16 @@ impl ChannelPluginInstance for WhatsAppChannel {
 fn parse_jid(s: &str) -> Result<Jid, WhatsAppError> {
     let normalized = normalize_whatsapp_id(s);
     
-    // Split into user and server parts
-    let parts: Vec<&str> = normalized.splitn(2, '@').collect();
-    if parts.len() == 2 {
-        Ok(Jid::new(parts[0], parts[1]))
+    // normalize_whatsapp_id always adds @, so we can use split_once
+    if let Some((user, server)) = normalized.split_once('@') {
+        Ok(Jid::new(user, server))
     } else {
-        // No @ found, assume it's a phone number
-        Ok(Jid::new(&normalized, "s.whatsapp.net"))
+        // This case should be unreachable if normalize_whatsapp_id works correctly.
+        // Return an error to make the contract explicit.
+        Err(WhatsAppError::InvalidJid(format!(
+            "Failed to parse normalized JID: {}",
+            normalized
+        )))
     }
 }
 
