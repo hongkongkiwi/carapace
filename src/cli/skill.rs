@@ -65,7 +65,9 @@ fn parse_signing_key(hex_key: &str) -> Result<SigningKey, String> {
         ));
     }
 
-    let key_bytes: [u8; 32] = bytes.try_into().unwrap();
+    let key_bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| "failed to convert signing key to a 32-byte array".to_string())?;
     Ok(SigningKey::from_bytes(&key_bytes))
 }
 
@@ -92,22 +94,14 @@ fn embed_manifest_in_wasm(
     let data_bytes = manifest_json.as_bytes();
 
     // Calculate sizes
-    // name_len is LEB128 encoded (1 byte for len <= 127)
-    let name_len = name_bytes.len() as u32;
-    // data_size = name_len_byte + name + data
-    let _data_size = 1 + name_len as usize + data_bytes.len();
-    // section_size = name_len_byte + name + data (LEB128)
-    let section_size = 1 + name_len as usize + data_bytes.len();
+    let name_len = name_bytes.len();
+    // section_content_size = name_len_byte + name + data
+    let section_content_size = 1 + name_len + data_bytes.len();
 
-    let mut output = Vec::with_capacity(wasm_bytes.len() + section_size + 10);
+    let mut output = Vec::with_capacity(wasm_bytes.len() + section_content_size + 10);
 
     // Copy original WASM header (magic + version)
     output.extend_from_slice(&wasm_bytes[..8]);
-
-    // Find the end of sections and insert our custom section before the last section
-    // For simplicity, we'll append the custom section
-    // Original sections: copy everything except we might need to adjust
-    // Actually, let's just append after the existing sections - wasmtime can handle it
 
     // Copy the rest of the original WASM (skip header, we'll re-add sections)
     if wasm_bytes.len() > 8 {
@@ -116,16 +110,36 @@ fn embed_manifest_in_wasm(
 
     // Add custom section
     output.push(0x00); // Section ID: custom
-    output.push(section_size as u8); // Size (simplified - assumes < 128 bytes)
+
+    // Write section size as LEB128
+    write_leb128_u32(&mut output, section_content_size as u32);
 
     // Name length (LEB128)
-    output.push(name_len as u8);
+    write_leb128_u32(&mut output, name_len as u32);
+
     // Name
     output.extend_from_slice(name_bytes);
     // Data
     output.extend_from_slice(data_bytes);
 
     Ok(output)
+}
+
+/// Write a u32 as LEB128 encoded bytes.
+fn write_leb128_u32(output: &mut Vec<u8>, value: u32) {
+    // LEB128 encoding: write 7-bit chunks, with continuation bit
+    let mut value = value;
+    loop {
+        let mut byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80; // continuation bit
+        }
+        output.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
 }
 
 /// Run the skill build handler.
@@ -298,9 +312,8 @@ pub fn handle_skill_sign(
     // Create or update manifest
     let mut manifest = if output_manifest_path.exists() {
         let content = fs::read_to_string(&output_manifest_path)?;
-        serde_json::from_str(&content).unwrap_or_else(|_| SkillManifest {
-            entries: std::collections::HashMap::new(),
-        })
+        serde_json::from_str(&content)
+            .map_err(|e| format!("failed to parse existing manifest: {e}"))?
     } else {
         SkillManifest {
             entries: std::collections::HashMap::new(),
@@ -392,7 +405,8 @@ async fn download_file_async(url: &str, dest: &Path) -> Result<Vec<u8>, String> 
 
     // Write to dest if provided
     if let Some(parent) = dest.parent() {
-        let _ = fs::create_dir_all(parent);
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create parent directory: {}", e))?;
     }
     let mut file = fs::File::create(dest)
         .map_err(|e| format!("failed to create file: {}", e))?;
@@ -1018,7 +1032,8 @@ crate-type = ["cdylib"]
         .unwrap_or_else(|| PathBuf::from("wit/plugin.wit"));
     
     if carapace_wit.exists() {
-        let _ = fs::copy(&carapace_wit, wit_dir.join("plugin.wit"));
+        fs::copy(&carapace_wit, wit_dir.join("plugin.wit"))
+            .map_err(|e| format!("failed to copy WIT file: {}", e))?;
     } else {
         // Fallback: create a minimal WIT file
         let minimal_wit = include_str!("../../wit/plugin.wit");
